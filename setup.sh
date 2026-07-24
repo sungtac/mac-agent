@@ -13,10 +13,28 @@ is_tty() { [ -t 0 ] && [ -t 1 ]; }
 
 section() { printf '\n=== %s ===\n' "$1"; }
 
+confirm() {
+  local prompt="$1"
+  if ! is_tty; then
+    echo "인터랙티브 터미널이 아니라 설치 확인을 받을 수 없어 건너뜁니다."
+    return 1
+  fi
+  read -r -p "$prompt [y/N] " reply
+  case "$reply" in
+    [yY]|[yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 install_cask() {
   local cask="$1"
+  local desc="$2"
   if ! command -v brew >/dev/null 2>&1; then
     echo "Homebrew가 없어서 자동 설치할 수 없습니다. https://brew.sh 에서 먼저 설치해주세요."
+    return 1
+  fi
+  if ! confirm "brew install --cask $cask 를 실행해서 설치할까요? ($desc)"; then
+    echo "설치를 건너뜁니다. 나중에 수동 설치: brew install --cask $cask"
     return 1
   fi
   echo "brew install --cask $cask 실행 중..."
@@ -32,8 +50,8 @@ fi
 
 section "Codex CLI"
 if ! command -v codex >/dev/null 2>&1; then
-  echo "codex CLI가 설치되어 있지 않음. 자동 설치를 시도합니다."
-  install_cask codex
+  echo "codex CLI가 설치되어 있지 않음."
+  install_cask codex "CLI 전용 도구라 Applications/Launchpad에 아이콘은 생기지 않고, 터미널 명령어만 추가됨"
 fi
 if command -v codex >/dev/null 2>&1; then
   if codex login status >/dev/null 2>&1; then
@@ -59,8 +77,8 @@ if [ -z "$AGY_BIN" ] && [ -x "$HOME/.local/bin/agy" ]; then
   AGY_BIN="$HOME/.local/bin/agy"
 fi
 if [ -z "$AGY_BIN" ]; then
-  echo "agy를 찾을 수 없음. 자동 설치를 시도합니다 (Antigravity.app 설치 후 agy CLI가 함께 생성됨)."
-  install_cask antigravity
+  echo "agy를 찾을 수 없음."
+  install_cask antigravity "Antigravity.app이 Applications 폴더/Launchpad에 실제 앱 아이콘으로 설치됨"
   AGY_BIN="$(command -v agy 2>/dev/null || true)"
   if [ -z "$AGY_BIN" ] && [ -x "$HOME/.local/bin/agy" ]; then
     AGY_BIN="$HOME/.local/bin/agy"
