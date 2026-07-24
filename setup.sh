@@ -1,16 +1,27 @@
 #!/usr/bin/env bash
 # Fleet agent setup: checks Codex CLI / Antigravity CLI (agy) login status,
-# and guides the user through logging in when needed.
+# installs them via Homebrew if missing, and guides the user through logging
+# in when needed.
 #
 # OAuth logins can't be fully silent — a human has to approve in a browser —
-# so this script detects whether it's running in a real interactive terminal
-# and either drives the login directly, or tells you the exact command to run
-# yourself in one.
+# so this script auto-installs what it safely can (Homebrew casks) and either
+# drives the login directly (real interactive terminal) or tells you the
+# exact command to run yourself (SSH/non-interactive).
 set -uo pipefail
 
 is_tty() { [ -t 0 ] && [ -t 1 ]; }
 
 section() { printf '\n=== %s ===\n' "$1"; }
+
+install_cask() {
+  local cask="$1"
+  if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew가 없어서 자동 설치할 수 없습니다. https://brew.sh 에서 먼저 설치해주세요."
+    return 1
+  fi
+  echo "brew install --cask $cask 실행 중..."
+  brew install --cask "$cask"
+}
 
 section "Claude Code"
 if command -v claude >/dev/null 2>&1; then
@@ -21,9 +32,10 @@ fi
 
 section "Codex CLI"
 if ! command -v codex >/dev/null 2>&1; then
-  echo "codex CLI가 설치되어 있지 않음."
-  echo "설치: npm install -g @openai/codex  (또는 brew install codex)"
-else
+  echo "codex CLI가 설치되어 있지 않음. 자동 설치를 시도합니다."
+  install_cask codex
+fi
+if command -v codex >/dev/null 2>&1; then
   if codex login status >/dev/null 2>&1; then
     echo "이미 로그인됨: $(codex login status 2>&1)"
   else
@@ -37,6 +49,8 @@ else
       echo "  codex login"
     fi
   fi
+else
+  echo "설치 실패 또는 설치 안 됨. 수동 설치: brew install --cask codex"
 fi
 
 section "Antigravity CLI (agy)"
@@ -45,8 +59,15 @@ if [ -z "$AGY_BIN" ] && [ -x "$HOME/.local/bin/agy" ]; then
   AGY_BIN="$HOME/.local/bin/agy"
 fi
 if [ -z "$AGY_BIN" ]; then
-  echo "agy를 찾을 수 없음."
-  echo "Antigravity 앱 설치 필요: https://antigravity.google (설치 후 agy가 ~/.local/bin/agy 에 생성됨)"
+  echo "agy를 찾을 수 없음. 자동 설치를 시도합니다 (Antigravity.app 설치 후 agy CLI가 함께 생성됨)."
+  install_cask antigravity
+  AGY_BIN="$(command -v agy 2>/dev/null || true)"
+  if [ -z "$AGY_BIN" ] && [ -x "$HOME/.local/bin/agy" ]; then
+    AGY_BIN="$HOME/.local/bin/agy"
+  fi
+fi
+if [ -z "$AGY_BIN" ]; then
+  echo "설치 실패 또는 설치 안 됨. 수동 설치: brew install --cask antigravity"
 else
   if "$AGY_BIN" models >/dev/null 2>&1; then
     echo "이미 로그인됨."

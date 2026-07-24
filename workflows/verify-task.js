@@ -97,11 +97,20 @@ function passes(score) {
   return score.total >= 85
 }
 
+async function appendHistory(record, historyFile) {
+  const recordJson = JSON.stringify(record)
+  await agent(
+    `아래 JSON 레코드 한 건을 히스토리 로그 파일에 한 줄(JSONL)로 추가(append)해줘. 기존 파일 내용은 절대 건드리지 말고 끝에 한 줄만 추가해.\n\n1. Bash로 \`mkdir -p $(dirname ${historyFile})\` 실행.\n2. Bash로 \`date -u +%Y-%m-%dT%H:%M:%SZ\` 실행해서 현재 UTC 시각을 얻어.\n3. 아래 JSON에 "timestamp" 필드로 그 시각을 추가한 뒤, 한 줄짜리 JSON 문자열로 만들어서 Bash \`cat >> ${historyFile} << 'HISTEOF'\n(그 JSON 한 줄)\nHISTEOF\` 형태로 안전하게 append 해 (JSON 안에 작은따옴표나 특수문자가 있어도 깨지지 않게 heredoc 사용).\n4. 성공하면 "ok"만 반환해.\n\n원본 JSON (timestamp 필드만 추가하고 나머지는 그대로 유지):\n${recordJson}`,
+    { phase: 'Score', label: 'history-append', agentType: 'general-purpose' }
+  )
+}
+
 const parsedArgs = typeof args === 'string' ? JSON.parse(args) : (args || {})
 const MAX_ROUNDS = parsedArgs.maxRounds || 3
 const task = parsedArgs.task
 const persona = parsedArgs.persona || '일반 사용자'
 const cwd = parsedArgs.cwd
+const historyFile = parsedArgs.historyFile || '/Users/edge_ai/.claude/verify-task-history.jsonl'
 
 let result = parsedArgs.result
 const history = []
@@ -137,7 +146,15 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
   log(`라운드 ${round} 미통과 (Codex ${codexScore?.total ?? '?'}점 / Gemini ${geminiScore?.total ?? '?'}점)`)
 
   if (round === MAX_ROUNDS) {
-    finalVerdict = { passed: false, round, result, codexScore, geminiScore }
+    finalVerdict = {
+      passed: false,
+      round,
+      result,
+      codexScore,
+      geminiScore,
+      needsUserDecision: true,
+      reason: `최대 ${MAX_ROUNDS}라운드 안에 통과 기준(85점, 과락 없음)을 충족하지 못함. 호출한 에이전트는 반드시 사용자에게 물어봐야 함: (a) 현재 결과물을 그대로 수용, (b) maxRounds를 늘려 재시도, (c) 수동 개입.`,
+    }
     break
   }
 
@@ -147,5 +164,19 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
     { phase: 'Revise', label: `revise-round-${round}`, agentType: 'general-purpose' }
   )
 }
+
+log('채점 히스토리 저장 중...')
+await appendHistory(
+  {
+    task: typeof task === 'string' ? task.slice(0, 300) : task,
+    persona,
+    rounds: history.length,
+    passed: !!finalVerdict?.passed,
+    needsUserDecision: !!finalVerdict?.needsUserDecision,
+    finalCodexTotal: finalVerdict?.codexScore?.total ?? null,
+    finalGeminiTotal: finalVerdict?.geminiScore?.total ?? null,
+  },
+  historyFile
+)
 
 return { finalVerdict, history }
