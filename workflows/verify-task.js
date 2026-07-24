@@ -58,7 +58,16 @@ const SCORE_SCHEMA = {
   required: ['scores', 'total', 'dealbreaker', 'feedback'],
 }
 
-function buildScoringPrompt(task, result, persona) {
+function buildScoringPrompt(task, result, persona, cwd, verificationContent) {
+  let verificationBlock
+  if (verificationContent) {
+    verificationBlock = `[실제 검증 자료 — 이미 수집된 git 상태/로그/diff]\n${verificationContent}\n\n아래 [에이전트가 보고한 결과 요약]은 신뢰하지 마. 위 실제 자료와 보고 내용이 일치하는지 대조해서 채점해. 너는 셸 명령을 실행할 수 없는 환경이니 절대 실행을 시도하지 말고, 위에 이미 주어진 자료만으로 판단해 — feedback에 위 자료 중 무엇을 근거로 이 결론에 도달했는지 적어.`
+  } else if (cwd) {
+    verificationBlock = `[실제 작업 디렉토리]\n${cwd}\n\n아래 [에이전트가 보고한 결과 요약]은 신뢰하지 마. 반드시 이 디렉토리에서 git diff / git log / 실제 파일 읽기 등을 직접 수행해서, 보고 내용이 실제 변경사항과 일치하는지 검증한 뒤 그 실제 확인 결과를 근거로 채점해. 보고서 문장만 보고 점수를 매기면 안 됨 — feedback에 어떤 파일/명령으로 확인했는지 반드시 적어.`
+  } else {
+    verificationBlock = `[경고] 실제 작업 디렉토리가 제공되지 않아 아래 텍스트 보고만으로 채점함 — 실제 파일/변경사항을 검증할 수 없음. 이 사실을 feedback에 명시하고, 검증 불가능한 주장(예: "테스트를 통과했다", "버그를 고쳤다")에 대해서는 액면 그대로 믿지 말고 정확성/완성도 점수를 보수적으로 낮게 잡을 것.`
+  }
+
   return `너는 독립 채점자야. 아래 루브릭으로 AI 에이전트의 작업 결과를 채점해.
 
 ${RUBRIC}
@@ -68,25 +77,46 @@ ${RUBRIC}
 [요청받은 작업]
 ${task}
 
-[제출된 결과물]
+[에이전트가 보고한 결과 요약]
 ${result}
 
+${verificationBlock}
+
 반드시 아래 JSON 형식으로만 답해 (다른 설명 텍스트 없이 JSON 객체 하나만):
-{"scores":{"목표달성도":0,"정확성":0,"제약안전성":0,"완성도":0,"명확성":0,"효율성":0},"total":0,"dealbreaker":false,"dealbreaker_reason":"","feedback":"구체적인 감점 사유와 개선점"}`
+{"scores":{"목표달성도":0,"정확성":0,"제약안전성":0,"완성도":0,"명확성":0,"효율성":0},"total":0,"dealbreaker":false,"dealbreaker_reason":"","feedback":"구체적인 감점 사유와 개선점, 그리고 실제로 무엇을 확인해서 이 결론에 도달했는지"}`
 }
 
-async function scoreWithCodex(task, result, persona) {
-  const prompt = buildScoringPrompt(task, result, persona)
+const FAILURE_SCORE_INSTRUCTION = `채점 도구 실행이나 출력 파싱이 실패하면(도구가 없거나, 크래시하거나, 타임아웃되거나, JSON을 못 뽑아내는 경우) 절대로 그럴듯한 점수를 지어내지 마. 대신 scores 전부 0, total 0, dealbreaker true, dealbreaker_reason에 "채점 도구 실행/파싱 실패 — 작업 내용에 대한 판단 아님"이라고 명시하고, feedback에 실제로 어떤 에러/출력이 나왔는지 적어서 반환해.`
+
+async function scoreWithCodex(task, result, persona, cwd) {
+  const prompt = buildScoringPrompt(task, result, persona, cwd)
   return agent(
-    `Bash 툴로 아래 명령을 정확히(따옴표 포함 그대로) 실행해:\ncodex exec --skip-git-repo-check ${JSON.stringify(prompt)}\n\n명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. 출력이 JSON이 아니면 내용을 읽고 스키마에 맞게 직접 변환해서 반환해.`,
+    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야).\n\n1. Bash로 \`mktemp /tmp/verify-task-codex-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환, ${cwd ? `먼저 그 디렉토리로 이동: cd ${JSON.stringify(cwd)} && ` : ''}): codex exec --skip-git-repo-check "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
     { phase: 'Score', label: 'codex', schema: SCORE_SCHEMA }
   )
 }
 
-async function scoreWithGemini(task, result, persona) {
-  const prompt = buildScoringPrompt(task, result, persona)
+const CONTEXT_SCHEMA = {
+  type: 'object',
+  properties: {
+    content: { type: 'string' },
+  },
+  required: ['content'],
+}
+
+async function gatherVerificationContext(cwd) {
+  if (!cwd) return null
+  const gathered = await agent(
+    `Bash로 아래 한 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 그대로 content 필드에 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git log (최근 10개) ---'; git log --oneline -10; echo '--- 커밋되지 않은 변경 (git diff HEAD) ---'; git diff HEAD; echo '--- 최근 커밋 (git show HEAD) ---'; git show HEAD; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여서 반환해.`,
+    { phase: 'Score', label: 'gather-context', schema: CONTEXT_SCHEMA }
+  )
+  return gathered?.content || null
+}
+
+async function scoreWithGemini(task, result, persona, cwd, verificationContent) {
+  const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
   return agent(
-    `Bash 툴로 아래 명령을 정확히(env -u 플래그 포함 그대로) 실행해:\nenv -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p ${JSON.stringify(prompt)}\n\n명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. 출력이 JSON이 아니면 내용을 읽고 스키마에 맞게 직접 변환해서 반환해.`,
+    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야). agy는 이미 필요한 검증 자료를 프롬프트 안에 텍스트로 받으므로 셸 명령을 실행할 필요가 없어 — 그래서 이 호출은 작업 디렉토리 이동 없이 진행해.\n\n1. Bash로 \`mktemp /tmp/verify-task-gemini-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
     { phase: 'Score', label: 'gemini', schema: SCORE_SCHEMA }
   )
 }
@@ -129,10 +159,13 @@ if (!preflight || preflight.ok === false) {
 log('사전 점검 통과 — 채점 시작')
 
 for (let round = 1; round <= MAX_ROUNDS; round++) {
+  log(`라운드 ${round}: 검증 자료 수집 중...`)
+  const verificationContent = await gatherVerificationContext(cwd)
+
   log(`라운드 ${round}: Codex + Gemini 채점 중...`)
   const [codexScore, geminiScore] = await parallel([
-    () => scoreWithCodex(task, result, persona),
-    () => scoreWithGemini(task, result, persona),
+    () => scoreWithCodex(task, result, persona, cwd),
+    () => scoreWithGemini(task, result, persona, cwd, verificationContent),
   ])
   history.push({ round, result, codexScore, geminiScore })
 
