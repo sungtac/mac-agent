@@ -2,9 +2,26 @@ export const meta = {
   name: 'verify-task',
   description: 'Score a completed task with Codex + Antigravity(Gemini) against a shared rubric, revise, and loop until it passes',
   phases: [
+    { title: 'Preflight' },
     { title: 'Score' },
     { title: 'Revise' },
   ],
+}
+
+const PREFLIGHT_SCHEMA = {
+  type: 'object',
+  properties: {
+    ok: { type: 'boolean' },
+    issues: { type: 'string' },
+  },
+  required: ['ok'],
+}
+
+async function preflightCheck() {
+  return agent(
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘:\n1. codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
+    { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
+  )
 }
 
 const RUBRIC = `[100점 만점 루브릭]
@@ -89,6 +106,18 @@ const cwd = parsedArgs.cwd
 let result = parsedArgs.result
 const history = []
 let finalVerdict = null
+
+log('사전 점검: Codex/Antigravity 로그인 상태 확인 중...')
+const preflight = await preflightCheck()
+if (!preflight || preflight.ok === false) {
+  const issues = preflight?.issues || '사전 점검 응답을 받지 못함'
+  log(`사전 점검 실패: ${issues}`)
+  return {
+    finalVerdict: { passed: false, error: 'preflight_failed', issues },
+    history: [],
+  }
+}
+log('사전 점검 통과 — 채점 시작')
 
 for (let round = 1; round <= MAX_ROUNDS; round++) {
   log(`라운드 ${round}: Codex + Gemini 채점 중...`)
