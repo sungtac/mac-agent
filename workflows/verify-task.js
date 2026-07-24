@@ -86,14 +86,15 @@ ${verificationBlock}
 {"scores":{"목표달성도":0,"정확성":0,"제약안전성":0,"완성도":0,"명확성":0,"효율성":0},"total":0,"dealbreaker":false,"dealbreaker_reason":"","feedback":"구체적인 감점 사유와 개선점, 그리고 실제로 무엇을 확인해서 이 결론에 도달했는지"}`
 }
 
-const FAILURE_SCORE_INSTRUCTION = `채점 도구 실행이나 출력 파싱이 실패하면(도구가 없거나, 크래시하거나, 타임아웃되거나, JSON을 못 뽑아내는 경우) 절대로 그럴듯한 점수를 지어내지 마. 대신 scores 전부 0, total 0, dealbreaker true, dealbreaker_reason에 "채점 도구 실행/파싱 실패 — 작업 내용에 대한 판단 아님"이라고 명시하고, feedback에 실제로 어떤 에러/출력이 나왔는지 적어서 반환해.`
+const DISPATCH_SCRIPT = '/Users/edge_ai/mac-agent/workflows/lib/score-dispatch.sh'
 
-async function scoreWithCodex(task, result, persona, cwd) {
-  const prompt = buildScoringPrompt(task, result, persona, cwd)
-  return agent(
-    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야).\n\n1. Bash로 \`mktemp /tmp/verify-task-codex-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환, ${cwd ? `먼저 그 디렉토리로 이동: cd ${JSON.stringify(cwd)} && ` : ''}): codex exec --skip-git-repo-check "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
-    { phase: 'Score', label: 'codex', schema: SCORE_SCHEMA }
-  )
+function buildDispatchInstruction(tool, prompt) {
+  return `1. Bash로 \`mktemp /tmp/verify-task-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${DISPATCH_SCRIPT} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야(성공이든 실패든 스크립트가 결정적으로 만든 값) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+}
+
+async function scoreWithCodex(task, result, persona, cwd, verificationContent) {
+  const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
+  return agent(buildDispatchInstruction('codex', prompt), { phase: 'Score', label: 'codex', schema: SCORE_SCHEMA })
 }
 
 const CONTEXT_SCHEMA = {
@@ -115,10 +116,7 @@ async function gatherVerificationContext(cwd) {
 
 async function scoreWithGemini(task, result, persona, cwd, verificationContent) {
   const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
-  return agent(
-    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야). agy는 이미 필요한 검증 자료를 프롬프트 안에 텍스트로 받으므로 셸 명령을 실행할 필요가 없어 — 그래서 이 호출은 작업 디렉토리 이동 없이 진행해.\n\n1. Bash로 \`mktemp /tmp/verify-task-gemini-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
-    { phase: 'Score', label: 'gemini', schema: SCORE_SCHEMA }
-  )
+  return agent(buildDispatchInstruction('agy', prompt), { phase: 'Score', label: 'gemini', schema: SCORE_SCHEMA })
 }
 
 function passes(score) {
@@ -164,7 +162,7 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
 
   log(`라운드 ${round}: Codex + Gemini 채점 중...`)
   const [codexScore, geminiScore] = await parallel([
-    () => scoreWithCodex(task, result, persona, cwd),
+    () => scoreWithCodex(task, result, persona, cwd, verificationContent),
     () => scoreWithGemini(task, result, persona, cwd, verificationContent),
   ])
   history.push({ round, result, codexScore, geminiScore })
