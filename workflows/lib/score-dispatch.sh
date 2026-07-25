@@ -36,9 +36,15 @@ if [ ! -f "$PROMPT_FILE" ]; then
   exit 0
 fi
 
+# Both codex and agy are invoked by absolute path, not bare command name —
+# confirmed 2026-07-26 that a Workflow-spawned agent's Bash environment can
+# have a stripped PATH missing /opt/homebrew/bin (same recurring gotcha as
+# tmux/coach/claude/ffmpeg/whisper-cli elsewhere on this Mac), which silently
+# turns "codex not found" into a fabricated preflight/scoring failure instead
+# of an actual tool problem.
 case "$TOOL" in
   codex)
-    RAW_OUTPUT="$(codex exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1)"
+    RAW_OUTPUT="$(/opt/homebrew/bin/codex exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1)"
     ;;
   agy)
     RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat "$PROMPT_FILE")" 2>&1)"

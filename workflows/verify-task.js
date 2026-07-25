@@ -19,7 +19,7 @@ const PREFLIGHT_SCHEMA = {
 
 async function preflightCheck() {
   return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘:\n1. codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (둘 다 절대경로 — 이 실행 환경 PATH에 /opt/homebrew/bin이 없을 수 있어서 bare 명령어 "codex"는 "command not found"로 실패할 수 있음):\n1. /opt/homebrew/bin/codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 /opt/homebrew/bin/codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
     { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
   )
 }
