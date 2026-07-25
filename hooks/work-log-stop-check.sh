@@ -97,6 +97,7 @@ PROMPT_EOF
       kill -9 "$CLAUDE_PID" 2>/dev/null
       wait "$CLAUDE_PID" 2>/dev/null
       echo "TIMEOUT after ${TIMEOUT_SECONDS}s — killed. Debug log: ${DEBUG_LOGFILE}. See mac-agent/docs/worklog-hook.md." >> "$LOGFILE"
+      bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ work-log 세션 기록 실패(타임아웃). 세션 ${SESSION_ID}. 로그: ${LOGFILE}" || true
       exit 1
     fi
     sleep 15

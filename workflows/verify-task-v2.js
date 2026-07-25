@@ -581,7 +581,29 @@ if (tier === 'full' && !finalVerdict) {
   }
 }
 
+async function notifyDiscordEscalation(message) {
+  // Best-effort, one-way (Mac → Discord) — same discord-notify.sh used by
+  // weekly-report.sh/work-log-stop-check.sh. Failure here must never affect
+  // finalVerdict; this is purely a side-channel nudge.
+  try {
+    await agent(
+      `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}`,
+      { phase: 'FullEvaluate', label: 'discord-notify', agentType: 'general-purpose' }
+    )
+  } catch (e) {
+    log(`디스코드 알림 실패(무시): ${e}`)
+  }
+}
+
 async function finalizeAndReturn() {
+  if (finalVerdict?.needsUserDecision || finalVerdict?.error === 'needs_clarification') {
+    const shortTask = typeof task === 'string' ? task.slice(0, 200) : String(task)
+    const reason = finalVerdict?.reason || finalVerdict?.questions || '(사유 없음)'
+    await notifyDiscordEscalation(
+      `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}`
+    )
+  }
+
   log('히스토리 저장 중...')
   await appendHistory(
     {

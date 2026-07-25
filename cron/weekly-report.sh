@@ -120,5 +120,6 @@ done
 
 if [ "$SUCCESS" -ne 1 ]; then
   echo "all ${MAX_ATTEMPTS} attempts failed." >> "$LOGFILE"
+  bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 주간보고서 생성 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}" || true
   exit 1
 fi
