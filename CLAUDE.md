@@ -22,7 +22,7 @@ This is an index only — each entry is a one/two-line pointer. Full rationale, 
 Three pieces that together turn finished work (Claude Code sessions, shared recordings, shared documents) into an archived record + calendar entry, plus a Friday rollup:
 
 - `hooks/work-log-stop-check.sh` — Stop hook: classifies each session as public-work vs. meta/private, archives output files + logs a Calendar event for public-work sessions. → [docs/worklog-hook.md](docs/worklog-hook.md)
-- `cron/weekly-report.sh` — Friday `launchd` job: compiles the week's Calendar entries into a "이번 주 한 일 / 다음 주 할 일" report. **Has an open, unresolved hang bug under real launchd triggering** — check this before trusting it ran. → [docs/weekly-report.md](docs/weekly-report.md)
+- `cron/weekly-report.sh` — Friday `launchd` job: compiles the week's Calendar entries into a "이번 주 한 일 / 다음 주 할 일" report. Headless `claude -p` invocations hang intermittently under launchd; mitigated with a watchdog + 3x retry. → [docs/weekly-report.md](docs/weekly-report.md)
 - `bin/transcribe.sh` — local, offline Whisper transcription for shared audio recordings; feeds into the same archive+calendar flow as documents. → [docs/transcribe.md](docs/transcribe.md)
 
 Also relevant: the Google Drive MCP connector is permanently blocked (`permissions.deny` in `~/.claude/settings.json`) — it's authenticated as a third party's account, not the user's own. Details in [docs/weekly-report.md](docs/weekly-report.md).
