@@ -6,12 +6,15 @@
 # usage-advisor.sh (Rule 1's deterministic comparison), codex-execute-dispatch.sh,
 # or score-dispatch.sh.
 #
-# Mechanical proxy only, same limitation as verify-task-stop-check.sh — a
-# shell script can't judge whether any SPECIFIC action was actually
-# delegable (e.g. live browser automation via mcp__claude-in-chrome can't be
-# routed to codex at all), and can't verify policy Rule A (Orchestrator's own
-# unique-judgment work is exempt) was correctly invoked rather than used as
-# an excuse. It nags; it doesn't and can't block correctly.
+# Rule A (docs/usage-routing.md, objectified 2026-07-27) now only exempts two
+# mechanically-checkable cases, both grepped for below before nagging:
+#   1. an independent-verification skill/workflow ran this session
+#      (verify-task / verify-task-v2 / independent-critique-loop)
+#   2. a mcp__claude-in-chrome__* browser-automation tool was actually used
+# Still a proxy, same limitation as verify-task-stop-check.sh — string
+# matching can false-positive (skill loaded but not actually load-bearing
+# for the direct edits) or miss paraphrased invocations. But the old fully
+# subjective "orchestrator judged this needed me" excuse no longer passes.
 set -uo pipefail
 
 export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
@@ -55,12 +58,21 @@ case "$CLAUDE_LEVEL" in
   *) exit 0 ;;
 esac
 
+# Rule A objective exceptions — if either is present, this session is
+# exempt from routing by design; skip the nag entirely.
+HAS_VERIFY_SKILL="$(grep -c '"skill":"\(verify-task\|verify-task-v2\|independent-critique-loop\)"' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+HAS_BROWSER_TOOL="$(grep -c '"name":"mcp__claude-in-chrome__' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+if [ "${HAS_VERIFY_SKILL:-0}" -gt 0 ] || [ "${HAS_BROWSER_TOOL:-0}" -gt 0 ]; then
+  touch "$NAG_MARKER"
+  exit 0
+fi
+
 HAS_ROUTING="$(grep -c 'route-dispatch\.sh\|usage-advisor\.sh\|codex-execute-dispatch\.sh\|score-dispatch\.sh' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
 if [ "${HAS_ROUTING:-0}" -eq 0 ]; then
   touch "$NAG_MARKER"
   jq -n --arg level "$CLAUDE_LEVEL" '{
     decision: "block",
-    reason: ("클로드 자체 사용량이 낮은 상태(coach level=" + $level + ")에서 Edit/Write 3회 이상의 직접 작업이 있었는데, docs/usage-routing.md 정책(2026-07-26)을 따른 흔적이 안 보입니다. 코덱스 가능 작업은 workflows/lib/usage-advisor.sh로 비교 후 우세한 쪽에, 단순 작업은 workflows/lib/route-dispatch.sh로. 이번 세션이 정책 예외(Rule A: 오케스트레이터 고유 판단, 또는 브라우저 조작 등 라우팅 불가능한 도구)였다면 사용자에게 한 줄로 알려주고 종료하세요."),
+    reason: ("클로드 자체 사용량이 낮은 상태(coach level=" + $level + ")에서 Edit/Write 3회 이상의 직접 작업이 있었는데, docs/usage-routing.md 정책을 따른 흔적이 안 보입니다. 코덱스 가능 작업은 workflows/lib/usage-advisor.sh로 비교 후 우세한 쪽에, 단순 작업은 workflows/lib/route-dispatch.sh로. Rule A 예외(독립검사 스킬 실행, 또는 mcp__claude-in-chrome 브라우저 자동화)에 해당하지 않는다면 지금이라도 라우팅을 타세요."),
     systemMessage: "사용량 라우팅 정책 미준수 감지 — usage-advisor.sh/route-dispatch.sh 사용을 고려하세요."
   }'
 fi
