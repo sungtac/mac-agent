@@ -1,0 +1,8 @@
+# idea-meeting-plan-mode.sh
+
+`hooks/idea-meeting-plan-mode.sh` — a Claude Code `UserPromptSubmit` hook. Registered in `~/.claude/settings.json` under `hooks.UserPromptSubmit`, it fires on every user message. If the prompt contains the literal keyword **"아이디어 회의"**, it injects `additionalContext` telling the model to call `EnterPlanMode` before doing anything else.
+
+- **Why this exists:** `hooks/verify-task-stop-check.sh`'s MANDATORY "아이디어 회의" category (2026-07-27) detects that a design discussion happened by checking for `ExitPlanMode` in the transcript — but that only works if Plan Mode actually got entered. A design discussion that never calls `EnterPlanMode` slips through that detector undetected. This hook closes that gap from the other side: the same keyword that names the category also nudges the model into the state the category checks for.
+- **Can't force a tool call:** `UserPromptSubmit` hooks can only return `additionalContext` (or block the prompt outright) — they can't invoke `EnterPlanMode` on the model's behalf. If the model ignores the nudge, the Stop-hook backstop still fires unconditionally at session end (same as the coding category — no "explain why you skipped it" escape).
+- **Deliberately exact-substring, not fuzzy:** matches only the literal string "아이디어 회의" (user-specified keyword, 2026-07-27), not synonyms like "브레인스토밍"/"설계 논의". Add more trigger phrases here the same way `verify-task-stop-check.sh`'s mandatory-category registry grows — one at a time, as the user identifies a real gap.
+- To port to another agent/machine: add the same `hooks.UserPromptSubmit` entry (command: `bash <path-to-this-repo>/hooks/idea-meeting-plan-mode.sh`) to that machine's `~/.claude/settings.json`.
