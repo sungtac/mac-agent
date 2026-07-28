@@ -5,15 +5,22 @@ export const meta = {
     { title: 'Preflight' },
     { title: 'Context' },
     { title: 'Light' },
-    { title: 'FullSpec' },
-    { title: 'FullDraft' },
+    { title: 'FullPlan' },
+    { title: 'FullCritique' },
+    { title: 'FullReconcile' },
     { title: 'FullExecute' },
-    { title: 'FullEvaluate' },
+    { title: 'FullReview' },
   ],
 }
 
 // 설계 전체는 docs/verify-task-v2-design.md 참고 — 이 스크립트는 결정 기록이
 // 아니라 구현이다. 결정의 "왜"를 다시 읽지 않고 이 파일만 고치지 말 것.
+//
+// 2026-07-27 개정: 전체(full) 트랙이 채점표 기반(안티 스펙+고정/동적 rubric+
+// 90점)에서 하네스 기반 정성 검토(코덱스 자체계획→클로드+안티 블라인드
+// 비평→코덱스 취합/개선→실행→클로드+안티 무점수 듀얼 코드리뷰)로 재설계됨.
+// 경량(light) 트랙은 전혀 안 건드림. docs/verify-task-v2-design.md의
+// "## 개정" 섹션에 왜 바뀌었는지 기록돼 있음 — 여기서 다시 설명 안 함.
 //
 // Workflow 스크립트는 다른 로컬 파일을 import 할 수 없어(자기완결적이어야
 // 함), verify-task.js와 겹치는 헬퍼(대시패치 지시문 생성, 검증용 diff 수집,
@@ -35,16 +42,32 @@ async function preflightCheck() {
 
 const SCORE_DISPATCH = '/Users/edge_ai/mac-agent/workflows/lib/score-dispatch.sh'
 const CODEX_EXECUTE_DISPATCH = '/Users/edge_ai/mac-agent/workflows/lib/codex-execute-dispatch.sh'
+const HARNESS_FILE_DEFAULT = '/Users/edge_ai/mac-agent/docs/codex-harness.md'
 
 // score-dispatch.sh는 읽기전용 채점/의견용(codex 또는 agy 모두 --sandbox
-// read-only 기본값). 실제 파일을 쓰는 유일한 지점(전체 트랙 3단계 실행)만
+// read-only 기본값). 실제 파일을 쓰는 유일한 지점(전체 트랙 실행 단계)만
 // codex-execute-dispatch.sh(-s workspace-write)를 쓴다 — 절대 섞어 쓰지 말 것.
-function buildScoreDispatchInstruction(tool, prompt) {
-  return `1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+//
+// 하네스 주입: score-dispatch.sh의 코덱스 호출엔 -C(대상 저장소 경로)가
+// 없고, codex-execute-dispatch.sh의 -C는 "대상 프로젝트"지 이 하네스 파일이
+// 있는 mac-agent 저장소가 아니다. 그래서 코덱스 자신에게 "하네스 파일을
+// 읽어라"라고 시킬 수 없다 — 이 지시문들을 실행하는 Claude 서브에이전트가
+// (Read 툴로) 대신 읽어서 프롬프트 텍스트 안에 직접 박아 넣는다. harnessFile
+// 인자가 있을 때만(그리고 tool==='codex'일 때만 — agy는 하네스 대상 아님)
+// 이 prepend가 붙는다.
+function buildScoreDispatchInstruction(tool, prompt, harnessFile) {
+  const injectHarness = tool === 'codex' && !!harnessFile
+  const harnessNote = injectHarness
+    ? `[하네스 주입] 2번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
+    : ''
+  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
-function buildExecuteDispatchInstruction(cwd, prompt) {
-  return `1. Bash로 \`mktemp /tmp/verify-task-v2-exec-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환, timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
+function buildExecuteDispatchInstruction(cwd, prompt, harnessFile) {
+  const harnessNote = harnessFile
+    ? `[하네스 주입] 2번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
+    : ''
+  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-exec-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${harnessFile ? ', 단 위에서 설명한 하네스 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환, timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 const EXECUTE_ENVELOPE_SCHEMA = {
@@ -109,9 +132,16 @@ const REAL_DIFF_SCHEMA = {
   required: ['content', 'filesChanged', 'sensitivePath'],
 }
 
+// 주의: `git diff HEAD`는 아직 add된 적 없는 untracked 신규 파일을 절대 보여주지
+// 않는다(코덱스/에이전트가 새 파일을 만든 경우 흔함) — 실측(2026-07-27 종단
+// 테스트)으로 이 누락 때문에 안티그래비티(파일시스템 직접 접근 불가, 이 함수가
+// 만든 텍스트만 봄)가 이미 정확히 생성된 파일을 "누락됐다"고 거짓 반려한 사례가
+// 실제로 발생함. 그래서 git status --porcelain으로 신규(untracked) 파일 목록을
+// 뽑아 전체 내용을 별도 섹션으로 반드시 덧붙인다 — git add 등으로 실제 git
+// 상태를 건드리지 않고 읽기만 한다.
 async function gatherRealDiff(cwd) {
   const gathered = await agent(
-    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git diff --stat ---'; git diff --stat HEAD; echo '--- git diff HEAD ---'; git diff HEAD; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git diff --stat HEAD의 출력에서 실제로 변경된 파일 경로들만 뽑아 filesChanged 배열에 넣고, 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.`,
+    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.`,
     { phase: 'Light', label: 'gather-real-diff', schema: REAL_DIFF_SCHEMA }
   )
   return gathered
@@ -122,7 +152,7 @@ function mechanicalTierViolated(realDiff) {
   return fileCount > 3 || !!realDiff?.sensitivePath
 }
 
-// ---------- 경량 트랙 ----------
+// ---------- 경량 트랙 (2026-07-27 개정에서 손 안 댐 — 그대로 유지) ----------
 
 const LIGHT_EXEC_SCHEMA = {
   type: 'object',
@@ -181,197 +211,266 @@ async function codexEvaluateLight(task, context, summary, realDiff) {
   })
 }
 
-// ---------- 전체 트랙: 0단계 (스펙 + 고정/동적 채점표, 안티그래비티) ----------
+// ---------- 전체 트랙: 1단계 (코덱스 자체 계획 작성) ----------
 
-const FIXED_RUBRIC = `[고정 채점 항목 — 65점, 모든 작업 공통]
-- 정확성 20점: 버그·논리 오류 없음
-- 완전성 20점: 명시적 요청(목표) 달성 + 숨은 의도·엣지케이스 반영
-- 안전성 15점: 되돌리기 가능성, 기존 기능 파손(regression) 없음
-- 기존 컨벤션 준수 10점: 저장소 관례(CLAUDE.md 등)·코드 스타일 위반 없음`
-
-const FULL_SPEC_SCHEMA = {
+const CODEX_PLAN_SCHEMA = {
   type: 'object',
   properties: {
     needsClarification: { type: 'boolean' },
     clarifyingQuestions: { type: 'string' },
-    spec: { type: 'string' },
-    dynamicRubricItems: { type: 'string' },
-    vetoConditions: { type: 'string' },
+    plan: { type: 'string' },
   },
   required: ['needsClarification'],
 }
 
-function buildFullSpecPrompt(task, context, objection) {
-  const objectionBlock = objection
-    ? `\n\n[코덱스의 반박 — 이전에 네가 쓴 스펙/채점표에 대한 이의제기, 검토해서 타당하면 반영하고 아니면 그대로 유지해도 됨]\n${objection}`
-    : ''
-  return `너는 이 작업의 기준을 고정하는 역할이야. 아래는 사용자의 원 지시문과 저장소 컨텍스트뿐이고, 어떤 해법·초안도 안 보여줌 — 절대 "어떻게 할지"는 스펙에 쓰지 마.
+function buildCodexPlanPrompt(task, context) {
+  return `너는 이 작업을 실제로 코딩할 담당자야. 아래는 사용자의 원 지시문과 저장소 컨텍스트뿐이고, 다른 에이전트의 의견은 아직 없어 — 네가 이 작업에 대한 실행 계획을 처음으로 세우는 거야.
 
 [원 지시문]
 ${task}
 
 [저장소 컨텍스트]
-${context.contextText}${objectionBlock}
+${context.contextText}
 
-1. 정보 충분성 판단: 목적·완료기준을 판단할 수 있어? 부족하면 needsClarification=true로 하고 clarifyingQuestions에 필수 질문 최대 3개 + 선택 질문 최대 3개를 적어(그 이상 필요해도 아는 만큼 스펙을 쓰고 "확인 필요"라고 표시). 충분하면 needsClarification=false.
-2. (충분하면) spec에: 목표(한 문단) / 산출물(형식·경로) / 제약 / 종료조건(기계적으로 판정 가능한 것만)을 적어.
-3. (충분하면) 아래 고정 채점 항목(65점, 이미 확정됨 — 네가 다시 쓰지 마)에 더해, 이번 작업 고유의 종료조건만 35점 배점으로 dynamicRubricItems에 항목별로 적어. 종료조건에서 직접 도출된 것만, 즉흥적으로 지어내지 마.
-${FIXED_RUBRIC}
-4. vetoConditions에 거부권 항목(걸리면 총점 무관 즉시 반려 — 보안 위험, 데이터 손실, 명시적 요구사항 누락 등)을 적어.
+1. 정보 충분성 판단: 이 계획을 세우고 실행하기에 정보가 충분해? 부족하면 needsClarification=true로 하고 clarifyingQuestions에 필수 질문 최대 3개 + 선택 질문 최대 3개를 적어(그 이상 필요해도 아는 만큼 계획을 쓰고 "확인 필요"라고 표시). 충분하면 needsClarification=false.
+2. (충분하면) plan에 네가 실제로 코딩할 구체적 실행 계획을 적어: 건드릴 파일, 각 파일에서 할 일, 예상되는 엣지케이스와 처리 방법, 완료 조건. "어떻게 할지"를 상세히 적어 — 이후 다른 에이전트들이 이 계획만 보고 비평할 거야.
 
-JSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","spec":"","dynamicRubricItems":"","vetoConditions":""}`
+JSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","plan":""}`
 }
 
-async function fullSpec(task, context, objection) {
-  const prompt = buildFullSpecPrompt(task, context, objection)
-  return agent(buildScoreDispatchInstruction('agy', prompt), {
-    phase: 'FullSpec',
-    label: objection ? 'full-spec-revised' : 'full-spec',
-    schema: FULL_SPEC_SCHEMA,
+async function codexOwnPlan(task, context, harnessFile) {
+  const prompt = buildCodexPlanPrompt(task, context)
+  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile), {
+    phase: 'FullPlan',
+    label: 'codex-own-plan',
+    schema: CODEX_PLAN_SCHEMA,
   })
 }
 
-const CODEX_REBUTTAL_SCHEMA = {
+// ---------- 전체 트랙: 2단계 (클로드+안티그래비티 블라인드 비평) ----------
+
+const CRITIQUE_SCHEMA = {
   type: 'object',
-  properties: { hasObjection: { type: 'boolean' }, objectionText: { type: 'string' } },
-  required: ['hasObjection'],
+  properties: {
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { description: { type: 'string' }, severity: { type: 'string' } },
+        required: ['description'],
+      },
+    },
+    notes: { type: 'string' },
+  },
+  required: ['issues'],
 }
 
-async function codexRebuttal(spec, context) {
-  const prompt = `안티그래비티가 아래 스펙과 채점표를 작성했어(둘 다 안티그래비티 혼자 작성 — 검증 없이 그대로 쓰면 자기참조 문제가 생기니까, 네가 딱 한 번 반박할 기회야). 스펙 자체를 다시 쓰지 말고, "이거 하나 빠졌다" "이 기준 이상하다" 같은 지적만 해.
+function buildCritiquePrompt(task, context, codexPlan) {
+  return `너는 독립 비평자야. 채점표나 점수는 없어 — 이 계획에서 실제로 문제가 될 만한 버그/공백/결함/오류만 찾아. 다른 비평자의 의견은 안 보여줌(블라인드 — 서로 결과를 보면 앵커링 편향이 생기니까).
+
+[원 지시문]
+${task}
 
 [저장소 컨텍스트]
 ${context.contextText}
 
-[스펙]
-${spec.spec}
+[코덱스가 작성한 실행 계획]
+${codexPlan.plan}
 
-[동적 채점 항목]
-${spec.dynamicRubricItems}
+이 계획을 실행했을 때 실제로 문제가 생길 만한 지점을 issues 배열에 담아(각 항목: description 필수, severity는 자유 텍스트, 예: "critical"/"minor"). 문제가 없으면 빈 배열. notes에 그 외 참고할 점을 자유롭게.
 
-[거부권 항목]
-${spec.vetoConditions}
+JSON으로만: {"issues":[{"description":"","severity":""}],"notes":""}`
+}
 
-이의 없으면 hasObjection=false. 있으면 hasObjection=true, objectionText에 구체적으로.
-
-JSON으로만: {"hasObjection":false,"objectionText":""}`
-  return agent(buildScoreDispatchInstruction('codex', prompt), {
-    phase: 'FullSpec',
-    label: 'codex-rebuttal',
-    schema: CODEX_REBUTTAL_SCHEMA,
+async function claudeCritiquePlan(task, context, codexPlan) {
+  return agent(buildCritiquePrompt(task, context, codexPlan), {
+    phase: 'FullCritique',
+    label: 'critique-claude',
+    schema: CRITIQUE_SCHEMA,
+    agentType: 'general-purpose',
   })
 }
 
-// ---------- 전체 트랙: 1단계 (초안 경쟁) ----------
+async function antigravityCritiquePlan(task, context, codexPlan) {
+  return agent(buildScoreDispatchInstruction('agy', buildCritiquePrompt(task, context, codexPlan)), {
+    phase: 'FullCritique',
+    label: 'critique-antigravity',
+    schema: CRITIQUE_SCHEMA,
+  })
+}
 
-const DRAFT_SCHEMA = { type: 'object', properties: { approach: { type: 'string' } }, required: ['approach'] }
+// ---------- 전체 트랙: 3단계 (코덱스 취합+판단+계획 개선, 5+7단계 병합) ----------
+// 사용자가 설명한 흐름에서 "코덱스가 버그/결함을 정리해 클로드에게 전달"(5)과
+// "코덱스가 클로드+안티의 분석을 객관적으로 평가해 개선 후 코딩 시작"(7)은
+// 원래 별개 턴이지만, 클로드의 하네스 반영(6)은 "다음 실행부터" 의미가
+// 있는 것이지 이번 실행 중 코덱스가 자기가 방금 만든 규칙을 다시 읽어야 할
+// 이유는 없다(이미 원본 비평 텍스트를 그대로 받으므로 정보 손실 없음).
+// 그래서 5+7을 한 호출로 병합해 왕복을 줄인다.
 
-function buildDraftPrompt(spec, context) {
-  return `아래 스펙만 보고(다른 에이전트의 의견은 안 보여줌) 이 작업에 어떻게 접근할지 제안해줘. 실제로 실행하지 말고 접근 방식/의견만.
+const RECONCILE_SCHEMA = {
+  type: 'object',
+  properties: {
+    compiledIssues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { description: { type: 'string' }, source: { type: 'string' } },
+        required: ['description', 'source'],
+      },
+    },
+    disagreements: { type: 'string' },
+    revisedPlan: { type: 'string' },
+  },
+  required: ['compiledIssues', 'revisedPlan'],
+}
+
+function buildReconcilePrompt(task, context, codexPlan, claudeCritique, antigravityCritique) {
+  return `아래는 네(코덱스)가 작성한 실행 계획과, 클로드+안티그래비티가 각각 독립적으로(서로 안 보고) 비평한 내용이야. 두 비평을 취합하고, 네가 보기에 타당한 지적은 반영해서 계획을 개선해. 타당하지 않다고 판단되는 지적은 disagreements에 왜 받아들이지 않는지 적고 무시해도 돼 — 비평자 말을 무조건 다 따를 필요는 없어, 네가 객관적으로 판단해.
+
+[원 지시문]
+${task}
 
 [저장소 컨텍스트]
 ${context.contextText}
 
-[스펙]
-${spec.spec}
+[네가 작성한 원래 계획]
+${codexPlan.plan}
 
-[종료조건 관련 채점 항목]
-${spec.dynamicRubricItems}
+[클로드의 비평]
+${JSON.stringify(claudeCritique?.issues || [])}
+${claudeCritique?.notes || ''}
 
-JSON으로만: {"approach":"구체적 접근 방식"}`
+[안티그래비티의 비평]
+${JSON.stringify(antigravityCritique?.issues || [])}
+${antigravityCritique?.notes || ''}
+
+1. compiledIssues에 두 비평에서 나온 이슈들을 (description, source: "claude" 또는 "antigravity") 형태로 전부 합쳐 적어 — 네가 타당하다고 본 것만이 아니라 나온 것 전부 기록해(사용자가 이후 이 기록으로 재발방지 문서를 만들 거야).
+2. disagreements에 네가 반영하지 않기로 한 지적과 그 이유를 적어(없으면 빈 문자열).
+3. revisedPlan에 비평을 반영한 최종 실행 계획을 적어 — 실제로 이 계획대로 코딩할 거야.
+
+JSON으로만: {"compiledIssues":[{"description":"","source":""}],"disagreements":"","revisedPlan":""}`
 }
 
-async function codexDraft(spec, context) {
-  return agent(buildScoreDispatchInstruction('codex', buildDraftPrompt(spec, context)), {
-    phase: 'FullDraft',
-    label: 'draft-codex',
-    schema: DRAFT_SCHEMA,
+async function codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, harnessFile) {
+  const prompt = buildReconcilePrompt(task, context, codexPlan, claudeCritique, antigravityCritique)
+  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile), {
+    phase: 'FullReconcile',
+    label: 'codex-reconcile',
+    schema: RECONCILE_SCHEMA,
   })
 }
 
-async function antigravityDraft(spec, context) {
-  return agent(buildScoreDispatchInstruction('agy', buildDraftPrompt(spec, context)), {
-    phase: 'FullDraft',
-    label: 'draft-antigravity',
-    schema: DRAFT_SCHEMA,
-  })
+// ---------- 하네스 파일 기록 (클로드, 영구 누적) ----------
+
+const HARNESS_APPEND_SCHEMA = {
+  type: 'object',
+  properties: {
+    appended: { type: 'boolean' },
+    rulesAdded: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['appended'],
 }
 
-// ---------- 전체 트랙: 2단계 (종합, 클로드) ----------
-
-async function synthesize(spec, draftCodex, draftAntigravity, baseline) {
-  const baselineBlock = baseline
-    ? `\n\n[기존 베이스라인 — 경량 트랙에서 이미 실행된 산출물, 버리지 말고 이걸 보완하는 방향으로]\n${baseline.summary}`
-    : ''
-  const codexBlock = draftCodex ? `\n\n[코덱스 초안]\n${draftCodex.approach}` : ''
+async function appendHarnessRules(issues, stageLabel, harnessFile) {
+  if (!issues || issues.length === 0) return { appended: false, rulesAdded: [] }
+  const issuesJson = JSON.stringify(issues)
   return agent(
-    `두 초안을 비교해서, 실제 실행을 맡을 코덱스에게 줄 **짧은** 지시문만 써줘 — 전체를 다시 쓰지 말고 "이 방향으로 가되 이 부분 보완" 정도로.${baselineBlock}${codexBlock}\n\n[안티그래비티 초안]\n${draftAntigravity.approach}\n\n[스펙]\n${spec.spec}\n\n지시문 텍스트만 출력해(부가 설명 없이).`,
-    { phase: 'FullDraft', label: 'synthesize', agentType: 'general-purpose' }
+    `아래는 verify-task-v2 워크플로우의 "${stageLabel}" 단계에서 발견된 결함/버그/오류 목록이야. 코덱스가 앞으로 같은 실수를 반복하지 않도록 이 내용을 영구 누적 규칙 문서에 추가해줘.
+
+1. Read 툴로 ${harnessFile}을 읽어봐. 파일이 없으면 첫 실행이니 아래 헤더로 새로 시작해(Write 툴로 먼저 저장):
+"# Codex Harness — 누적 규칙\\n\\n이 문서는 verify-task-v2 워크플로우가 발견한 결함/버그/오류를 코덱스가 앞으로 참고할 규칙으로 영구 누적한 것이다. append-only — 기존 규칙은 절대 삭제·수정하지 말 것.\\n\\n## 규칙 목록\\n"
+
+2. 아래 [발견된 이슈]를 하나씩 검토해서, 이번 작업에만 해당하는 구체적 서술이 아니라 앞으로도 유효한 범용적 규칙 문장으로 일반화해(예: "X 파일의 Y 함수가 틀림" 같은 1회성 서술이 아니라 "~할 때는 반드시 ~해야 한다"는 규칙 형태로). 파일에 이미 사실상 동일한 규칙이 있으면 중복 추가하지 말고 건너뛰어.
+3. Bash로 \`cat >> ${harnessFile} << 'HARNESSEOF'\n(일반화한 규칙들을 "- "로 시작하는 마크다운 리스트 각 줄로, 줄 끝에 "(출처: ${stageLabel})" 표기)\nHARNESSEOF\` 형태로 안전하게 append만 해 — 기존 내용은 절대 건드리지 마.
+4. 실제로 새로 추가한 규칙 문장들을 rulesAdded 배열에 담아 반환해(중복이라 건너뛴 건 포함하지 마). 하나도 못 추가했으면 appended=false에 빈 배열, 하나라도 추가했으면 appended=true.
+
+[발견된 이슈]
+${issuesJson}
+
+JSON으로만: {"appended":true,"rulesAdded":[""]}`,
+    {
+      phase: stageLabel === 'pre-execution' ? 'FullReconcile' : 'FullReview',
+      label: `harness-append-${stageLabel}`,
+      schema: HARNESS_APPEND_SCHEMA,
+      agentType: 'general-purpose',
+    }
   )
 }
 
-// ---------- 전체 트랙: 3단계 (실행, 코덱스, 쓰기 가능) ----------
+// ---------- 전체 트랙: 실행 (코덱스, 쓰기 가능) ----------
 
-async function fullExecute(cwd, instruction, context) {
+async function fullExecute(cwd, instruction, context, harnessFile) {
   const prompt = `아래 지시대로 실제로 파일을 수정/생성해줘. 작업 디렉토리: ${cwd}\n\n[저장소 컨텍스트]\n${context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 뭘 했는지 짧게 설명해.`
-  return agent(buildExecuteDispatchInstruction(cwd, prompt), {
+  return agent(buildExecuteDispatchInstruction(cwd, prompt, harnessFile), {
     phase: 'FullExecute',
     label: 'full-execute',
     schema: EXECUTE_ENVELOPE_SCHEMA,
   })
 }
 
-// ---------- 전체 트랙: 4단계 (평가, 안티그래비티) ----------
+// ---------- 전체 트랙: 코드 리뷰 (클로드+안티그래비티 블라인드, 무점수) ----------
 
-const FULL_EVAL_SCHEMA = {
+const CODE_REVIEW_SCHEMA = {
   type: 'object',
   properties: {
-    fixedScore: { type: 'number' },
-    dynamicScore: { type: 'number' },
-    total: { type: 'number' },
-    veto: { type: 'boolean' },
-    vetoReason: { type: 'string' },
-    feedback: { type: 'string' },
+    hasBlockingIssue: { type: 'boolean' },
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { description: { type: 'string' }, blocking: { type: 'boolean' } },
+        required: ['description', 'blocking'],
+      },
+    },
+    notes: { type: 'string' },
   },
-  required: ['fixedScore', 'dynamicScore', 'total', 'veto', 'feedback'],
+  required: ['hasBlockingIssue', 'issues'],
 }
 
-function buildFullEvalPrompt(spec, realDiff) {
-  return `너는 독립 채점자야. 네가 0단계에서 만든 아래 채점표로, 실제 변경사항(git diff — 이게 진실)을 채점해.
+function buildReviewPrompt(task, context, realDiff) {
+  return `너는 독립 코드 리뷰어야. 점수나 채점표는 없어 — 실제 변경사항(git diff)에서 버그/결함/오류만 찾아. 다른 리뷰어의 의견은 안 보여줌(블라인드).
 
-${FIXED_RUBRIC}
+[원 작업]
+${task}
 
-[동적 채점 항목 — 35점]
-${spec.dynamicRubricItems}
-
-[거부권 항목 — 걸리면 총점 무관 즉시 반려]
-${spec.vetoConditions}
-
-[스펙]
-${spec.spec}
+[저장소 컨텍스트]
+${context.contextText}
 
 [실제 변경사항 — git diff]
 ${realDiff.content}
 
-거부권 항목에 걸리면 veto=true, vetoReason에 구체적으로. 안 걸리면 veto=false로 하고 fixedScore(65점 만점)+dynamicScore(35점 만점)를 매겨 total에 합산. feedback에 구체적 감점 사유와 개선점.
+이 변경에서 실제로 문제가 되는 지점을 issues 배열에 담아(각 항목: description 필수, blocking — 반드시 고쳐야 할 정도면 true, 사소하면 false). 하나라도 blocking=true인 이슈가 있으면 hasBlockingIssue=true, 없으면 false. 문제가 없으면 issues는 빈 배열이고 hasBlockingIssue=false. notes에 그 외 참고할 점.
 
-JSON으로만: {"fixedScore":0,"dynamicScore":0,"total":0,"veto":false,"vetoReason":"","feedback":""}`
+JSON으로만: {"hasBlockingIssue":false,"issues":[{"description":"","blocking":false}],"notes":""}`
 }
 
-async function evaluateFull(spec, realDiff) {
-  const prompt = buildFullEvalPrompt(spec, realDiff)
-  return agent(buildScoreDispatchInstruction('agy', prompt), {
-    phase: 'FullEvaluate',
-    label: 'full-eval',
-    schema: FULL_EVAL_SCHEMA,
+async function claudeReviewDiff(task, context, realDiff) {
+  return agent(buildReviewPrompt(task, context, realDiff), {
+    phase: 'FullReview',
+    label: 'review-claude',
+    schema: CODE_REVIEW_SCHEMA,
+    agentType: 'general-purpose',
   })
 }
 
-// ---------- 노이즈 감지 ----------
+async function antigravityReviewDiff(task, context, realDiff) {
+  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff)), {
+    phase: 'FullReview',
+    label: 'review-antigravity',
+    schema: CODE_REVIEW_SCHEMA,
+  })
+}
+
+function formatFixInstruction(combinedIssues) {
+  return combinedIssues.map((it, i) => `${i + 1}. [${it.source}] ${it.description}`).join('\n')
+}
+
+// ---------- 노이즈 감지 (경량 트랙 전용 — 전체 트랙은 무점수라 해당 없음) ----------
 // 설계상 "구현 시 정할 파라미터"로 남겨둔 부분 — 라운드 간 점수 변동폭이
 // 실제 diff 변화량에 비해 과하면 "결함"이 아니라 "측정 노이즈 가능성"으로
 // 표시. 임계값은 보수적으로 시작 — 실측 데이터(verify-task-history) 쌓이면
-// 조정할 것.
+// 조정할 것. 2026-07-27 개정으로 전체 트랙은 무점수가 되어 이 함수를 더 이상
+// 호출하지 않지만, 경량 트랙은 그대로 이 함수를 쓴다 — 삭제하지 말 것.
 function flagNoise(prevTotal, currTotal, prevFileCount, currFileCount) {
   const scoreDelta = Math.abs(currTotal - prevTotal)
   const fileDelta = Math.abs(currFileCount - prevFileCount)
@@ -386,7 +485,7 @@ async function appendHistory(record, historyFile) {
   const recordJson = JSON.stringify(record)
   await agent(
     `아래 JSON 레코드 한 건을 히스토리 로그 파일에 한 줄(JSONL)로 추가(append)해줘. 기존 파일 내용은 절대 건드리지 말고 끝에 한 줄만 추가해.\n\n1. Bash로 \`mkdir -p $(dirname ${historyFile})\` 실행.\n2. Bash로 \`date -u +%Y-%m-%dT%H:%M:%SZ\` 실행해서 현재 UTC 시각을 얻어.\n3. 아래 JSON에 "timestamp" 필드로 그 시각을 추가한 뒤, 한 줄짜리 JSON 문자열로 만들어서 Bash \`cat >> ${historyFile} << 'HISTEOF'\n(그 JSON 한 줄)\nHISTEOF\` 형태로 안전하게 append 해.\n4. 성공하면 "ok"만 반환해.\n\n원본 JSON (timestamp 필드만 추가하고 나머지는 그대로 유지):\n${recordJson}`,
-    { phase: 'FullEvaluate', label: 'history-append', agentType: 'general-purpose' }
+    { phase: 'FullReview', label: 'history-append', agentType: 'general-purpose' }
   )
 }
 
@@ -398,6 +497,7 @@ const task = parsedArgs.task
 const persona = parsedArgs.persona || '일반 사용자'
 const cwd = parsedArgs.cwd
 const historyFile = parsedArgs.historyFile || '/Users/edge_ai/.claude/verify-task-v2-history.jsonl'
+const HARNESS_FILE = parsedArgs.harnessFile || HARNESS_FILE_DEFAULT
 
 if (!cwd) {
   return {
@@ -426,7 +526,8 @@ log(`티어 판정: ${tier} (예상 파일 ${context.intendedFiles?.length ?? '?
 
 const history = []
 let finalVerdict = null
-let baseline = null // 탈출구 발동 시 경량 트랙 산출물을 여기 보관, 전체 트랙 1단계에서 재사용
+let baseline = null // 탈출구 발동 시 경량 트랙 산출물을 여기 보관 — 전체 트랙에서 1~8단계(계획/비평/실행)를 생략하고 바로 코드리뷰로 직행하는 데 씀
+let harnessRulesAddedCount = 0
 
 // ---------- 경량 트랙 ----------
 if (tier === 'light') {
@@ -476,91 +577,99 @@ if (tier === 'light') {
 }
 
 // ---------- 전체 트랙 (직접 진입 또는 경량→전체 탈출구 재분류) ----------
+// 2026-07-27 개정: 채점표 없음. 1~3단계(코덱스 계획→클로드+안티 블라인드
+// 비평→코덱스 취합/개선)를 거쳐 실행하고, 실행 결과를 클로드+안티가 무점수로
+// 듀얼 리뷰한다. 탈출구로 들어온 경우 이미 실제 코드가 있으므로 1~3단계를
+// 생략하고 바로 리뷰로 직행한다.
 if (tier === 'full' && !finalVerdict) {
-  log('[전체] 0단계: 안티그래비티 스펙+채점표 작성 중...')
-  let spec = await fullSpec(task, context, null)
+  let realDiff
 
-  if (spec?.needsClarification) {
-    finalVerdict = {
-      passed: false,
-      tier: 'full',
-      error: 'needs_clarification',
-      questions: spec.clarifyingQuestions,
-      reason:
-        'Workflow 스크립트는 AskUserQuestion을 직접 못 부름. 호출한 에이전트가 questions를 사용자에게 AskUserQuestion으로 물어보고(필수 최대 3개+선택 최대 3개, 왕복 최대 2회), 답변을 원 task 문자열 끝에 덧붙여서 이 워크플로우를 다시 호출해야 함.',
-    }
-    log('[전체] 0단계: 정보 부족 — 역질문 필요')
-    return await finalizeAndReturn()
-  }
-
-  log('[전체] 0단계: 코덱스 반박권...')
-  const rebuttal = await codexRebuttal(spec, context)
-  if (rebuttal?.hasObjection) {
-    log('[전체] 코덱스 반박 있음 — 안티그래비티 1회 수정...')
-    spec = await fullSpec(task, context, rebuttal.objectionText)
-  }
-
-  log('[전체] 1단계: 초안 경쟁...')
-  let draftCodex = null
-  let draftAntigravity
   if (baseline) {
-    // 탈출구로 진입한 경우: 코덱스 초안 단계 생략(실물 베이스라인이 이미
-    // "의견"보다 나은 정보) — 안티그래비티만 독립적으로 접근 제시.
-    draftAntigravity = await antigravityDraft(spec, context)
+    log('[전체] 탈출구 경로 — 1~3단계(코덱스 계획/비평/취합) 생략, 코드리뷰로 직행')
+    realDiff = await gatherRealDiff(cwd)
   } else {
-    ;[draftCodex, draftAntigravity] = await parallel([
-      () => codexDraft(spec, context),
-      () => antigravityDraft(spec, context),
-    ])
-  }
+    log('[전체] 1단계: 코덱스 자체 계획 작성...')
+    const codexPlan = await codexOwnPlan(task, context, HARNESS_FILE)
 
-  let prevTotal = null
-  let prevFileCount = null
+    if (!codexPlan) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'codex_plan_failed',
+        reason: '코덱스 자체 계획 작성 단계가 실패함(세이프티 분류기 오류 등 일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+      }
+      log('[전체] 1단계: 코덱스 계획 작성 실패 — 재시도 필요')
+      return await finalizeAndReturn()
+    }
+
+    if (codexPlan?.needsClarification) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'needs_clarification',
+        questions: codexPlan.clarifyingQuestions,
+        reason:
+          'Workflow 스크립트는 AskUserQuestion을 직접 못 부름. 호출한 에이전트가 questions를 사용자에게 AskUserQuestion으로 물어보고(필수 최대 3개+선택 최대 3개, 왕복 최대 2회), 답변을 원 task 문자열 끝에 덧붙여서 이 워크플로우를 다시 호출해야 함.',
+      }
+      log('[전체] 1단계: 정보 부족 — 역질문 필요')
+      return await finalizeAndReturn()
+    }
+
+    log('[전체] 2단계: 클로드/안티그래비티 블라인드 비평...')
+    const [claudeCritique, antigravityCritique] = await parallel([
+      () => claudeCritiquePlan(task, context, codexPlan),
+      () => antigravityCritiquePlan(task, context, codexPlan),
+    ])
+
+    log('[전체] 3단계: 코덱스 취합+판단+계획 개선...')
+    const reconciled = await codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, HARNESS_FILE)
+
+    if (!reconciled) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'codex_reconcile_failed',
+        reason: '코덱스 취합/계획개선 단계가 실패함(일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+      }
+      log('[전체] 3단계: 코덱스 취합 실패 — 재시도 필요')
+      return await finalizeAndReturn()
+    }
+
+    log('[전체] 하네스 규칙 추가 (사전비평 단계)...')
+    const harnessResultPre = await appendHarnessRules(reconciled?.compiledIssues, 'pre-execution', HARNESS_FILE)
+    harnessRulesAddedCount += harnessResultPre?.rulesAdded?.length || 0
+
+    log('[전체] 실행: 코덱스가 개선된 계획대로 코딩...')
+    await fullExecute(cwd, reconciled?.revisedPlan, context, HARNESS_FILE)
+    realDiff = await gatherRealDiff(cwd)
+  }
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    let instruction
-    if (round === 1) {
-      log('[전체] 2단계: 클로드 종합 중...')
-      instruction = await synthesize(spec, draftCodex, draftAntigravity, baseline)
-    } else {
-      // 2회차부터: 클로드는 다시 종합하지 않고 안티의 지적을 그대로 전달만.
-      instruction = history[history.length - 1]?.evalResult?.feedback ?? ''
-      log('[전체] 재시도: 안티그래비티 피드백을 코덱스에게 그대로 전달')
+    log(`[전체] ${round}라운드: 클로드/안티그래비티 블라인드 코드리뷰(무점수)...`)
+    const [claudeReview, antigravityReview] = await parallel([
+      () => claudeReviewDiff(task, context, realDiff),
+      () => antigravityReviewDiff(task, context, realDiff),
+    ])
+
+    const combinedIssues = [
+      ...(claudeReview?.issues || []).map((i) => ({ ...i, source: 'claude' })),
+      ...(antigravityReview?.issues || []).map((i) => ({ ...i, source: 'antigravity' })),
+    ]
+    history.push({ tier: 'full', round, claudeReview, antigravityReview })
+
+    if (combinedIssues.length) {
+      // 탈출구 경로의 1라운드는 클로드(lightExecute)가 쓴 코드에서 나온
+      // 발견이라 저자 표기를 남겨, 클로드 툴 사용 특유의 문제까지
+      // "코덱스가 반복하는 실수"로 잘못 일반화되지 않게 한다.
+      const stageLabel = baseline && round === 1 ? 'code-review-of-claude-baseline' : 'code-review'
+      const harnessResultPost = await appendHarnessRules(combinedIssues, stageLabel, HARNESS_FILE)
+      harnessRulesAddedCount += harnessResultPost?.rulesAdded?.length || 0
     }
 
-    log(`[전체] 라운드 ${round}: 코덱스 실행 중...`)
-    const execEnvelope = await fullExecute(cwd, instruction, context)
-    const realDiff = await gatherRealDiff(cwd)
-
-    log(`[전체] 라운드 ${round}: 안티그래비티 평가 중...`)
-    const evalResult = await evaluateFull(spec, realDiff)
-    history.push({ tier: 'full', round, execEnvelope, evalResult })
-
-    const currFileCount = realDiff?.filesChanged?.length ?? 0
-    const noise = prevTotal !== null ? flagNoise(prevTotal, evalResult?.total ?? 0, prevFileCount, currFileCount) : false
-    prevTotal = evalResult?.total ?? 0
-    prevFileCount = currFileCount
-
-    if (evalResult?.veto) {
-      log(`[전체] 라운드 ${round}: 거부권 발동 — ${evalResult.vetoReason}`)
-      if (round === MAX_ROUNDS) {
-        finalVerdict = {
-          passed: false,
-          tier: 'full',
-          round,
-          evalResult,
-          noise,
-          needsUserDecision: true,
-          reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 거부권을 못 벗어남. 사용자에게 물어야 함.`,
-        }
-        break
-      }
-      continue
-    }
-
-    if ((evalResult?.total ?? 0) >= 90) {
-      finalVerdict = { passed: true, tier: 'full', round, evalResult, noise, wasEscapeHatch: !!baseline }
-      log(`[전체] 라운드 ${round}에서 통과 (${evalResult.total}점)${noise ? ' — 단, 노이즈 가능성 있음' : ''}`)
+    const passed = !claudeReview?.hasBlockingIssue && !antigravityReview?.hasBlockingIssue
+    if (passed) {
+      finalVerdict = { passed: true, tier: 'full', round, wasEscapeHatch: !!baseline }
+      log(`[전체] ${round}라운드에서 통과 (블로킹 이슈 없음)`)
       break
     }
 
@@ -569,15 +678,16 @@ if (tier === 'full' && !finalVerdict) {
         passed: false,
         tier: 'full',
         round,
-        evalResult,
-        noise,
+        combinedIssues,
         needsUserDecision: true,
-        reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 90점을 못 넘김. 사용자에게 물어야 함.`,
+        reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 블로킹 이슈를 해소 못함. 사용자에게 물어야 함.`,
       }
       break
     }
 
-    log(`[전체] 라운드 ${round} 미통과 (${evalResult?.total ?? '?'}점)${noise ? ' — 노이즈 가능성' : ''}`)
+    log(`[전체] ${round}라운드 불통과 — 코덱스에게 수정 지시`)
+    await fullExecute(cwd, formatFixInstruction(combinedIssues), context, HARNESS_FILE)
+    realDiff = await gatherRealDiff(cwd)
   }
 }
 
@@ -588,7 +698,7 @@ async function notifyDiscordEscalation(message) {
   try {
     await agent(
       `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}`,
-      { phase: 'FullEvaluate', label: 'discord-notify', agentType: 'general-purpose' }
+      { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
     )
   } catch (e) {
     log(`디스코드 알림 실패(무시): ${e}`)
@@ -615,7 +725,9 @@ async function finalizeAndReturn() {
       passed: !!finalVerdict?.passed,
       needsUserDecision: !!finalVerdict?.needsUserDecision,
       needsClarification: finalVerdict?.error === 'needs_clarification',
-      finalTotal: finalVerdict?.evalResult?.total ?? null,
+      finalTotal: tier === 'light' ? (finalVerdict?.evalResult?.total ?? null) : null,
+      finalHasBlockingIssue: tier === 'full' && finalVerdict && !finalVerdict.error ? !finalVerdict.passed : null,
+      rulesAddedToHarness: tier === 'full' ? harnessRulesAddedCount : null,
     },
     historyFile
   )
