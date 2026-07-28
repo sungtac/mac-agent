@@ -493,6 +493,7 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
 
 
 USAGE_PREFLIGHT_GATE_SH = MAC_AGENT / "workflows" / "lib" / "usage-preflight-gate.sh"
+USAGE_GATE_TIMEOUT_SECONDS = 15  # should return in well under a second normally; bounds a `coach` hang instead of wedging the caller's lock forever
 
 
 async def usage_gate_check(actor: str) -> str | None:
@@ -507,9 +508,21 @@ async def usage_gate_check(actor: str) -> str | None:
     user directly and return — no pending-job/auto-retry needed here, the
     user can just re-send the command once usage recovers.
 
-    Fails open (returns None, i.e. "proceed") on any subprocess error — a
-    broken gate must not become a new way for these commands to stop
-    working, same posture as every bash call site's `|| echo "PROCEED..."`.
+    Fails open (returns None, i.e. "proceed") on any subprocess error OR
+    timeout — a broken gate must not become a new way for these commands to
+    stop working, same posture as every bash call site's
+    `|| echo "PROCEED..."`.
+
+    15s timeout (2026-07-29, found in review before ever hit live): this is
+    called from INSIDE FREE_CHAT_LOCK / CODEX_DISPATCH_LOCKS[alias] (see
+    those callers), so an unbounded hang here doesn't just delay one
+    message — it permanently wedges that lock, since nothing else in this
+    function can ever un-block it. `coach` (the underlying data source,
+    via usage-preflight-gate.sh) has been observed mid-session to report a
+    query-timeout condition for one of its own provider checks
+    ("조회 시간초과(hang?)"), confirming it can genuinely stall — this
+    script had no timeout of its own to guard against that propagating
+    upward into an unrecoverable lock.
     """
     try:
         proc = await asyncio.create_subprocess_exec(
@@ -517,7 +530,11 @@ async def usage_gate_check(actor: str) -> str | None:
             env=SUBPROCESS_ENV,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
-        out, _ = await proc.communicate()
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=USAGE_GATE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return None
         text = out.decode(errors="replace").strip()
     except Exception:
         return None

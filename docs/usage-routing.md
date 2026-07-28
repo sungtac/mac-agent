@@ -70,5 +70,13 @@
   리다이렉트)로 검증 — 실제 launchd 스케줄이나 진짜 Discord 왕복으로 라이브 전체 실행까지는
   아직 안 함(다음 실제 발동 때 확인). 상세 근거는 각 커밋 메시지와 `docs/discord-bot.md`/
   `docs/kakao-playmcp.md` 참고.
+- **`usage_gate_check()` 자체에 타임아웃 없던 결함(2026-07-29, `!코덱스` 코드리뷰로 발견)**:
+  `discord-bot.py`의 `usage_gate_check()`가 `usage-preflight-gate.sh`(→`coach --json`)를
+  기다리는 데 원래 `asyncio.wait_for` 없이 무기한 대기했다. `coach`가 세션 도중 실제로
+  자기 provider 조회 중 하나에서 "조회 시간초과(hang?)"를 낸 사례가 이미 관측됐는데, 이
+  호출이 `FREE_CHAT_LOCK`/`CODEX_DISPATCH_LOCKS[alias]` **안에서** 일어나서, 진짜로 멈추면
+  그 락이 봇을 재시작하기 전까진 영원히 안 풀리는 구조였다. `USAGE_GATE_TIMEOUT_SECONDS`(15초)
+  추가, 타임아웃도 fail-open(PROCEED)로 처리. 가짜로 영원히 멈추는 스크립트를 넣어 타임아웃이
+  실제로 발동하는 것까지 확인.
 
 verify-task.js/verify-task-v2.js의 역할 고정(안티=스펙+평가, 코덱스=초안+실행)은 이 정책과 무관 — 사용량과 상관없이 그대로 유지(자기평가 방지 설계를 사용량 이유로 깨면 안 됨).
