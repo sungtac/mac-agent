@@ -24,15 +24,15 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 세 에스컬레이션 소스 중 `weekly-report.sh`만 재시도가 안전하다고 판단해(2026-07-28) 이것부터
 구현했다: 재실행 자체가 안전하고, 유일한 중복 위험(Calendar 이벤트 매번 새로 생성)은 4번
-단계에 `search_events` 선확인 가드를 추가해 막았다. 나머지 둘은 아래처럼 이번에도 일방향으로
+단계에 `search_events` 선확인 가드를 추가해 막았다. 나머지 둘은 이 시점엔 일방향으로
 남겨뒀다:
 
 - `verify-task-v2.js`의 `needsUserDecision`/`needsClarification`은 재개(resume) 메커니즘
   자체가 없다 — 유일한 복구 경로가 "질문에 답 → 전체 워크플로우를 처음부터 재호출"이고, 이걸
-  헤드리스(활성 터미널 없이)로 하려면 `agent()` 셔임을 새로 만들어야 해서 Phase 2.5로 미룸.
+  헤드리스(활성 터미널 없이)로 하려면 `agent()` 셔임을 새로 만들어야 해서 여전히 미구현.
 - `work-log-stop-check.sh`는 `.dispatched` 마커 때문에 단순 재실행이 즉시 no-op되고, 스크립트
   자체 주석에 "중복 아카이브/캘린더 이벤트 위험 때문에 재시도를 의도적으로 안 만들었다"고
-  이미 적혀 있어 그 판단을 이번에도 그대로 존중함.
+  적혀 있었다 — 아래 "## Phase 2.5" 절에서 이 판단을 실제로 다시 검토해 해결했다.
 
 동작: 실패 알림에 답장(Discord reply) → `discord-bot.py`가 `message.reference`로
 `~/.claude/discord-bot/pending/<id>.json`을 찾아 `type: "weekly-report-retry"`를 확인하고
@@ -48,11 +48,43 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 exit 3을 "⏳ 이미 실행 중"으로 별도 표시한다(실패로 오표시하지 않음). 락이 30분 넘게 남아있으면
 (비정상 종료로 stale) 자동으로 무시하고 새로 잡는다.
 
+## Phase 2.5 — work-log-stop-check.sh 답장 재시도
+
+원래 재시도를 안 만든 이유(스크립트 주석)는 "재실행이 아카이브 파일/캘린더 이벤트를 중복
+생성할 수 있다"였는데, 실제로 뜯어보면 **두 산출물의 중복 위험이 서로 다르다**:
+
+- **아카이브 파일 복사는 원래부터 멱등적이다** — 프롬프트가 원본 파일을 `.../YYYY-MM-DD/`
+  날짜 폴더로 "복사"만 시키는데, 같은 소스 파일명은 같은 목적지 경로로 재실행해도 그냥
+  덮어쓰기만 된다. 손댈 필요가 없었다.
+- **진짜 위험은 캘린더 이벤트 하나뿐**이었다 — 매번 "새로 생성해라"고만 지시돼 있어 존재
+  확인 없이 무조건 새로 만들었다. `weekly-report.sh`의 `search_events` 선확인 가드와
+  동일한 발상으로 막았다: 이벤트 description 맨 끝에 검색 가능한 `[세션ID: <id>]` 마커를
+  반드시 남기게 하고, 새로 만들기 **전에** 오늘 날짜로 그 마커가 포함된 기존 이벤트가
+  있는지 먼저 찾아서 있으면 update, 없으면만 생성하도록 프롬프트를 바꿨다.
+
+나머지 두 가지 실제 구현 문제:
+
+- **`.dispatched` 마커**: 최초 1회 찍히면 이후 같은 세션ID는 스크립트 맨 위에서 즉시
+  `exit 0`(정리 로직 없음). 재시도 시 `discord-bot.py`의 `handle_work_log_retry()`가
+  `$STATE_DIR/work-log/<session_id>.dispatched`를 먼저 지우고 시작한다.
+- **stdin 전용 입력**: 이 스크립트는 Claude Code Stop 훅 전용으로 설계돼 stdin JSON
+  (`{"session_id":..., "transcript_path":...}`)만 받는다. `weekly-report.sh`처럼 "그냥
+  재실행"이 안 돼서, 최초 실패 시 pending-job의 `params`에 이 두 값을 담아뒀다가 재시도
+  때 합성 stdin으로 다시 흘려보낸다.
+
+**완료/실패 알림 자체가 원래 없었다**: 기존엔 타임아웃 실패에만 알림이 갔고, 성공이나
+타임아웃 아닌 실패는 로그 파일에만 조용히 남았다(재시도 호출자가 결과를 알 방법이 없었음).
+이제 세 갈래 다 알림: 성공 시 "✅ 완료"(단, 실제로 "LOGGED:"를 출력한 경우만 — 세션이
+`SKIP` 판정났을 때까지 매번 알리면 스팸이 되므로 제외), 실패 시 pending-job과 함께
+"⚠️ 실패, 답장하면 재시도" 알림. 스크립트가 `( ... ) & disown`으로 실제 작업을
+백그라운드에 넘기고 즉시 반환하는 구조라, `handle_work_log_retry()`는 재시도 디스패치
+자체가 정상 시작됐는지만 확인하고, 진짜 성공/실패는 이 새 알림 경로로 별도로 온다.
+
 ## 에스컬레이션 알림 연결 지점
 
 - `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능).
-- `hooks/work-log-stop-check.sh` — watchdog 타임아웃 시 `discord-notify.sh` 호출(일방향, Phase 2.5 예정).
-- `workflows/verify-task-v2.js` — `needsUserDecision`/`needsClarification`로 끝나면(경량/전체 트랙 공통) `discord-notify.sh` 호출(일방향, Phase 2.5 예정).
+- `hooks/work-log-stop-check.sh` — 실패(타임아웃 포함) 시 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 성공 시에도(LOGGED일 때만) 알림.
+- `workflows/verify-task-v2.js` — `needsUserDecision`/`needsClarification`로 끝나면(경량/전체 트랙 공통) `discord-notify.sh` 호출(일방향, 재개 메커니즘 없어 재시도 미구현).
 
 ## 알려진 제약
 

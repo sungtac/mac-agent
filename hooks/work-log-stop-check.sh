@@ -23,6 +23,38 @@ CLAUDE_BIN="$HOME/.local/bin/claude"
 STATE_DIR="$HOME/.claude/hooks-state/work-log"
 DRIVE_ARCHIVE_ROOT="$HOME/Library/CloudStorage/GoogleDrive-sungtac@gmail.com/내 드라이브/업무아카이브"
 CALENDAR_ID="sungtac@gmail.com"
+# Phase 2.5: pending-job store discord-bot.py reads on a reply (same schema/
+# location as weekly-report.sh's Phase 2 v1 — see docs/discord-bot.md).
+PENDING_DIR="$HOME/.claude/discord-bot/pending"
+
+# Writes a pending-job file for `discord-notify.sh`'s returned message id, so
+# a Discord reply to that message can trigger a retry. No-ops silently if
+# discord-notify.sh returned no id (config missing, API call failed, etc.) —
+# same "never break the caller" posture as discord-notify.sh itself.
+#
+# created_at uses naive local-time `datetime.now().isoformat()` (via Python,
+# not `date -u ...Z`) to exactly match weekly-report.sh's Phase 2 v1 writer —
+# discord-bot.py's handle_pending_reply() compares this against another naive
+# `datetime.datetime.now()` call, so a UTC/local or aware/naive mismatch here
+# would silently skew the 48h expiry window (or throw on parse, on Python
+# versions where fromisoformat rejects a trailing "Z").
+write_pending_job() {
+  local notify_text="$1"
+  local msg_id
+  msg_id="$(bash "$HOME/mac-agent/bin/discord-notify.sh" "$notify_text")"
+  [ -z "$msg_id" ] && return 0
+  mkdir -p "$PENDING_DIR"
+  python3 -c "
+import json, sys, datetime
+job = {
+    'type': 'work-log-retry',
+    'created_at': datetime.datetime.now().isoformat(),
+    'params': {'session_id': sys.argv[1], 'transcript_path': sys.argv[2]},
+}
+with open(sys.argv[3], 'w') as f:
+    json.dump(job, f)
+" "$SESSION_ID" "$TRANSCRIPT_PATH" "$PENDING_DIR/${msg_id}.json"
+}
 
 INPUT="$(cat)"
 SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
@@ -64,8 +96,10 @@ PROMPT=$(cat <<PROMPT_EOF
 
 2. (a)로 판단되면:
    - 트랜스크립트에서 Write/Edit 도구로 만들어지거나 수정된 실제 산출물 파일 경로를 찾아라 (Claude Code 자체 설정/훅/스킬 파일은 제외).
-   - 그 파일들을 "${DRIVE_ARCHIVE_ROOT}/\$(date +%Y-%m-%d)/" 폴더(없으면 생성)로 복사해라. 원본은 그대로 두고 복사만 해라.
-   - Google Calendar(calendar_id: ${CALENDAR_ID})에 오늘 날짜로 이벤트를 하나 새로 생성해라. 제목은 한 일을 짧게 요약, description에는 2~3문장 요약과 정리한 파일 목록을 적어라. 시간은 지금 시각 기준 30분짜리로 잡아라.
+   - 그 파일들을 "${DRIVE_ARCHIVE_ROOT}/\$(date +%Y-%m-%d)/" 폴더(없으면 생성)로 복사해라. 원본은 그대로 두고 복사만 해라. (같은 파일명은 같은 목적지 경로로 다시 복사해도 그냥 덮어써질 뿐이니 재실행 걱정 없이 그대로 해라.)
+   - **먼저** Google Calendar(calendar_id: ${CALENDAR_ID})에서 오늘 날짜로 description에 정확히 "[세션ID: ${SESSION_ID}]" 문자열이 포함된 기존 이벤트가 있는지 search_events로 찾아봐라.
+     - 있으면: 그 이벤트를 update해라(제목/설명을 이번 판단 내용으로 갱신) — 새로 만들지 마라. 이건 재시도 상황이라는 뜻이다.
+     - 없으면: 새로 만들어라. 제목은 한 일을 짧게 요약, description에는 2~3문장 요약 + 정리한 파일 목록 + 맨 끝 줄에 반드시 "[세션ID: ${SESSION_ID}]"를 그대로 포함해라(이후 재시도 시 이 문자열로 중복 생성을 막는 유일한 단서다 — 절대 빠뜨리지 마라). 시간은 지금 시각 기준 30분짜리로 잡아라.
    - 마지막에 "LOGGED: <이벤트 제목>" 한 줄을 출력해라.
 
 꼭 필요한 도구 호출만 간결하게 해라.
@@ -97,7 +131,7 @@ PROMPT_EOF
       kill -9 "$CLAUDE_PID" 2>/dev/null
       wait "$CLAUDE_PID" 2>/dev/null
       echo "TIMEOUT after ${TIMEOUT_SECONDS}s — killed. Debug log: ${DEBUG_LOGFILE}. See mac-agent/docs/worklog-hook.md." >> "$LOGFILE"
-      bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ work-log 세션 기록 실패(타임아웃). 세션 ${SESSION_ID}. 로그: ${LOGFILE}" || true
+      write_pending_job "⚠️ work-log 세션 기록 실패(타임아웃). 세션 ${SESSION_ID}. 로그: ${LOGFILE}. 이 메시지에 답장하면 재시도합니다." || true
       exit 1
     fi
     sleep 15
@@ -107,6 +141,21 @@ PROMPT_EOF
   EXIT_CODE=$?
   [ "$EXIT_CODE" -eq 0 ] && rm -f "$DEBUG_LOGFILE"
   echo "exit=${EXIT_CODE}" >> "$LOGFILE"
+  # Phase 2.5: previously silent on both success and non-timeout failure —
+  # a retry caller (or the original dispatch) had no way to know the real
+  # outcome. Now notify on a real failure (offer retry), and on a real
+  # LOGGED completion (rare-ish, so worth a ping) — but NOT on the common
+  # SKIP case (most sessions), since exit=0 covers both "actually logged"
+  # and "correctly decided not to log anything", and notifying on every
+  # SKIP would spam the channel and defeat the "누락보다 과잉 기록이 낫다"
+  # noise-minimizing design this hook already committed to.
+  if [ "$EXIT_CODE" -eq 0 ]; then
+    if grep -q '^LOGGED:' "$LOGFILE" 2>/dev/null; then
+      bash "$HOME/mac-agent/bin/discord-notify.sh" "✅ work-log 세션 기록 완료. 세션 ${SESSION_ID}." >/dev/null || true
+    fi
+  else
+    write_pending_job "⚠️ work-log 세션 기록 실패(exit=${EXIT_CODE}). 세션 ${SESSION_ID}. 로그: ${LOGFILE}. 이 메시지에 답장하면 재시도합니다." || true
+  fi
 ) &
 disown
 

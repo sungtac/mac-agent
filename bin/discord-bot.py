@@ -172,6 +172,21 @@ async def handle_work_log_retry(message: discord.Message, params: dict):
     real success/failure signal arrives later, independently, via the
     script's own Phase 2.5 completion notification (see
     hooks/work-log-stop-check.sh) — not from this function.
+
+    stdout/stderr are DEVNULL, not PIPE, and this awaits `proc.wait()`, not
+    `proc.communicate()` — a real bug caught by live testing (2026-07-28):
+    the disowned background subshell inherits the script's stdout/stderr
+    file descriptors and holds them open for as long as IT runs (up to the
+    script's own 300s watchdog), even though the top-level `bash` process
+    itself returns in milliseconds. `communicate()` waits for those pipes to
+    hit EOF, not just for the process to exit, so it silently blocked for
+    the full 30s timeout on every single call in practice — confirmed via a
+    live test end-to-end (PIPE reliably timed out at 30s; DEVNULL + wait()
+    returned in ~0.02s for the identical dispatch). Do not "fix" this back
+    to PIPE to capture output — there is no output worth capturing here
+    anyway (nothing meaningful is written to the top-level script's own
+    stdout/stderr; the real diagnostics all live in the per-session
+    LOGFILE/DEBUG_LOGFILE inside work-log-stop-check.sh).
     """
     session_id = params.get("session_id")
     transcript_path = params.get("transcript_path")
@@ -189,18 +204,20 @@ async def handle_work_log_retry(message: discord.Message, params: dict):
             "/bin/bash", str(WORK_LOG_STOP_CHECK_SH),
             env=SUBPROCESS_ENV,
             stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
-        stdout, _ = await asyncio.wait_for(proc.communicate(input=stdin_json), timeout=30)
+        proc.stdin.write(stdin_json)
+        await proc.stdin.drain()
+        proc.stdin.close()
+        await asyncio.wait_for(proc.wait(), timeout=30)
         if proc.returncode == 0:
             await message.channel.send(f"재시도 시작했습니다 (세션 {session_id}) — 완료되면 따로 알려드릴게요.")
         else:
-            tail = (stdout or b"").decode(errors="replace")[-500:]
-            await message.channel.send(f"❌ work-log 재시도 디스패치 자체가 실패했습니다 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+            await message.channel.send(f"❌ work-log 재시도 디스패치 자체가 실패했습니다 (exit={proc.returncode}). 로그: ~/.claude/hooks-state/work-log/{session_id}.log")
     except asyncio.TimeoutError:
         proc.kill()
-        await message.channel.send(f"⚠️ work-log 재시도 디스패치가 30초 안에 반환되지 않았습니다 — 정상이라면 백그라운드로 넘어가면서 거의 즉시 반환돼야 하는데 이상 상황입니다. 세션 {session_id} 직접 확인이 필요합니다.")
+        await message.channel.send(f"⚠️ work-log 재시도 디스패치가 30초 안에 반환되지 않았습니다 — 정상이라면 거의 즉시 반환돼야 하는데 이상 상황입니다. 세션 {session_id} 직접 확인이 필요합니다.")
     except Exception as e:
         await message.channel.send(f"❌ work-log 재시도 실행 중 예외: {e}")
 
