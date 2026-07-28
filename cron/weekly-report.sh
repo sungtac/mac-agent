@@ -39,6 +39,29 @@ mkdir -p "$STATE_DIR"
 TODAY="$(date +%Y-%m-%d)"
 LOGFILE="$STATE_DIR/${TODAY}.log"
 
+# Mutex: launchd's Thursday schedule, `!주간보고서`, and Phase 2's reply-retry
+# can all end up invoking this script around the same time. Without a lock,
+# two concurrent runs can each pass the Calendar search-first check before
+# either has created/updated the event, defeating the idempotency guard added
+# below and creating a duplicate. Exit code 3 = skipped (another run is
+# already in progress) — distinct from 0 (success) and 1 (failed after
+# retries) so discord-bot.py can report it accurately instead of showing a
+# skip as either success or failure.
+LOCK_FILE="$STATE_DIR/.lock"
+LOCK_MAX_AGE_SECONDS=1800   # generous above the ~13min worst-case full run
+if [ -f "$LOCK_FILE" ]; then
+  LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null)"
+  LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+  if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null && [ "$LOCK_AGE" -lt "$LOCK_MAX_AGE_SECONDS" ]; then
+    echo "already running (pid ${LOCK_PID}, lock age ${LOCK_AGE}s) — skipping to avoid duplicate Calendar events." >> "$LOGFILE"
+    echo "SKIPPED_ALREADY_RUNNING (pid ${LOCK_PID})"
+    exit 3
+  fi
+  echo "stale lock (pid ${LOCK_PID:-unknown}, age ${LOCK_AGE}s) — taking over." >> "$LOGFILE"
+fi
+echo $$ > "$LOCK_FILE"
+trap 'rm -f "$LOCK_FILE"' EXIT
+
 # Compute the Monday..Friday range of the current week regardless of which
 # day this actually fires on (launchd can run a missed job late on wake).
 WEEKDAY="$(date +%u)"   # 1=Mon .. 7=Sun

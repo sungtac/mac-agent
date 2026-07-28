@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Discord bot — Phase 1 (on-demand automation triggers) + Phase 2 v1
-(reply-triggered retry for weekly-report.sh only; see handle_pending_reply).
+(reply-triggered retry for weekly-report.sh) + Phase 2.5 (reply-triggered
+retry for work-log-stop-check.sh; see handle_pending_reply).
 Runs as a persistent process under launchd (KeepAlive) since it holds a
 Gateway WebSocket connection — this is NOT a periodic cron job like
 weekly-report.sh.
@@ -17,9 +18,11 @@ Reply-triggered retries inherit this same boundary (checked before dispatch).
 
 Phase 1 scope: two deterministic commands only. No free-form chat relay to
 `claude -p` yet (that's Phase 3) — a bare "!command" prefix keeps the
-surface small and auditable. Phase 2 v1 only handles weekly-report.sh
-retries — verify-task-v2 clarification and work-log-stop-check retries are
-Phase 2.5, not yet implemented (see docs/discord-bot.md).
+surface small and auditable. Phase 2 v1 (weekly-report.sh) and Phase 2.5
+(work-log-stop-check.sh) both handle retries; verify-task-v2 clarification
+retry remains unimplemented (see docs/discord-bot.md) since it needs a
+resume mechanism that doesn't exist yet, unlike the other two which are
+just re-running a self-contained script.
 """
 import asyncio
 import datetime
@@ -34,7 +37,9 @@ import discord
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
+WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
+WORK_LOG_DISPATCHED_MARKER_DIR = STATE_DIR / "work-log"
 
 # Phase 2: pending-job store for reply-triggered retries. Written by scripts
 # that escalate via discord-notify.sh (keyed by that call's returned message
@@ -129,14 +134,75 @@ async def handle_weekly_report(message: discord.Message):
             proc.kill()
             await message.channel.send(f"⚠️ 주간보고서 실행이 {WEEKLY_REPORT_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 스크립트 자체 watchdog도 못 잡은 이상 상황이라 직접 확인이 필요합니다.")
             return
-        ok = proc.returncode == 0
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-10:])
-        if ok:
+        if proc.returncode == 0:
             await message.channel.send(f"✅ 주간보고서 완료.\n```\n{tail}\n```"[:1900])
+        elif proc.returncode == 3:
+            # weekly-report.sh's own lockfile mutex: another run (launchd's
+            # schedule, a manual !주간보고서, or another reply) was already
+            # in progress. Not a failure — say so plainly rather than
+            # showing a red X for something that didn't actually break.
+            await message.channel.send(f"⏳ 이미 다른 실행이 진행 중이라 이번 요청은 건너뛰었습니다. 그 실행이 끝난 뒤 상태를 `!상태`로 확인해주세요.\n```\n{tail}\n```"[:1900])
         else:
             await message.channel.send(f"❌ 주간보고서 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
     except Exception as e:
         await message.channel.send(f"❌ 주간보고서 실행 중 예외: {e}")
+
+
+async def handle_work_log_retry(message: discord.Message, params: dict):
+    """Re-run work-log-stop-check.sh for one specific session, triggered by
+    a Discord reply. Unlike weekly-report.sh (a self-contained script with
+    no external state), this hook is Stop-hook-only by design: it reads
+    session_id/transcript_path from stdin JSON that Claude Code itself
+    normally supplies. A bare re-invocation (mirroring handle_weekly_report's
+    no-stdin subprocess call) would hit the script's own `[ -z "$SESSION_ID"
+    ] && exit 0` guard and silently no-op — so this synthesizes that same
+    stdin JSON from the pending-job's captured params instead.
+
+    The script also unconditionally touches a `.dispatched` marker on first
+    run and never cleans it up (a same-session-once guard against Stop
+    firing multiple times via /clear, /compact, /resume) — that marker must
+    be removed here first, or this retry would ALSO silently no-op at that
+    check, one line before the real work.
+
+    Does NOT await the actual archive+Calendar work: the script backgrounds
+    that part internally (`( ... ) & disown`) and returns almost immediately
+    by design (so the original Stop hook never blocks session exit) — this
+    call only confirms the top-level dispatch itself started cleanly. The
+    real success/failure signal arrives later, independently, via the
+    script's own Phase 2.5 completion notification (see
+    hooks/work-log-stop-check.sh) — not from this function.
+    """
+    session_id = params.get("session_id")
+    transcript_path = params.get("transcript_path")
+    if not session_id or not transcript_path:
+        await message.channel.send(f"❌ work-log 재시도 실패 — pending-job에 session_id/transcript_path가 없습니다: {params!r}")
+        return
+
+    marker = WORK_LOG_DISPATCHED_MARKER_DIR / f"{session_id}.dispatched"
+    marker.unlink(missing_ok=True)
+
+    stdin_json = json.dumps({"session_id": session_id, "transcript_path": transcript_path}).encode()
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(WORK_LOG_STOP_CHECK_SH),
+            env=SUBPROCESS_ENV,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(input=stdin_json), timeout=30)
+        if proc.returncode == 0:
+            await message.channel.send(f"재시도 시작했습니다 (세션 {session_id}) — 완료되면 따로 알려드릴게요.")
+        else:
+            tail = (stdout or b"").decode(errors="replace")[-500:]
+            await message.channel.send(f"❌ work-log 재시도 디스패치 자체가 실패했습니다 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+    except asyncio.TimeoutError:
+        proc.kill()
+        await message.channel.send(f"⚠️ work-log 재시도 디스패치가 30초 안에 반환되지 않았습니다 — 정상이라면 백그라운드로 넘어가면서 거의 즉시 반환돼야 하는데 이상 상황입니다. 세션 {session_id} 직접 확인이 필요합니다.")
+    except Exception as e:
+        await message.channel.send(f"❌ work-log 재시도 실행 중 예외: {e}")
 
 
 async def handle_pending_reply(message: discord.Message) -> bool:
@@ -168,8 +234,20 @@ async def handle_pending_reply(message: discord.Message) -> bool:
     job_path.unlink(missing_ok=True)  # delete first so a second reply can't double-trigger
 
     if job_type == "weekly-report-retry":
-        await message.channel.send("답장 확인 — 주간보고서 재시도합니다.")
+        # The ack is a courtesy, not load-bearing — if sending it hiccups
+        # (transient Discord API error), still run the actual retry below.
+        # The job file is already deleted at this point, so if we returned
+        # here on an ack failure without retrying, the retry would be lost
+        # silently with no way for the user to trigger it again via reply.
+        try:
+            await message.channel.send("답장 확인 — 주간보고서 재시도합니다.")
+        except Exception as e:
+            print(f"pending job {ref.message_id}: ack send failed ({e}), retrying anyway", file=sys.stderr)
         await handle_weekly_report(message)
+        return True
+
+    if job_type == "work-log-retry":
+        await handle_work_log_retry(message, job.get("params", {}))
         return True
 
     # Unhandled type (e.g. a future Phase 2.5 source) — log and ignore rather
