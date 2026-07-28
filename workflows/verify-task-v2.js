@@ -691,11 +691,36 @@ if (tier === 'full' && !finalVerdict) {
       () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry), '안티그래비티 코드리뷰'),
     ])
 
+    history.push({ tier: 'full', round, claudeReview, antigravityReview })
+
+    // 실측(2026-07-28, discord-bot의 verify-task-v2-retry 테스트 중 계정
+    // 세션 한도 초과로 재현됨): claudeReview/antigravityReview 둘 다 agent()가
+    // null을 반환할 수 있는데(터미널 API 오류 등), 아래 `!x?.hasBlockingIssue`
+    // 패턴은 null도 undefined도 false로 평가돼 "리뷰어가 이슈 없다고 답했다"와
+    // "리뷰어 호출 자체가 실패했다"를 구분 못하고 후자를 조용히 통과시켜버렸다
+    // — 리뷰가 아예 안 됐는데 통과 판정이 나가는 fail-open 버그. 둘 중
+    // 하나라도 null이면 정상 판정으로 진행하지 말고 즉시 실패로 처리해 재시도.
+    if (!claudeReview || !antigravityReview) {
+      const whichFailed = [!claudeReview && 'claude', !antigravityReview && 'antigravity'].filter(Boolean).join(', ')
+      if (round === MAX_ROUNDS) {
+        finalVerdict = {
+          passed: false,
+          tier: 'full',
+          round,
+          error: 'code_review_failed',
+          reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 코드리뷰(${whichFailed})가 계속 실패함(세션 한도 초과 등 일시적 오류일 가능성 높음) — 리뷰가 실제로 수행되지 못한 상태이니 통과로 간주하면 안 됨. 사용자에게 물어야 함.`,
+          needsUserDecision: true,
+        }
+        break
+      }
+      log(`[전체] ${round}라운드: 코드리뷰 실패(${whichFailed}) — 통과 처리하지 않고 재시도`)
+      continue
+    }
+
     const combinedIssues = [
       ...(claudeReview?.issues || []).map((i) => ({ ...i, source: 'claude' })),
       ...(antigravityReview?.issues || []).map((i) => ({ ...i, source: 'antigravity' })),
     ]
-    history.push({ tier: 'full', round, claudeReview, antigravityReview })
 
     if (combinedIssues.length) {
       // 탈출구 경로의 1라운드는 클로드(lightExecute)가 쓴 코드에서 나온
