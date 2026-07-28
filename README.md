@@ -4,6 +4,8 @@ Source of truth for Claude Code assets (hooks, workflows, scripts) shared across
 
 Full index of what's here, what each piece does, and known bugs/limitations: **[CLAUDE.md](CLAUDE.md)**. Narrative detail, rationale, and porting notes for each individual script live under [docs/](docs/).
 
+Setting up a brand-new agent/machine (this repo + Claude Skills + document-writing skills)? Start with **[docs/new-agent-setup.md](docs/new-agent-setup.md)**.
+
 ## Quick orientation
 
 - `setup.sh` — run this first on any new agent/machine (checks/installs the Codex and Antigravity CLIs).
