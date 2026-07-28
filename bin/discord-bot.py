@@ -63,6 +63,16 @@ CODEX_REPO_ALIASES = {
 }
 CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a report generation
 
+# Concurrency guard (2026-07-29, same bug class as FREE_CHAT_LOCK, found in
+# the same review pass before either was ever hit live): two overlapping
+# `!코덱스` runs against the SAME repo would both get workspace-write
+# access at once, and _dirty_snapshot()'s own before/after diff already
+# admits it can't fully attribute changes made by another process editing
+# DURING its window — this bot itself could be that other process. Keyed
+# per-alias (not one global lock) since two DIFFERENT repos genuinely don't
+# share any state and running them concurrently is fine.
+CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+
 # Phase 2: pending-job store for reply-triggered retries. Written by scripts
 # that escalate via discord-notify.sh (keyed by that call's returned message
 # id), read here when a reply comes in. Schema: {"type": ..., "created_at":
@@ -621,75 +631,81 @@ async def handle_codex_dispatch(message: discord.Message):
         await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
         return
 
-    # No pending-job/requeue here (unlike the two verify-task-v2 handlers) —
-    # !코덱스 is a one-shot manual command, not a reply-triggered retry chain,
-    # so there's nothing to requeue: the user just re-sends !코덱스 later.
-    skip_reason = await usage_gate_check("codex")
-    if skip_reason:
-        await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
+    lock = CODEX_DISPATCH_LOCKS.setdefault(alias, asyncio.Lock())
+    if lock.locked():
+        await message.channel.send(f"`{alias}`에 대한 다른 `!코덱스` 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
         return
 
-    before = await _dirty_snapshot(cwd)
-    dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
-
-    prompt_file = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-            f.write(task)
-            prompt_file = Path(f.name)
-
-        await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
-
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
-            env=SUBPROCESS_ENV,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+    async with lock:
+        # No pending-job/requeue here (unlike the two verify-task-v2 handlers) —
+        # !코덱스 is a one-shot manual command, not a reply-triggered retry chain,
+        # so there's nothing to requeue: the user just re-sends !코덱스 later.
+        skip_reason = await usage_gate_check("codex")
+        if skip_reason:
+            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
             return
 
-        raw = (stdout or b"").decode(errors="replace")
+        before = await _dirty_snapshot(cwd)
+        dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
+
+        prompt_file = None
         try:
-            result = json.loads(raw)
-            ok = bool(result.get("ok"))
-            codex_message = str(result.get("message", ""))[:1000]
-        except Exception:
-            ok = False
-            codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[:1000]}"
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+                f.write(task)
+                prompt_file = Path(f.name)
 
-        # Never trust Codex's own report — confirm with a real before/after diff.
-        after = await _dirty_snapshot(cwd)
-        changed = sorted(f for f in after if after[f] != before.get(f))
-        changed_tracked = [f for f in changed if after[f] != "UNTRACKED"]
-        changed_untracked = [f for f in changed if after[f] == "UNTRACKED"]
+            await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
 
-        diff_stat = ""
-        if changed_tracked:
-            diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-        if changed_untracked:
-            new_files_note = "\n".join(f"신규 파일: {f}" for f in changed_untracked)
-            diff_stat = f"{diff_stat}\n{new_files_note}" if diff_stat else new_files_note
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
+                env=SUBPROCESS_ENV,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+                return
 
-        lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
-        if diff_stat:
-            lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
-        elif ok:
-            lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
-        else:
-            lines.append("실제 파일 변경 없음.")
-        lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
-        lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
-        await message.channel.send("\n".join(lines)[:1900])
-    except Exception as e:
-        await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
-    finally:
-        if prompt_file is not None:
-            prompt_file.unlink(missing_ok=True)
+            raw = (stdout or b"").decode(errors="replace")
+            try:
+                result = json.loads(raw)
+                ok = bool(result.get("ok"))
+                codex_message = str(result.get("message", ""))[:1000]
+            except Exception:
+                ok = False
+                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[:1000]}"
+
+            # Never trust Codex's own report — confirm with a real before/after diff.
+            after = await _dirty_snapshot(cwd)
+            changed = sorted(f for f in after if after[f] != before.get(f))
+            changed_tracked = [f for f in changed if after[f] != "UNTRACKED"]
+            changed_untracked = [f for f in changed if after[f] == "UNTRACKED"]
+
+            diff_stat = ""
+            if changed_tracked:
+                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+            if changed_untracked:
+                new_files_note = "\n".join(f"신규 파일: {f}" for f in changed_untracked)
+                diff_stat = f"{diff_stat}\n{new_files_note}" if diff_stat else new_files_note
+
+            lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
+            if diff_stat:
+                lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
+            elif ok:
+                lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
+            else:
+                lines.append("실제 파일 변경 없음.")
+            lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
+            lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
+            await message.channel.send("\n".join(lines)[:1900])
+        except Exception as e:
+            await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
+        finally:
+            if prompt_file is not None:
+                prompt_file.unlink(missing_ok=True)
 
 
 async def handle_pending_reply(message: discord.Message) -> bool:
