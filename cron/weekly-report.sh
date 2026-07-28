@@ -39,6 +39,30 @@ mkdir -p "$STATE_DIR"
 TODAY="$(date +%Y-%m-%d)"
 LOGFILE="$STATE_DIR/${TODAY}.log"
 
+# Usage pre-flight gate (2026-07-28): this script's whole job is a headless
+# `claude -p` run, and firing it while the account's short window is
+# already near-empty is exactly what caused repeated silent/hung failures
+# on 2026-07-28. Check BEFORE taking the mutex lock below, not after — no
+# point holding the lock for a run we're not going to attempt. Exit code 4
+# = skipped for low usage headroom, distinct from 0/1/3 so discord-bot.py
+# can report it accurately instead of miscasting it as success or failure.
+GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
+if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
+  echo "usage gate: ${GATE_OUTPUT} — skipping this run." >> "$LOGFILE"
+  MSG_ID="$(bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 주간보고서 실행을 건너뛰었습니다 — 계정 사용량 부족.
+${GATE_OUTPUT#SKIP: }
+이 메시지에 답장하면 (사용량 회복 후) 다시 시도합니다." || true)"
+  if [ -n "$MSG_ID" ]; then
+    PENDING_DIR="$HOME/.claude/discord-bot/pending"
+    mkdir -p "$PENDING_DIR"
+    python3 -c "import json,sys,datetime
+json.dump({'type': 'weekly-report-retry', 'created_at': datetime.datetime.now().isoformat(), 'params': {}},
+           open(sys.argv[1], 'w'))" "$PENDING_DIR/${MSG_ID}.json"
+  fi
+  echo "SKIPPED_LOW_USAGE"
+  exit 4
+fi
+
 # Mutex: launchd's Thursday schedule, `!주간보고서`, and Phase 2's reply-retry
 # can all end up invoking this script around the same time. Without a lock,
 # two concurrent runs can each pass the Calendar search-first check before

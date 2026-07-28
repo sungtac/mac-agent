@@ -169,6 +169,15 @@ async def handle_weekly_report(message: discord.Message):
             # in progress. Not a failure — say so plainly rather than
             # showing a red X for something that didn't actually break.
             await message.channel.send(f"⏳ 이미 다른 실행이 진행 중이라 이번 요청은 건너뛰었습니다. 그 실행이 끝난 뒤 상태를 `!상태`로 확인해주세요.\n```\n{tail}\n```"[:1900])
+        elif proc.returncode == 4:
+            # weekly-report.sh's usage-preflight-gate.sh check (2026-07-28):
+            # skipped because account usage was too low to safely run, not a
+            # failure. The script itself already posted its own
+            # discord-notify.sh message + pending-job for this case, so this
+            # ack (from the !주간보고서/reply-retry caller) would be a
+            # duplicate notification — stay quiet here, same reasoning as
+            # exit 3 just needing a distinct code to not be miscast.
+            pass
         else:
             await message.channel.send(f"❌ 주간보고서 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
     except Exception as e:
