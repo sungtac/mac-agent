@@ -718,10 +718,20 @@ async def handle_codex_dispatch(message: discord.Message):
             try:
                 result = json.loads(raw)
                 ok = bool(result.get("ok"))
-                codex_message = str(result.get("message", ""))[:1000]
+                # tail, not head (2026-07-29, found in review — this had
+                # quietly undone the prior tail-truncation fix made to
+                # codex-execute-dispatch.sh itself): that script already
+                # returns its message tail-truncated so it ends at Codex's
+                # actual failure reason, but this second `[:1000]` cut was
+                # taking the FIRST 1000 chars of that already-tail-cut
+                # text — re-discarding the ending it just preserved.
+                # Confirmed via simulation: a realistic failure message
+                # survived the bash script's fix but lost the error text
+                # again at this exact line.
+                codex_message = str(result.get("message", ""))[-1000:]
             except Exception:
                 ok = False
-                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[:1000]}"
+                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[-1000:]}"
 
             # Never trust Codex's own report — confirm with a real before/after diff.
             after = await _dirty_snapshot(cwd)
