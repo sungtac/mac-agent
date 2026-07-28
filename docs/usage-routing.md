@@ -53,11 +53,22 @@
   출력. 항상 exit 0 — 판정은 stdout에만 있다(`route-dispatch.sh`의 `ROUTED-TO: ...` 관례와 통일).
   `coach` 자체가 없거나 에러거나 파싱 안 되면 **무조건 PROCEED**(fail-open) — 체크 도구
   고장이 이 머신의 모든 예약 자동화를 조용히 죽이는 스위치가 되면 안 되므로.
-- **아직 아무 caller에도 연결 안 함(2026-07-28, 의도적)**: 코어 게이트만 우선 만들고 실측
-  검증까지 끝냈다 — 만드는 시점 자체가 실제로 클로드 5시간창이 0%인 상황이라(`SKIP: claude
-  5h창 잔여 0%...`로 실제 확인됨) 검증엔 최적의 타이밍이었지만, 그 상태에서 `weekly-report.sh`/
-  `kakao-morning-briefing.sh`/`discord-bot.py`(4~5개 호출 지점) 연동까지 한 번에 밀어붙이는 건
-  이 게이트가 강제하려는 원칙("사용량 낮으면 범위를 줄여라")과 스스로 어긋나는 일이라 의도적으로
-  범위를 좁혔다. 연동은 클로드 5시간창이 회복된 뒤(또는 다음 세션)로 미룸 — 남은 작업.
+- **모든 caller에 연결 완료(2026-07-28)**: 처음엔 코어 게이트만 만들고(만드는 시점 자체가
+  실제로 클로드 5시간창 0%라 검증엔 최적의 타이밍이었음) 연동은 의도적으로 미뤘다 — 그
+  상태에서 4~5개 지점 연동까지 한 번에 밀어붙이는 건 게이트가 강제하려는 원칙("사용량 낮으면
+  범위를 줄여라")과 스스로 어긋나는 일이라서. 이후 재확인: **코딩(로컬 파일 편집) 자체는
+  외부 CLI를 안 부르니 사용량과 무관하게 안전하고, 위험한 건 라이브 전체 실행 검증뿐**이라는
+  점에서 범위를 다시 나눴다 — 연동 코드는 전부 지금 작성하고, 실제 launchd/Discord 트리거로
+  라이브 전체 실행 검증만 리셋 후로 미루는 절충. 4곳 전부 연결됨:
+  `cron/weekly-report.sh`(뮤텍스 락 잡기 전에 확인, SKIP 시 `discord-notify.sh`+pending-job),
+  `cron/kakao-morning-briefing.sh`(SKIP 시 일방향 알림만, pending-job 체계 자체가 없음),
+  `hooks/work-log-stop-check.sh`(`.dispatched` 마커 세운 뒤 확인, SKIP 시 기존
+  `write_pending_job()` 재사용), `discord-bot.py`의 `usage_gate_check()` 공용 헬퍼(세
+  곳에서 재사용: `handle_verify_task_v2_retry`/`handle_verify_task_v2_decision_retry`는
+  actor=claude, `handle_codex_dispatch`는 actor=codex). 전부 코드 리뷰 + 샌드박스/모킹
+  테스트(실제 저사용량 데이터로 SKIP 분기 재현, 알림·pending-job 파일을 스크래치 경로로
+  리다이렉트)로 검증 — 실제 launchd 스케줄이나 진짜 Discord 왕복으로 라이브 전체 실행까지는
+  아직 안 함(다음 실제 발동 때 확인). 상세 근거는 각 커밋 메시지와 `docs/discord-bot.md`/
+  `docs/kakao-playmcp.md` 참고.
 
 verify-task.js/verify-task-v2.js의 역할 고정(안티=스펙+평가, 코덱스=초안+실행)은 이 정책과 무관 — 사용량과 상관없이 그대로 유지(자기평가 방지 설계를 사용량 이유로 깨면 안 됨).
