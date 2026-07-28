@@ -35,4 +35,29 @@
 - `workflows/lib/route-dispatch.sh` — Rule B 트리거 지점. 안티그래비티 우선 시도(`score-dispatch.sh` 위에 얹지 않고 독립 구현 — score-dispatch.sh는 JSON 채점용이라 일반 텍스트 응답을 "파싱 실패"로 오판해서 항상 코덱스로 폴백하는 버그가 실제로 났었음, 테스트 중 발견·수정), 실패/rate-limit 신호 시 코덱스 폴백.
 - `hooks/usage-routing-check.sh` — Stop 훅. 위 "코드 강제화의 실제 한계" 참고.
 
+## `usage-preflight-gate.sh` — 예약/트리거 자동화용 사전 게이트 (2026-07-28)
+
+위 넷은 전부 "**라이브 세션 안에서** 이번 작업을 어디로 보낼까"를 다룬다 — `weekly-report.sh`/
+`kakao-morning-briefing.sh`(launchd 예약 실행)나 `discord-bot.py`의 Discord 트리거 디스패치처럼
+**사람이 지켜보지 않는 상태에서 알아서 시작하는 자동화**가 지금 당장 사용량이 바닥인 채로
+그냥 실행돼버리는 문제는 아무도 안 다뤘다. 2026-07-28 하루에만 이 때문에 서로 무관한
+자동화(주간보고서·카카오 브리핑·verify-task-v2 전체 트랙)가 최소 8번 독립적으로 세션 한도에
+걸려 실패했고, 그중 일부는 10~30분을 돌다가 실패했다 — 예약 작업은 라이브 세션과 달리 도중에
+멈춘 걸 알아챌 사람이 없다.
+
+- `workflows/lib/usage-preflight-gate.sh <claude|codex|dual>` — `coach --json`을 다시 읽어서
+  (2·3번처럼 `coach-headroom.sh`의 정수 두 개짜리 요약이 아니라 `level`/`reason`까지 그대로
+  써야 해서 별도 파싱), 해당 액터가 의존하는 창(클로드는 5시간창 — 이게 오늘 실제 장애를 낸
+  창이고 7일창은 널널해도 5시간창만 0%일 수 있음 실측 확인됨; 코덱스는 7일창)이 10% 미만이거나
+  `coach`가 그 provider를 `red`로 판정하면 `SKIP: <사유>`, 아니면 `PROCEED`를 stdout 한 줄로
+  출력. 항상 exit 0 — 판정은 stdout에만 있다(`route-dispatch.sh`의 `ROUTED-TO: ...` 관례와 통일).
+  `coach` 자체가 없거나 에러거나 파싱 안 되면 **무조건 PROCEED**(fail-open) — 체크 도구
+  고장이 이 머신의 모든 예약 자동화를 조용히 죽이는 스위치가 되면 안 되므로.
+- **아직 아무 caller에도 연결 안 함(2026-07-28, 의도적)**: 코어 게이트만 우선 만들고 실측
+  검증까지 끝냈다 — 만드는 시점 자체가 실제로 클로드 5시간창이 0%인 상황이라(`SKIP: claude
+  5h창 잔여 0%...`로 실제 확인됨) 검증엔 최적의 타이밍이었지만, 그 상태에서 `weekly-report.sh`/
+  `kakao-morning-briefing.sh`/`discord-bot.py`(4~5개 호출 지점) 연동까지 한 번에 밀어붙이는 건
+  이 게이트가 강제하려는 원칙("사용량 낮으면 범위를 줄여라")과 스스로 어긋나는 일이라 의도적으로
+  범위를 좁혔다. 연동은 클로드 5시간창이 회복된 뒤(또는 다음 세션)로 미룸 — 남은 작업.
+
 verify-task.js/verify-task-v2.js의 역할 고정(안티=스펙+평가, 코덱스=초안+실행)은 이 정책과 무관 — 사용량과 상관없이 그대로 유지(자기평가 방지 설계를 사용량 이유로 깨면 안 됨).
