@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Runs every Thursday 18:00 via launchd (~/Library/LaunchAgents/com.macagent.weekly-report.plist)
 # to compile the week's Google Calendar work log into a report, saved locally
-# into the Drive-synced 업무아카이브 folder (auto-uploads to sungtac@gmail.com's Drive),
+# into the Drive-synced 주간보고서 folder (auto-uploads to sungtac@gmail.com's Drive),
 # and also logs a same-content Calendar event on that week's Friday so the
 # report is visible directly on the calendar, not just buried in a Drive
 # folder. Moved from Friday 18:07 to Thursday 18:00 on 2026-07-26 — the date
@@ -18,17 +18,19 @@
 # haven't run yet as of Thursday 18:00 -- a real time-ordering limit, not
 # something a prompt fix can close.
 #
-# Deliberately avoids the Google Drive MCP connector entirely — that connector
-# is authenticated as a third party's account (sungwan777@gmail.com), not the
-# user's own, and is blocked at the settings.json permission level (see
-# permissions.deny in ~/.claude/settings.json). This script only uses the
-# Calendar MCP (correctly authenticated as sungtac@gmail.com) plus local
-# filesystem writes into the already-sungtac-owned synced folder.
+# Uses the Calendar MCP (authenticated as sungtac@gmail.com) plus local
+# filesystem writes into the already-sungtac-owned synced folder. Historical
+# note: until 2026-07-28 the Google Drive MCP connector was misauthenticated
+# as a third party's account (sungwan777@gmail.com) and hard-blocked via
+# permissions.deny in ~/.claude/settings.json — that has since been fixed
+# (Drive connector reconnected to sungtac@gmail.com, deny entries removed).
+# This script still deliberately skips Drive MCP and uses local filesystem
+# writes, since that path is already tested and working; switching to Drive
+# MCP would be a deliberate follow-up change, not required by the fix above.
 set -uo pipefail
 
 CLAUDE_BIN="$HOME/.local/bin/claude"
 DRIVE_ROOT="$HOME/Library/CloudStorage/GoogleDrive-sungtac@gmail.com/내 드라이브"
-ARCHIVE_ROOT="$DRIVE_ROOT/업무아카이브"
 ARCHIVE_ROOT_TOP="$DRIVE_ROOT/주간보고서"
 CALENDAR_ID="sungtac@gmail.com"
 STATE_DIR="$HOME/.claude/hooks-state/weekly-report"
@@ -55,15 +57,31 @@ PROMPT=$(cat <<PROMPT_EOF
 
 절차:
 1. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에서 ${MON}부터 ${FRI}까지의 모든 이벤트를 가져오세요(금요일 포함, 절대 누락 금지). '대한민국의 휴일' 같은 공휴일 캘린더 이벤트는 제외하세요.
-2. Bash/Read 도구로 "${ARCHIVE_ROOT}" 폴더 안에서 이번 주 날짜(${MON}~${FRI}) 하위 폴더가 있는지 확인해서(ls 등), 캘린더 기록과 교차 확인하고 파일 목록에 참고하세요.
-3. 아래 두 섹션으로 보고서를 작성하세요:
-   - '이번 주 한 일': 이번 주 캘린더 이벤트들을(금요일 이벤트 포함) 날짜별로 종합 정리. 이벤트가 하나도 없으면 '이번 주 기록된 업무 없음'이라고 명시하세요.
-   - '다음 주 할 일 (제안)': 이번 주 기록에서 보이는 미완료·후속 작업, 그리고 다음 주에 이미 캘린더에 잡혀 있는 일정이 있다면 참고해서 초안을 제안하세요. 이 섹션 맨 위에 반드시 '※ 아래 항목은 에이전트가 제안하는 초안이며 실제 계획이 아닙니다. 검토 후 직접 수정해주세요.'라는 문구를 넣으세요.
-4. Write 도구로 이 보고서를 마크다운 파일로 저장하세요. 경로: "${REPORT_PATH}" (폴더가 없으면 Bash로 먼저 mkdir -p 하세요). 파일 맨 위에 "# ${TITLE}" 제목을 넣으세요.
-5. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에 이번 주 금요일(${FRI}) 09:00~09:30 이벤트를 하나 새로 생성하세요. 제목은 "${TITLE}", description에는 3번에서 쓴 두 섹션 내용을 그대로(요약하지 말고) 넣고 맨 끝 줄에 "전체 파일: ${REPORT_PATH}"를 추가하세요.
-6. 마지막에 저장한 파일의 절대 경로와 생성한 캘린더 이벤트 ID를 각각 한 줄로 출력하세요.
+2. 아래 두 섹션으로 보고서를 작성하세요:
+   - '이번 주 한 일': 이번 주 캘린더 이벤트를(금요일 포함) 날짜순 flat bullet 목록으로 나열하세요. 이 섹션은 실제 확정된 사실이므로 bullet 마커는 반드시 "○ "를 쓰세요("- "는 쓰지 마세요 — "-"는 아래 부가설명 줄 전용입니다). '### 날짜' 같은 날짜별 소제목은 쓰지 마세요. 날짜가 바뀌는 첫 항목에만 줄 끝에 "(MM.DD.)" 형식(두 자리 월.두 자리 일.)으로 날짜를 붙이고, 같은 날짜의 나머지 항목에는 날짜를 반복해서 붙이지 마세요. 예:
+     ○ [TIPS] 접수 완료(07.27.)
+     ○ [AI확산] 통합 시스템 견적 변경 및 공유(07.28.)
+     ○ [AI확산] 수산물분과 주요성과 및 현장적용 결과보고서 수정 및 공유 완료
+     (위처럼 07.28.도 그날 첫 항목에만 붙고 나머지 줄엔 날짜 없음)
+     이벤트가 없는 날은 별도로 언급하지 말고 그냥 건너뛰세요. 이번 주에 이벤트가 하나도 없으면 '이번 주 기록된 업무 없음'이라고 명시하세요.
+     캘린더 이벤트 제목/내용에 " - "(공백-대시-공백)가 있어서 "짧은 제목 - 부가설명" 구조이면(부가설명이 쉼표 목록이든 짧은 구절이든 상관없이 항상), 대시 앞부분만 본문 "○ " bullet으로 쓰고 대시 뒷부분은 그 아래 2칸 들여쓴 "  - " 하위 줄로 내려서 부가설명으로 적으세요. 예: 캘린더에 "산업용 PC 대여 - 웨이브다인 발송(대여증 요청)"이라고 돼 있으면
+     ○ [AI확산] 산업용 PC 대여
+       - 웨이브다인 발송(대여증 요청)
+     캘린더에 "등급판별 센서류 탈착 - NIR(2대), 일반카메라(2대), 산업용PC 일체"라고 돼 있으면
+     ○ [AI확산] 등급판별 센서류 탈착
+       - NIR(2대), 일반카메라(2대), 산업용PC 일체
+     로 나누세요(날짜 suffix가 있다면 위쪽 "○" 제목 줄에만 붙이고 부가설명 줄엔 붙이지 마세요).
+     이벤트 설명(description)에 지난주 이전에 있었던 배경 설명(예: 일정 변경·연기 사유 등 과거 이슈)이 들어있어도, '이번 주 한 일'에는 이번 주에 실제 있었던 사실만 간결히 적고 지난주 히스토리는 옮기지 마세요(예: "[AI확산] 실무자 회의 (14:00~15:00)"처럼 담백하게).
+   - '다음 주 할 일 (제안)': 이 섹션은 반드시 두 하위 소제목으로 나누세요 — 실제 사실과 AI 제안을 절대 섞지 마세요.
+     ### 확정 일정
+     다음 주(다음 주 월요일~금요일)에 이미 Google Calendar에 등록돼 있는 실제 이벤트만, 각 줄 앞에 "○ "를 붙여 나열하세요(제안 아님, 사실). 위 '이번 주 한 일'과 동일한 " - " 부가설명 줄바꿈 규칙을 여기도 적용하세요(제목에 " - "가 있으면 대시 뒷부분을 "  - " 하위 줄로 내림). 등록된 이벤트가 하나도 없으면 "다음 주 캘린더에 등록된 일정 없음"이라고 명시하세요.
+     ### 제안 (초안)
+     이 소제목 바로 아래에 반드시 '※ 아래 항목은 에이전트가 제안하는 초안이며 실제 계획이 아닙니다. 검토 후 직접 수정해주세요.'라는 문구를 넣고, 그 아래에 이번 주 기록에서 보이는 미완료·후속 작업을 "- "로 시작하는 bullet로 제안하세요. 이 소제목 아래엔 확정된 사실을 절대 넣지 말고(확정 일정은 위 소제목에만), 순수 제안·초안만 적으세요.
+3. Write 도구로 이 보고서를 마크다운 파일로 저장하세요. 경로: "${REPORT_PATH}" (폴더가 없으면 Bash로 먼저 mkdir -p 하세요). 파일 맨 위에 "# ${TITLE}" 제목을 넣으세요.
+4. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에 이번 주 금요일(${FRI}) 09:00~09:30 이벤트를 하나 새로 생성하세요. 제목은 "${TITLE}", description에는 2번에서 쓴 두 섹션 내용을 그대로(요약하지 말고) 넣고 맨 끝 줄에 "전체 파일: ${REPORT_PATH}"를 추가하세요.
+5. 마지막에 저장한 파일의 절대 경로와 생성한 캘린더 이벤트 ID를 각각 한 줄로 출력하세요.
 
-참고: 이 세션에는 Google Drive MCP 도구가 연결되어 있지 않을 수 있습니다 — 의도된 설정이니 신경쓰지 말고 로컬 파일시스템(Bash/Write)으로만 저장하세요.
+참고: Google Drive MCP 도구가 연결되어 있어도 이 작업에는 쓰지 마세요 — 의도된 설계이니 항상 로컬 파일시스템(Bash/Write)으로만 저장하세요.
 PROMPT_EOF
 )
 
