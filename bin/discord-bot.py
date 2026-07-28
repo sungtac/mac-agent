@@ -34,7 +34,6 @@ import datetime
 import json
 import os
 import signal
-import subprocess
 import sys
 import tempfile
 import uuid
@@ -135,13 +134,10 @@ def tail_file(path: Path, n_lines: int = 15) -> str:
 
 
 async def handle_status(message: discord.Message):
-    import datetime
-
     today = datetime.date.today().isoformat()
 
     weekly_log = STATE_DIR / "weekly-report" / f"{today}.log"
     worklog_dir = STATE_DIR / "work-log"
-    nag_dir = STATE_DIR / "verify-task-nag"
 
     recent_worklog = "(없음)"
     if worklog_dir.exists():
