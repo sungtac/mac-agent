@@ -56,7 +56,7 @@ PROMPT=$(cat <<PROMPT_EOF
    - 종합: (요약)
    - IT/AI: (요약)
    - 경제: (요약)
-5. kakao-playmcp MCP 서버의 KakaotalkChat-MemoChat 도구로 4번에서 만든 메시지를 나에게 보내세요. (메시지 길이 제한은 문서상 200자로 적혀 있지만 실측 결과 더 긴 텍스트도 정상 전송됨— 확인됨, 인위적으로 자르지 마세요.)
+5. kakao-playmcp MCP 서버의 KakaotalkChat-MemoChat 도구로 4번에서 만든 메시지를 나에게 보내세요. (메시지 길이 제한은 문서상 200자로 적혀 있지만 실측 결과 더 긴 텍스트도 정상 전송됨 — 확인됨, 인위적으로 자르지 마세요.)
 6. 마지막으로 "카카오톡 발송 완료"라고만 한 줄 출력하세요. 실패한 단계가 있으면 어떤 단계에서 무엇이 실패했는지 명시하세요.
 PROMPT_EOF
 )
@@ -66,14 +66,31 @@ PROMPT_EOF
 # repro — a stall inside the Bun-based CLI's own HTTP connection pool, not a
 # network/DNS/proxy issue). Same shape here since this script shares the exact
 # same headless-claude-under-launchd execution path.
+#
+# CONFIRM_MARKER check (added after a code-level review, 2026-07-28): claude
+# -p's own exit code only reflects whether the CLI process itself completed
+# without crashing — NOT whether the KakaoTalk send actually succeeded. If the
+# kakao-playmcp MCP tool call fails inside (e.g. the mcporter daemon died),
+# Claude can still finish its turn cleanly (exit 0) while its own text says it
+# failed (per the prompt's step 6 instruction to report failures instead of
+# the confirmation line). Treating exit=0 alone as success would silently
+# skip both the retry loop AND the Discord escalation on a real delivery
+# failure — the user just wouldn't get their briefing with zero signal
+# anything went wrong. So success now additionally requires the literal
+# confirmation string from the prompt's step 6 to be present in that
+# attempt's own output (captured per-attempt, not grepped from the
+# cross-attempt LOGFILE, so a later attempt can't accidentally match on an
+# earlier attempt's success/failure text).
+CONFIRM_MARKER="카카오톡 발송 완료"
 TIMEOUT_SECONDS=240
 MAX_ATTEMPTS=3
 SUCCESS=0
 for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   DEBUG_LOGFILE="$STATE_DIR/${TODAY}-attempt${ATTEMPT}-debug.log"
+  ATTEMPT_OUTFILE="$STATE_DIR/${TODAY}-attempt${ATTEMPT}.out"
   echo "--- attempt ${ATTEMPT}/${MAX_ATTEMPTS} ---" >> "$LOGFILE"
   WORK_LOG_DISPATCHED=1 "$CLAUDE_BIN" -p "$PROMPT" --output-format text \
-    --debug-file "$DEBUG_LOGFILE" </dev/null >> "$LOGFILE" 2>&1 &
+    --debug-file "$DEBUG_LOGFILE" </dev/null > "$ATTEMPT_OUTFILE" 2>&1 &
   CLAUDE_PID=$!
   ELAPSED=0
   TIMED_OUT=0
@@ -90,19 +107,25 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
     sleep 15
     ELAPSED=$((ELAPSED + 15))
   done
+  cat "$ATTEMPT_OUTFILE" >> "$LOGFILE"
   if [ "$TIMED_OUT" -eq 1 ]; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: TIMEOUT after ${TIMEOUT_SECONDS}s — killed. Debug log: ${DEBUG_LOGFILE}." >> "$LOGFILE"
+    rm -f "$ATTEMPT_OUTFILE"
     sleep 5
     continue
   fi
   wait "$CLAUDE_PID"
   EXIT_CODE=$?
   echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=${EXIT_CODE}" >> "$LOGFILE"
-  if [ "$EXIT_CODE" -eq 0 ]; then
+  if [ "$EXIT_CODE" -eq 0 ] && grep -qF "$CONFIRM_MARKER" "$ATTEMPT_OUTFILE"; then
     SUCCESS=1
-    rm -f "$DEBUG_LOGFILE"
+    rm -f "$DEBUG_LOGFILE" "$ATTEMPT_OUTFILE"
     break
   fi
+  if [ "$EXIT_CODE" -eq 0 ]; then
+    echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=0 but confirmation string \"${CONFIRM_MARKER}\" not found in output — treating as failed attempt." >> "$LOGFILE"
+  fi
+  rm -f "$ATTEMPT_OUTFILE"
 done
 
 if [ "$SUCCESS" -ne 1 ]; then
