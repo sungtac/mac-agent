@@ -7,10 +7,16 @@
 # folder. Moved from Friday 18:07 to Thursday 18:00 on 2026-07-26 — the date
 # math below (Mon..Fri range derived from ISO weekday offset, not "today")
 # already handles firing a day early correctly, no changes needed there.
-# Known trade-off of firing Thursday evening instead of Friday: whatever work
-# happens on Friday itself (the report's own last day) hasn't happened yet at
-# generation time, so it can't be in "이번 주 한 일" — accepted knowingly, not
-# a bug.
+# 2026-07-28: the Calendar query below always fetched through Friday (the
+# date range was never the bug), but the prompt told the agent Friday
+# "isn't reflected -- that's normal," so it saw Friday events in the fetched
+# range and still omitted them. Fixed per user request -- the user reports
+# every Friday, so any Friday event already on the calendar at Thursday
+# 18:00 generation time (e.g. a meeting scheduled in advance) must be
+# included in "이번 주 한 일", not treated as "hasn't happened yet." What
+# genuinely can't be captured: work-log-hook entries for sessions that
+# haven't run yet as of Thursday 18:00 -- a real time-ordering limit, not
+# something a prompt fix can close.
 #
 # Deliberately avoids the Google Drive MCP connector entirely — that connector
 # is authenticated as a third party's account (sungwan777@gmail.com), not the
@@ -45,13 +51,13 @@ TITLE="[주간 업무 보고] ${MON_Y}년 ${MON_M}월 ${MON_D}일 ~ ${FRI_Y}년 
 REPORT_PATH="${ARCHIVE_ROOT_TOP}/${FOLDER_RANGE}/${TITLE}.md"
 
 PROMPT=$(cat <<PROMPT_EOF
-매주 목요일 18시에 실행되는 주간 업무 보고서 작성 작업입니다. 이번 주 범위: ${MON} ~ ${FRI} (오늘은 아직 목요일이라 금요일 하루치는 반영이 안 됩니다 — 정상입니다).
+매주 목요일 18시에 실행되는 주간 업무 보고서 작성 작업입니다. 이번 주 범위: ${MON} ~ ${FRI}. 사용자가 실제 보고를 금요일에 하기 때문에, 오늘이 아직 목요일이라도 ${FRI}(금요일)에 이미 캘린더에 등록된 일정이 있다면 절대 빠뜨리지 말고 반드시 '이번 주 한 일'에 포함하세요 — "아직 안 지나간 날이니 제외"하는 판단을 하면 안 됩니다. (다만 work-log 훅 특성상 금요일 당일 세션에서 자동 기록되는 이벤트는 이 실행 시점엔 아직 없을 수 있음 — 그건 어쩔 수 없는 시간 순서 문제지, 의도적 제외가 아닙니다.)
 
 절차:
-1. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에서 ${MON}부터 ${FRI}까지의 모든 이벤트를 가져오세요. '대한민국의 휴일' 같은 공휴일 캘린더 이벤트는 제외하세요.
+1. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에서 ${MON}부터 ${FRI}까지의 모든 이벤트를 가져오세요(금요일 포함, 절대 누락 금지). '대한민국의 휴일' 같은 공휴일 캘린더 이벤트는 제외하세요.
 2. Bash/Read 도구로 "${ARCHIVE_ROOT}" 폴더 안에서 이번 주 날짜(${MON}~${FRI}) 하위 폴더가 있는지 확인해서(ls 등), 캘린더 기록과 교차 확인하고 파일 목록에 참고하세요.
 3. 아래 두 섹션으로 보고서를 작성하세요:
-   - '이번 주 한 일': 이번 주 캘린더 이벤트들을 날짜별로 종합 정리. 이벤트가 하나도 없으면 '이번 주 기록된 업무 없음'이라고 명시하세요.
+   - '이번 주 한 일': 이번 주 캘린더 이벤트들을(금요일 이벤트 포함) 날짜별로 종합 정리. 이벤트가 하나도 없으면 '이번 주 기록된 업무 없음'이라고 명시하세요.
    - '다음 주 할 일 (제안)': 이번 주 기록에서 보이는 미완료·후속 작업, 그리고 다음 주에 이미 캘린더에 잡혀 있는 일정이 있다면 참고해서 초안을 제안하세요. 이 섹션 맨 위에 반드시 '※ 아래 항목은 에이전트가 제안하는 초안이며 실제 계획이 아닙니다. 검토 후 직접 수정해주세요.'라는 문구를 넣으세요.
 4. Write 도구로 이 보고서를 마크다운 파일로 저장하세요. 경로: "${REPORT_PATH}" (폴더가 없으면 Bash로 먼저 mkdir -p 하세요). 파일 맨 위에 "# ${TITLE}" 제목을 넣으세요.
 5. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에 이번 주 금요일(${FRI}) 09:00~09:30 이벤트를 하나 새로 생성하세요. 제목은 "${TITLE}", description에는 3번에서 쓴 두 섹션 내용을 그대로(요약하지 말고) 넣고 맨 끝 줄에 "전체 파일: ${REPORT_PATH}"를 추가하세요.
