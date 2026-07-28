@@ -353,10 +353,30 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
 
 RETRY_INTENT_KEYWORDS = ("재시도", "retry", "다시")
 
+# Bare substring matching on RETRY_INTENT_KEYWORDS has a real false-positive
+# class (caught in code review, 2026-07-28, not live-hit yet): a reply like
+# "재시도 필요 없어" or "no need to retry" contains the keyword but means the
+# opposite. These markers are deliberately multi-character/specific — NOT
+# bare "안"/"않" (Korean negation prefixes), since those are single common
+# syllables that show up inside unrelated words (e.g. "안녕") and would
+# suppress nearly every retry-intent reply if used here. Fails closed: any
+# marker match here means "take no automated action", same as the existing
+# no-keyword-found path — an unwanted retry (burns quota/time on a live
+# workspace-write run) is worse than a missed one (user can just reply again).
+RETRY_NEGATION_MARKERS = (
+    "필요없", "필요 없", "하지마", "하지 마", "하지말", "안 해도", "안해도",
+    "그만", "말고", "말자",
+    "no need", "don't", "dont ", "not necessary", "never mind", "nevermind",
+)
+
 
 def _has_retry_intent(reply_text: str) -> bool:
     lowered = reply_text.lower()
-    return any(kw in lowered for kw in RETRY_INTENT_KEYWORDS)
+    if not any(kw in lowered for kw in RETRY_INTENT_KEYWORDS):
+        return False
+    if any(neg in lowered for neg in RETRY_NEGATION_MARKERS):
+        return False
+    return True
 
 
 async def handle_verify_task_v2_decision_retry(message: discord.Message, params: dict):
