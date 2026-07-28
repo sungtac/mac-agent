@@ -79,6 +79,23 @@ MARKER="$STATE_DIR/${SESSION_ID}.dispatched"
 [ -f "$MARKER" ] && exit 0
 touch "$MARKER"
 
+# Usage pre-flight gate (2026-07-28, same rationale as weekly-report.sh):
+# the dispatch below is a headless `claude -p` run just like the others hit
+# by today's repeated session-limit failures. Checked AFTER the marker is
+# set (not before) — this is a one-shot-per-session dispatch, and a skip
+# here is recoverable exactly the same way a timeout/failure already is
+# below: write_pending_job() so a Discord reply retries via
+# handle_work_log_retry(), which re-runs directly from the saved
+# session_id/transcript_path and does not depend on this marker at all.
+# Fails open on gate error.
+GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
+if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
+  write_pending_job "⏳ work-log 세션 기록을 건너뛰었습니다 — 계정 사용량 부족. 세션 ${SESSION_ID}.
+${GATE_OUTPUT#SKIP: }
+이 메시지에 답장하면 (사용량 회복 후) 다시 시도합니다." || true
+  exit 0
+fi
+
 LOGFILE="$STATE_DIR/${SESSION_ID}.log"
 
 PROMPT=$(cat <<PROMPT_EOF

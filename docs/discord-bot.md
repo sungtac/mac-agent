@@ -102,6 +102,13 @@ exit 3을 "⏳ 이미 실행 중"으로 별도 표시한다(실패로 오표시�
 백그라운드에 넘기고 즉시 반환하는 구조라, `handle_work_log_retry()`는 재시도 디스패치
 자체가 정상 시작됐는지만 확인하고, 진짜 성공/실패는 이 새 알림 경로로 별도로 온다.
 
+**사용량 사전 게이트(2026-07-28, P4)**: `.dispatched` 마커를 세운 **직후**(찍기 전이 아니라)
+`usage-preflight-gate.sh claude`를 확인한다 — 이 훅은 세션 하나당 한 번만 도는 구조라 마커는
+그대로 세워 같은 세션에 대해 Stop이 다시 떠도(`/resume` 등) 재시도하지 않게 하고, 대신 복구는
+기존 타임아웃/실패 경로와 동일하게 `write_pending_job()`으로 위임한다 — 답장이 오면
+`handle_work_log_retry()`가 저장된 `session_id`/`transcript_path`로 직접 재실행하니 이 마커와
+무관하게 동작한다. 게이트 자체가 실패하면 fail-open으로 그냥 진행.
+
 ## verify-task-v2 답장 재시도 — needs_clarification + needsUserDecision (2026-07-28)
 
 `verify-task-v2.js`는 앞의 둘(weekly-report.sh, work-log-stop-check.sh)과 두 가지가
