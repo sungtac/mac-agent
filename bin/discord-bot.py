@@ -351,6 +351,90 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
         await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
 
 
+RETRY_INTENT_KEYWORDS = ("재시도", "retry", "다시")
+
+
+def _has_retry_intent(reply_text: str) -> bool:
+    lowered = reply_text.lower()
+    return any(kw in lowered for kw in RETRY_INTENT_KEYWORDS)
+
+
+async def handle_verify_task_v2_decision_retry(message: discord.Message, params: dict):
+    """Reply-triggered retry for verify-task-v2.js's needsUserDecision
+    (max-rounds exhausted with a real accept/retry/manual-intervention
+    three-way choice) — as opposed to handle_verify_task_v2_retry, which is
+    for needs_clarification (info-gathering re-questions).
+
+    A free-text Discord reply can't cleanly carry a three-way choice, so this
+    only acts on one signal: does the reply contain a retry-intent keyword
+    (재시도/retry/다시)? If yes, re-run the SAME original task from scratch
+    with maxRounds bumped — unlike the clarification retry, nothing is
+    appended to the task text, since there's no question being answered.
+    If no keyword is found (including "수용"/"수동으로 할게" style replies,
+    or anything else), this intentionally takes no automated action — that
+    covers both "accept as-is" and "I'll handle it manually" without trying
+    to tell them apart, since both mean "don't touch it again automatically."
+    """
+    task = params.get("task")
+    cwd = params.get("cwd")
+    if not task or not cwd:
+        await message.channel.send(f"❌ verify-task-v2 재시도 실패 — pending-job에 task/cwd가 없습니다: {params!r}")
+        return
+
+    reply_text = message.content.strip()
+    if not _has_retry_intent(reply_text):
+        await message.channel.send("확인했습니다 — 재시도 키워드(재시도/retry/다시)가 없어서 자동 조치 없이 종료합니다.")
+        return
+
+    bumped_max_rounds = params.get("maxRounds", 2) + 2
+    workflow_args = {
+        "task": task,
+        "cwd": cwd,
+        "persona": params.get("persona", "일반 사용자"),
+        "maxRounds": bumped_max_rounds,
+        "historyFile": params.get("historyFile"),
+        "harnessFile": params.get("harnessFile"),
+    }
+    workflow_args = {k: v for k, v in workflow_args.items() if v is not None}
+
+    await message.channel.send(f"답장 확인 — verify-task-v2를 maxRounds={bumped_max_rounds}로 늘려 같은 작업을 처음부터 재실행합니다. 전체 트랙이면 코덱스/안티그래비티를 여러 번 오가서 몇 분 걸릴 수 있어요, 끝나면 알려드릴게요.")
+
+    prompt = (
+        "Workflow 툴을 사용해서 다음을 실행해줘: "
+        f"scriptPath는 {json.dumps(str(VERIFY_TASK_V2_JS))}, "
+        f"args는 {json.dumps(workflow_args, ensure_ascii=False)}. "
+        "실행이 끝나면 반환된 finalVerdict를 요약해서 한국어로 짧게 알려줘 "
+        "(통과 여부, needsUserDecision/needs_clarification로 또 끝났으면 그것도 명시)."
+    )
+
+    # Same rationale as handle_verify_task_v2_retry: this awaits the full run
+    # to completion (stdout=PIPE + communicate(), CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)
+    # rather than backgrounding — see that function's docstring for why a
+    # short give-up-and-detach default silently turns into a false success.
+    verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+            env=verify_task_v2_env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+            return
+        tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
+        if proc.returncode == 0:
+            await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
+        else:
+            await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+    except Exception as e:
+        await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
+
+
 async def _git_output(cwd: Path, *args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         "/usr/bin/git", "-C", str(cwd), *args,
@@ -547,8 +631,11 @@ async def handle_pending_reply(message: discord.Message) -> bool:
         await handle_verify_task_v2_retry(message, job.get("params", {}))
         return True
 
-    # Unhandled type (e.g. needsUserDecision, which never writes a pending-job
-    # by design, or a future source) — log and ignore rather than silently
+    if job_type == "verify-task-v2-decision-retry":
+        await handle_verify_task_v2_decision_retry(message, job.get("params", {}))
+        return True
+
+    # Unhandled type (a future source) — log and ignore rather than silently
     # pretending we did something.
     print(f"pending job {ref.message_id}: unhandled type {job_type!r}", file=sys.stderr)
     return True

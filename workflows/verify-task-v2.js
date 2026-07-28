@@ -756,15 +756,17 @@ if (tier === 'full' && !finalVerdict) {
   }
 }
 
-// pendingJobParams가 있으면(needs_clarification 경로만) discord-notify.sh의
-// 반환 메시지 id를 캡처해서 weekly-report.sh/work-log-stop-check.sh와 같은
-// 스키마로 ~/.claude/discord-bot/pending/<id>.json을 쓴다 — 이 스크립트는
-// JS 샌드박스라 파일시스템에 직접 못 쓰므로, appendHistory/appendHarnessRules와
-// 같은 방식으로 agent()에게 Bash/Write로 대신 시킨다. pendingJobParams가
-// 없으면(needsUserDecision 경로) 기존 그대로 완전 일방향 — 자유텍스트 답장으로
-// "수용/재시도/수동개입" 3지선다를 의미 해석하기 애매해서 의도적으로 그대로
-// 둔다(사용자 확정, 2026-07-28).
-async function notifyDiscordEscalation(message, pendingJobParams) {
+// pendingJobParams가 있으면 discord-notify.sh의 반환 메시지 id를 캡처해서
+// weekly-report.sh/work-log-stop-check.sh와 같은 스키마로
+// ~/.claude/discord-bot/pending/<id>.json을 쓴다 — 이 스크립트는 JS 샌드박스라
+// 파일시스템에 직접 못 쓰므로, appendHistory/appendHarnessRules와 같은
+// 방식으로 agent()에게 Bash/Write로 대신 시킨다. jobType으로 pending-job의
+// `type` 필드를 결정한다 — needs_clarification은 "verify-task-v2-retry"
+// (답장 전체를 답변으로 붙여 재실행), needsUserDecision은
+// "verify-task-v2-decision-retry"(2026-07-28 추가: 답장에서 재시도 의도
+// 키워드만 감지해 라운드를 늘려 같은 task로 재실행 — discord-bot.py 쪽에서
+// 판단). pendingJobParams가 없으면 기존 그대로 완전 일방향.
+async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
   try {
     if (!pendingJobParams) {
       await agent(
@@ -775,7 +777,7 @@ async function notifyDiscordEscalation(message, pendingJobParams) {
     }
     const paramsJson = JSON.stringify(pendingJobParams)
     await agent(
-      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 그냥 "no-id"라고만 답하고 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 "verify-task-v2-retry", \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. 성공하면 "wrote pending-job for <id>"라고 답해.\n\n[원본 params JSON]\n${paramsJson}`,
+      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 그냥 "no-id"라고만 답하고 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. 성공하면 "wrote pending-job for <id>"라고 답해.\n\n[원본 params JSON]\n${paramsJson}`,
       { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
     )
   } catch (e) {
@@ -788,11 +790,14 @@ async function finalizeAndReturn() {
     const shortTask = typeof task === 'string' ? task.slice(0, 200) : String(task)
     const reason = finalVerdict?.reason || finalVerdict?.questions || '(사유 없음)'
     const isClarification = finalVerdict?.error === 'needs_clarification'
+    const jobType = isClarification ? 'verify-task-v2-retry' : 'verify-task-v2-decision-retry'
+    const replyHint = isClarification
+      ? '\n\n이 메시지에 답장하면 그 내용을 답변으로 붙여서 재시도합니다.'
+      : '\n\n이 메시지에 "재시도"/"retry"/"다시" 중 하나를 포함해서 답장하면 라운드를 늘려 같은 작업을 재시도합니다. 그 외 답장이나 무응답은 자동 조치 없이 종료됩니다.'
     await notifyDiscordEscalation(
-      `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}${isClarification ? '\n\n이 메시지에 답장하면 그 내용을 답변으로 붙여서 재시도합니다.' : ''}`,
-      isClarification
-        ? { task, cwd, persona, maxRounds: MAX_ROUNDS, historyFile, harnessFile: HARNESS_FILE, questions: finalVerdict?.questions }
-        : undefined
+      `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}${replyHint}`,
+      jobType,
+      { task, cwd, persona, maxRounds: MAX_ROUNDS, historyFile, harnessFile: HARNESS_FILE, ...(isClarification ? { questions: finalVerdict?.questions } : {}) }
     )
   }
 

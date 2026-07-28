@@ -1,13 +1,13 @@
 # discord-bot.py + discord-notify.sh (일정비서 — Discord 연동)
 
-Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문) 답장 재시도. `needsUserDecision`(최대 라운드 소진)은 3지선다를 자유텍스트 답장으로 해석하기 애매해서 의도적으로 계속 일방향(사용자 확정). 자유 채팅(Phase 3)은 여전히 미구현.
+Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 답장 재시도 — 후자는 자유텍스트 3지선다를 그대로 해석하지 않고 재시도 의도 키워드(재시도/retry/다시)만 감지하는 방식으로 해결(사용자 확정, 2026-07-28). 자유 채팅(Phase 3)은 여전히 미구현.
 
 ## 구성
 
 - `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`.
 - `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨. Phase 2부터 성공 시 게시된 메시지의 Discord id를 stdout으로 반환(실패 시 빈 문자열) — 호출한 스크립트가 그 id로 pending-job을 기록해 나중에 답장을 매칭할 수 있게 함.
 - 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 아직 미구현인 Phase 3(본인 전용 자유 채팅)을 위해 미리 넣어둔 값 — 현재 코드는 참조하지 않음.
-- `~/.claude/discord-bot/pending/<message_id>.json` — Phase 2 pending-job 저장소(레포 밖, git 추적 안 함). 에스컬레이션을 쏜 스크립트가 `discord-notify.sh`가 반환한 message id로 기록: `{"type":"weekly-report-retry"|"work-log-retry"|"verify-task-v2-retry","created_at":ISO시각,"params":{...}}` — `weekly-report-retry`는 `params`가 비어있고(자기완결 스크립트라 외부 상태 불필요), `work-log-retry`는 `params`에 `session_id`/`transcript_path`를, `verify-task-v2-retry`는 `params`에 `task`(원본 전체, 자르지 않음)/`cwd`/`persona`/`maxRounds`/`historyFile`/`harnessFile`/`questions`를 담는다(각각 재실행에 필요한 상태를 스크립트/워크플로우 자체가 못 들고 있어서). `discord-bot.py`가 답장을 받으면 `message.reference.message_id`로 이 파일을 찾아 `type`에 따라 디스패치하고 처리 후 즉시 삭제(중복 답장 방지). 48시간 지난 항목은 만료 처리. `type`을 못 알아들으면(예: `needsUserDecision`은 애초에 pending-job을 안 씀) 조용히 로그만 남기고 무시 — 스키마가 깨지지 않고 확장 가능.
+- `~/.claude/discord-bot/pending/<message_id>.json` — Phase 2 pending-job 저장소(레포 밖, git 추적 안 함). 에스컬레이션을 쏜 스크립트가 `discord-notify.sh`가 반환한 message id로 기록: `{"type":"weekly-report-retry"|"work-log-retry"|"verify-task-v2-retry"|"verify-task-v2-decision-retry","created_at":ISO시각,"params":{...}}` — `weekly-report-retry`는 `params`가 비어있고(자기완결 스크립트라 외부 상태 불필요), `work-log-retry`는 `params`에 `session_id`/`transcript_path`를, `verify-task-v2-retry`는 `params`에 `task`(원본 전체, 자르지 않음)/`cwd`/`persona`/`maxRounds`/`historyFile`/`harnessFile`/`questions`를, `verify-task-v2-decision-retry`는 `questions`만 빼고 동일한 필드를 담는다(각각 재실행에 필요한 상태를 스크립트/워크플로우 자체가 못 들고 있어서). `discord-bot.py`가 답장을 받으면 `message.reference.message_id`로 이 파일을 찾아 `type`에 따라 디스패치하고 처리 후 즉시 삭제(중복 답장 방지). 48시간 지난 항목은 만료 처리. `type`을 못 알아들으면(향후 미구현 소스 등) 조용히 로그만 남기고 무시 — 스키마가 깨지지 않고 확장 가능.
 
 ## 권한 경계 (사용자가 명시적으로 결정한 것, 재검토 없이 그냥 넓히지 말 것)
 
@@ -29,8 +29,7 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 - `verify-task-v2.js`의 `needsUserDecision`/`needsClarification`은 재개(resume) 메커니즘
   자체가 없다 — 유일한 복구 경로가 "질문에 답 → 전체 워크플로우를 처음부터 재호출"이다.
-  `needsClarification`은 아래 "## verify-task-v2 답장 재시도" 절에서 해결했고,
-  `needsUserDecision`은 계속 일방향(아래 절 참고).
+  둘 다 아래 "## verify-task-v2 답장 재시도" 절에서 해결했다.
 - `work-log-stop-check.sh`는 `.dispatched` 마커 때문에 단순 재실행이 즉시 no-op되고, 스크립트
   자체 주석에 "중복 아카이브/캘린더 이벤트 위험 때문에 재시도를 의도적으로 안 만들었다"고
   적혀 있었다 — 아래 "## Phase 2.5" 절에서 이 판단을 실제로 다시 검토해 해결했다.
@@ -81,47 +80,77 @@ exit 3을 "⏳ 이미 실행 중"으로 별도 표시한다(실패로 오표시�
 백그라운드에 넘기고 즉시 반환하는 구조라, `handle_work_log_retry()`는 재시도 디스패치
 자체가 정상 시작됐는지만 확인하고, 진짜 성공/실패는 이 새 알림 경로로 별도로 온다.
 
-## verify-task-v2 답장 재시도 — needs_clarification만 (2026-07-28)
+## verify-task-v2 답장 재시도 — needs_clarification + needsUserDecision (2026-07-28)
 
 `verify-task-v2.js`는 앞의 둘(weekly-report.sh, work-log-stop-check.sh)과 두 가지가
 근본적으로 다르다: (1) bash 스크립트가 아니라 Claude Code의 `Workflow` 툴로만 실행 가능한
 JS 워크플로우라 discord-bot.py가 그냥 서브프로세스로 못 띄운다. (2) 재개(resume) 메커니즘
 자체가 없어서 "부분 이어하기"가 아니라 항상 **전체를 처음부터 재실행**해야 한다.
 
-**범위를 의도적으로 좁힘**: `finalVerdict`가 멈추는 경우는 두 가지인데, 이번엔
-`needs_clarification`(정보 부족 역질문)만 구현했다. `needsUserDecision`(최대 라운드 소진,
-"수용/재시도/수동개입" 3지선다)은 Discord가 버튼이 아니라 자유텍스트 답장이라 의미 해석이
-애매해서 이번 범위에서 제외 — 계속 일방향 알림만 남기고, pending-job 자체를 안 쓴다
-(사용자 확정, 2026-07-28).
+`finalVerdict`가 멈추는 경우는 두 가지고, 이제 둘 다 구현돼 있다:
 
-**구현 방식**:
-- `verify-task-v2.js`의 `notifyDiscordEscalation()`이 `needs_clarification`일 때만
-  `discord-notify.sh`의 반환 메시지 id를 캡처해서(Workflow 스크립트는 JS 샌드박스라
-  파일시스템에 직접 못 씀 — `appendHistory`/`appendHarnessRules`와 같은 방식으로 `agent()`를
-  통해 Bash/Write로 대신 시킴) `type: "verify-task-v2-retry"` pending-job을 기록한다.
-  `params`에 원본 `task`(자르지 않은 전체), `cwd`, `persona`, `maxRounds`, `historyFile`,
-  `harnessFile`, `questions`를 담는다 — 재실행에 필요한 상태 전부.
+### needs_clarification (정보 부족 역질문)
+
+- `verify-task-v2.js`의 `notifyDiscordEscalation()`이 `discord-notify.sh`의 반환 메시지
+  id를 캡처해서(Workflow 스크립트는 JS 샌드박스라 파일시스템에 직접 못 씀 —
+  `appendHistory`/`appendHarnessRules`와 같은 방식으로 `agent()`를 통해 Bash/Write로 대신
+  시킴) `type: "verify-task-v2-retry"` pending-job을 기록한다. `params`에 원본 `task`(자르지
+  않은 전체), `cwd`, `persona`, `maxRounds`, `historyFile`, `harnessFile`, `questions`를
+  담는다 — 재실행에 필요한 상태 전부.
 - 답장이 오면 `handle_verify_task_v2_retry()`가 답장 텍스트를 `task` 끝에
-  `"\n\n[사용자 답변]\n" + 답장`으로 붙여서 새 task를 만들고, headless `claude -p`를
-  띄워 자연어로 `Workflow({scriptPath: ".../verify-task-v2.js", args: {...}})`를
-  호출하라고 지시한다. **discord-bot.py가 Claude Code의 `Workflow` 툴을 직접 호출한
-  최초 사례** — 이전엔 bash 스크립트 직접 실행(`weekly-report.sh`, `work-log-stop-check.sh`)
-  이나 `codex exec` 직접 호출(`!코덱스`)뿐이었다. 실현 가능성은 사전에 실측 확인함:
-  트리비얼한 probe 워크플로우를 headless `claude -p`로 호출해서 정상 반환되는 걸 확인한
-  뒤에 이 설계를 그대로 밀어붙였다.
+  `"\n\n[사용자 답변]\n" + 답장`으로 붙여서 새 task를 만들고, 같은 maxRounds로 처음부터
+  재실행한다.
+- 재시도한 실행이 또 `needs_clarification`으로 끝나면, 그 재실행 안의
+  `notifyDiscordEscalation()`이 다시 독립적으로 발동해서 새 pending-job을 만든다 —
+  별도 코드 없이 "답변→또 불명확→다시 답변" 체인이 자연스럽게 반복 가능하다.
+
+### needsUserDecision (최대 라운드 소진) — 키워드 감지 방식 (2026-07-28)
+
+최초 구현 시(같은 날 이전 커밋) 이 경로는 의도적으로 범위에서 뺐다 — "수용/재시도/수동개입"
+3지선다를 Discord의 자유텍스트 답장으로 의미 해석하는 게 애매해서였다. 사용자에게 다시
+확인한 결과(2026-07-28), 전체 자연어 이해 대신 **답장에 재시도 의도 키워드(`재시도`/`retry`/
+`다시`)가 있는지만 감지**하는 방식으로 좁혀서 구현하기로 함:
+
+- `type: "verify-task-v2-decision-retry"` pending-job을 needs_clarification과 같은 스키마로
+  기록(단 `questions` 필드 없음 — 답할 질문이 없으므로).
+- `handle_verify_task_v2_decision_retry()`가 답장 텍스트에서 `_has_retry_intent()`로 키워드
+  존재만 확인한다. 키워드가 있으면 `maxRounds`를 +2 늘려서(질문에 답하는 게 아니므로 task는
+  원본 그대로, 붙이는 텍스트 없음) 처음부터 재실행. 없으면("수용", "수동으로 할게", 그 외
+  아무 말) 자동 조치 없이 "확인했습니다" 답장만 하고 종료 — "수용"과 "수동개입"을 굳이
+  구분하지 않는다, 둘 다 "더 이상 자동으로 건드리지 마라"는 뜻은 같기 때문.
+- 재시도가 또 `needsUserDecision`으로 끝나면 마찬가지로 새 pending-job이 독립적으로 다시
+  생겨 답장 체인이 반복 가능.
+
+### 공통 구현 메모
+
+- **discord-bot.py가 Claude Code의 `Workflow` 툴을 직접 호출한 최초 사례** — 이전엔 bash
+  스크립트 직접 실행(`weekly-report.sh`, `work-log-stop-check.sh`)이나 `codex exec` 직접
+  호출(`!코덱스`)뿐이었다. headless `claude -p`에 자연어로
+  `Workflow({scriptPath: ".../verify-task-v2.js", args: {...}})`를 호출하라고 지시하는
+  방식 — 실현 가능성은 사전에 트리비얼한 probe 워크플로우로 실측 확인 후 이 설계를 그대로
+  밀어붙였다.
 - work-log-stop-check.sh의 재시도(`handle_work_log_retry`)와 달리 **끝까지 기다린다**
   (`stdout=PIPE`+`communicate()`) — verify-task-v2는 `& disown`으로 백그라운드에
   넘기는 구조가 아니라 `claude -p` 프로세스 자체가 끝까지 동기적으로 도는 구조라,
   work-log-stop-check.sh에서 겪었던 "disown된 자식이 파이프를 붙잡고 있어서 블로킹"
   문제가 여기엔 적용되지 않는다(그 버그와 이유는 `handle_work_log_retry`의 docstring 참고).
-- 재시도한 실행이 또 `needs_clarification`으로 끝나면, 그 재실행 안의
-  `notifyDiscordEscalation()`이 다시 독립적으로 발동해서 새 pending-job을 만든다 —
-  별도 코드 없이 "답변→또 불명확→다시 답변" 체인이 자연스럽게 반복 가능하다.
+- **`CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0` 필수** — 이게 없으면 `claude -p`가 Workflow의
+  백그라운드 `agent()` 호출들을 ~600초까지만 기다리다 포기하고 "백그라운드에서 계속 실행
+  중이니 나중에 알려줄게"라며 exit 0으로 끝나버리는데, 일회성 `-p` 프로세스는 그 "나중에"를
+  전달할 방법이 없어 재시도가 사실상 유실된 채로 거짓 성공 취급되는 버그가 실측으로 확인됨.
+  이 환경변수로 그 give-up 동작 자체를 꺼서 `communicate()`가 워크플로우가 실제로 끝날 때까지
+  진짜로 블로킹하게 만든다.
 - 타임아웃 30분(`!코덱스`와 동일 — 전체 트랙이 코덱스/안티그래비티를 여러 번 오가므로).
 
-**실측 검증(2026-07-28)**: scratch repo에 의도적으로 정보가 부족한 작업("사용자 인증 기능을
-추가해줘", 아무 컨텍스트 없는 빈 저장소)을 줘서 full 트랙에서 실제로 `needs_clarification`이
-발생하는 걸 확인함(코덱스가 인증 방식/기술 스택/범위 3개 필수 질문을 정확히 생성).
+**실측 검증**: needs_clarification은 scratch repo에 의도적으로 정보가 부족한 작업("사용자
+인증 기능을 추가해줘", 아무 컨텍스트 없는 빈 저장소)을 줘서 full 트랙에서 실제로 발생하는 걸
+확인함(코덱스가 인증 방식/기술 스택/범위 3개 필수 질문을 정확히 생성). `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`
+수정은 실전 재시도 테스트가 26분(1573초) 동안 정상적으로 끝까지 대기하다가 진짜 실패
+사유(계정 세션 한도)를 정확히 보고하는 것으로 확인(예전엔 600초에 끊겨 거짓 완료를 보고).
+`needsUserDecision`의 키워드 감지(`_has_retry_intent`)는 로컬 유닛 테스트로 검증(수용/수동
+표현은 False, "재시도"/"retry"/"다시" 포함 표현은 True) — 이 경로 자체가 실제 코덱스/안티를
+호출하는 전체 재시도까지 라이브로 도는 건 아직 실측 안 됨(다음에 실제로 needsUserDecision이
+발생하면 확인할 것).
 
 ## `!코덱스` — 코덱스 직접 디스패치 (본인 전용, 2026-07-28)
 
@@ -166,7 +195,7 @@ JS 워크플로우라 discord-bot.py가 그냥 서브프로세스로 못 띄운�
 
 - `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능).
 - `hooks/work-log-stop-check.sh` — 실패(타임아웃 포함) 시 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 성공 시에도(LOGGED일 때만) 알림.
-- `workflows/verify-task-v2.js` — `needs_clarification`(정보 부족 역질문)로 끝나면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). `needsUserDecision`(최대 라운드 소진)은 여전히 일방향(3지선다를 자유텍스트로 해석하기 애매해서 의도적으로 제외).
+- `workflows/verify-task-v2.js` — `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 전자는 답장 전체를 답변으로 붙여 재실행, 후자는 답장에서 재시도 키워드(재시도/retry/다시)만 감지해 maxRounds를 늘려 재실행.
 
 ## 알려진 제약
 
