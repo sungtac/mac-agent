@@ -31,6 +31,7 @@ the channel-wide trust boundary above (see handle_codex_dispatch).
 """
 import asyncio
 import datetime
+import hashlib
 import json
 import os
 import signal
@@ -589,17 +590,44 @@ async def _git_output(cwd: Path, *args: str) -> str:
     return out.decode(errors="replace").strip()
 
 
+def _hash_file_content(path: Path) -> str:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        # Unreadable (permissions, vanished between listing and reading,
+        # etc.) — a fixed marker still lets before/after comparison detect
+        # a CHANGE (unreadable -> readable or vice versa), just not what
+        # changed. Never raise out of a snapshot helper.
+        return "UNREADABLE"
+
+
 async def _dirty_snapshot(cwd: Path) -> dict:
-    """filename -> its current unified-diff text (or "UNTRACKED" for a new
-    untracked file), for every file the working tree currently shows as
-    changed. Used to compute a before/after delta around a Codex run instead
-    of trusting a single post-run `git diff --stat` — this repo can have
-    other uncommitted work in flight (another terminal, a concurrent
+    """filename -> its current unified-diff text for a tracked change, or
+    "UNTRACKED:<sha256 of file content>" for an untracked file, for every
+    file the working tree currently shows as changed OR that exists
+    untracked. Used to compute a before/after delta around a Codex run
+    instead of trusting a single post-run `git diff --stat` — this repo can
+    have other uncommitted work in flight (another terminal, a concurrent
     session) that has nothing to do with this specific dispatch, and a bare
     post-run diff cannot tell the two apart. Caught live (2026-07-28): a
     `!코덱스` run to add one README line reported 3 unrelated files as
     "changed" that were actually pre-existing/concurrent edits from another
     terminal — this snapshot-delta approach is the fix.
+
+    Untracked entries carry a content hash, not a bare "UNTRACKED" marker
+    (2026-07-29, found in review before ever hit live): a flat marker only
+    tells you a path IS untracked, not what's in it, so two DIFFERENT
+    pieces of real Codex work were invisible to the caller's before/after
+    comparison — (1) Codex modifying the CONTENT of an already-untracked
+    file without `git add`ing it (before/after both just said "UNTRACKED",
+    identical, so no change registered at all, confirmed via local repro),
+    and (2) Codex DELETING a previously-untracked file (it vanishes from
+    both `git diff` and `git status --porcelain` entirely, so it silently
+    drops out of the snapshot with no trace, also confirmed via local
+    repro). Both meant `handle_codex_dispatch` could tell the user "실제
+    파일 변경 없음"/no changes even though Codex had genuinely done
+    something. Hashing the actual bytes makes both cases produce a real
+    before/after difference like any tracked change would.
     """
     diff_text = await _git_output(cwd, "diff", "--")
     status_text = await _git_output(cwd, "status", "--porcelain")
@@ -618,7 +646,8 @@ async def _dirty_snapshot(cwd: Path) -> dict:
         snapshot[current_file] = "\n".join(buf)
     for line in status_text.splitlines():
         if line.startswith("?? "):
-            snapshot[line[3:]] = "UNTRACKED"
+            path = line[3:]
+            snapshot[path] = f"UNTRACKED:{_hash_file_content(cwd / path)}"
     return snapshot
 
 
@@ -745,16 +774,43 @@ async def handle_codex_dispatch(message: discord.Message):
 
             # Never trust Codex's own report — confirm with a real before/after diff.
             after = await _dirty_snapshot(cwd)
-            changed = sorted(f for f in after if after[f] != before.get(f))
-            changed_tracked = [f for f in changed if after[f] != "UNTRACKED"]
-            changed_untracked = [f for f in changed if after[f] == "UNTRACKED"]
+            # Union of before/after keys, not just after's (2026-07-29,
+            # found in review before ever hit live): iterating only
+            # `after` means a file that was UNTRACKED in `before` and no
+            # longer appears in `after` at all (deleted) was silently
+            # invisible — confirmed via local repro that deleting a
+            # pre-existing untracked file produced an empty `changed` list.
+            # A tracked file reverted to exactly its committed state has
+            # the same shape (present in before's diff, absent from
+            # after's, since a clean file has no diff line) and is
+            # correctly caught by this same union-based comparison.
+            all_files = set(before) | set(after)
+            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
+
+            def _is_untracked_marker(v) -> bool:
+                return isinstance(v, str) and v.startswith("UNTRACKED:")
+
+            changed_tracked = [
+                f for f in changed
+                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
+            ]
+            untracked_notes = []
+            for f in changed:
+                if f in changed_tracked:
+                    continue
+                if f not in before:
+                    untracked_notes.append(f"신규 파일: {f}")
+                elif f not in after:
+                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
+                else:
+                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
 
             diff_stat = ""
             if changed_tracked:
                 diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-            if changed_untracked:
-                new_files_note = "\n".join(f"신규 파일: {f}" for f in changed_untracked)
-                diff_stat = f"{diff_stat}\n{new_files_note}" if diff_stat else new_files_note
+            if untracked_notes:
+                notes_block = "\n".join(untracked_notes)
+                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
 
             lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
             if diff_stat:

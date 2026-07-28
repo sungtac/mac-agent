@@ -220,9 +220,11 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
 가는 길이 없었다. 이 명령어로 디스코드에서 코덱스에게 직접 코딩 작업을 맡길 수 있다.
 
 - **재사용**: `workflows/lib/codex-execute-dispatch.sh <cwd> <prompt-file>`를 그대로
-  사용(verify-task-v2용으로 이미 있던 write-capable 코덱스 실행기, 수정 없음) —
-  `codex exec --skip-git-repo-check -s workspace-write -C <cwd> "$(cat <prompt-file>)"`를
-  실행하고 `{"ok": bool, "message": string}` JSON을 반환한다.
+  사용(verify-task-v2용으로 이미 있던 write-capable 코덱스 실행기) —
+  `codex exec -s workspace-write -C <cwd> "$(cat <prompt-file>)"`를 실행하고
+  `{"ok": bool, "message": string}` JSON을 반환한다(2026-07-29: cwd가 git 저장소인지
+  직접 검증하는 가드가 추가되면서 `--skip-git-repo-check`는 제거됨 — 상세는
+  `docs/verify-task-v2-design.md` 참고).
 - **저장소 별칭 allowlist**(`CODEX_REPO_ALIASES`, `discord-bot.py`): 임의 절대경로를
   그대로 받으면 `workspace-write`가 엉뚱한 곳을 건드릴 위험이 있어, 미리 승인된 별칭만
   허용. 현재: `mac-agent`, `hwpx-skill`, `pptx-skill`. 새 저장소 필요하면 이 딕셔너리에
@@ -240,6 +242,20 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
   건드리는 경우까지는 diff 비교만으로 완전히 못 잡는다 — 같은 작업 트리를 동시에 여러
   터미널/에이전트가 건드리는 구조적 한계이고, 완전한 격리(별도 git worktree 등)는 아직
   안 함.
+  - **미추적 파일의 삭제·내용변경이 안 잡히던 결함(2026-07-29, 코드리뷰로 발견, 라이브 전
+    수정)**: 미추적 파일은 스냅샷에 `"UNTRACKED"`라는 고정 문자열만 저장돼 있었다 — 그
+    말은 **경로가 미추적 상태라는 사실만** 기록하고 실제 내용은 전혀 안 담았다는 뜻. 두
+    가지 실제 케이스가 조용히 안 잡혔다(둘 다 로컬 재현으로 확인): (1) 실행 전부터 있던
+    미추적 파일을 코덱스가 `git add` 없이 내용만 바꾸면 before/after가 똑같이
+    `"UNTRACKED"`라 변경이 아예 감지 안 됨. (2) 실행 전부터 있던 미추적 파일을 코덱스가
+    삭제하면 `git diff`/`git status --porcelain` 어디에도 흔적이 안 남아 `after`
+    스냅샷에서 키 자체가 사라지는데, 비교 로직이 `after`의 키만 순회해서 이것도 놓침 —
+    두 경우 다 "실제 파일 변경 없음"으로 잘못 보고될 수 있었다. `_hash_file_content()`로
+    미추적 파일도 실제 내용의 sha256 해시(`"UNTRACKED:<hash>"`)를 저장하고, 비교도
+    `after`만이 아니라 `before`∪`after` 전체 키를 대상으로 하도록 고침 — 신규/삭제/내용변경
+    세 경우를 각각 "신규 파일"/"삭제됨(기존 미추적 파일)"/"내용 변경(미추적 파일)"로 구분해
+    보고한다. 실제 스텁 코덱스로 4가지(추적 파일 수정, 미추적 파일 삭제·내용변경·신규생성)를
+    동시에 일으키는 종단 테스트로 전부 정확히 보고되는 것까지 확인.
 - **커밋/푸시 안 함**: diff까지만 보여주고 끝 — 커밋·푸시는 별도의 명시적 요청이 있을 때만
   (되돌리기 어려운 작업이라 자동화하지 않음).
 - **재시도 없음(의도적)**: `weekly-report.sh`와 달리 자동 재시도가 없다 — 코딩 작업은
