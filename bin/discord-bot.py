@@ -313,10 +313,26 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
         "(통과 여부, needsUserDecision/needs_clarification로 또 끝났으면 그것도 명시)."
     )
 
+    # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0: a real bug caught by live testing
+    # (2026-07-28), not something documented anywhere beforehand. A Workflow
+    # call with real agent() calls (unlike the trivial no-agent probe.js used
+    # to validate feasibility) runs as an async background task inside
+    # `claude -p`'s own runtime, and by default `claude -p` gives up waiting
+    # for it after ~600s, prints a "still running in background, I'll notify
+    # you" message, and exits with code 0 — but a one-shot `-p` process has
+    # nowhere to deliver that later notification, so the workflow run is
+    # effectively orphaned and never actually reported (confirmed: verify-task-v2's
+    # own historyFile only had the FIRST run's entry, never the retry's, after
+    # this happened in a live test). Setting the ceiling to 0 disables that
+    # internal give-up-and-detach behavior so `communicate()` genuinely blocks
+    # until the workflow finishes — confirmed via a live agent()-calling probe
+    # workflow (not the trivial one) returning correctly with this var set.
+    verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+
     try:
         proc = await asyncio.create_subprocess_exec(
             str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
-            env=SUBPROCESS_ENV,
+            env=verify_task_v2_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )

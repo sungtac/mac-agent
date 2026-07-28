@@ -756,13 +756,26 @@ if (tier === 'full' && !finalVerdict) {
   }
 }
 
-async function notifyDiscordEscalation(message) {
-  // Best-effort, one-way (Mac → Discord) — same discord-notify.sh used by
-  // weekly-report.sh/work-log-stop-check.sh. Failure here must never affect
-  // finalVerdict; this is purely a side-channel nudge.
+// pendingJobParams가 있으면(needs_clarification 경로만) discord-notify.sh의
+// 반환 메시지 id를 캡처해서 weekly-report.sh/work-log-stop-check.sh와 같은
+// 스키마로 ~/.claude/discord-bot/pending/<id>.json을 쓴다 — 이 스크립트는
+// JS 샌드박스라 파일시스템에 직접 못 쓰므로, appendHistory/appendHarnessRules와
+// 같은 방식으로 agent()에게 Bash/Write로 대신 시킨다. pendingJobParams가
+// 없으면(needsUserDecision 경로) 기존 그대로 완전 일방향 — 자유텍스트 답장으로
+// "수용/재시도/수동개입" 3지선다를 의미 해석하기 애매해서 의도적으로 그대로
+// 둔다(사용자 확정, 2026-07-28).
+async function notifyDiscordEscalation(message, pendingJobParams) {
   try {
+    if (!pendingJobParams) {
+      await agent(
+        `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}`,
+        { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
+      )
+      return
+    }
+    const paramsJson = JSON.stringify(pendingJobParams)
     await agent(
-      `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}`,
+      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 그냥 "no-id"라고만 답하고 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 "verify-task-v2-retry", \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. 성공하면 "wrote pending-job for <id>"라고 답해.\n\n[원본 params JSON]\n${paramsJson}`,
       { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
     )
   } catch (e) {
@@ -774,8 +787,12 @@ async function finalizeAndReturn() {
   if (finalVerdict?.needsUserDecision || finalVerdict?.error === 'needs_clarification') {
     const shortTask = typeof task === 'string' ? task.slice(0, 200) : String(task)
     const reason = finalVerdict?.reason || finalVerdict?.questions || '(사유 없음)'
+    const isClarification = finalVerdict?.error === 'needs_clarification'
     await notifyDiscordEscalation(
-      `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}`
+      `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}${isClarification ? '\n\n이 메시지에 답장하면 그 내용을 답변으로 붙여서 재시도합니다.' : ''}`,
+      isClarification
+        ? { task, cwd, persona, maxRounds: MAX_ROUNDS, historyFile, harnessFile: HARNESS_FILE, questions: finalVerdict?.questions }
+        : undefined
     )
   }
 
