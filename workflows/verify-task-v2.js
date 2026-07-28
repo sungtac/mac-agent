@@ -55,12 +55,39 @@ const HARNESS_FILE_DEFAULT = '/Users/edge_ai/mac-agent/docs/codex-harness.md'
 // (Read 툴로) 대신 읽어서 프롬프트 텍스트 안에 직접 박아 넣는다. harnessFile
 // 인자가 있을 때만(그리고 tool==='codex'일 때만 — agy는 하네스 대상 아님)
 // 이 prepend가 붙는다.
-function buildScoreDispatchInstruction(tool, prompt, harnessFile) {
+// schemaKind는 score-dispatch.sh의 FAILURE_ENVELOPE가 어떤 단계 스키마에
+// 맞는 실패 봉투를 만들지 결정하는 3번째 인자다 — 이걸 안 넘기면 스크립트는
+// v1(rubric) 모양만 반환하는데, v2 각 단계 스키마(plan/critique/reconcile/
+// review/light-eval)는 그거랑 구조가 전혀 달라서 실제 실패가 나면 스키마
+// 검증 자체가 깨졌다(2026-07-27/28 실측, docs/verify-task-v2-design.md
+// "손 안 댄 것" 기록). 호출부마다 자기 스키마에 맞는 kind를 명시해야 함.
+function buildScoreDispatchInstruction(tool, prompt, harnessFile, schemaKind) {
   const injectHarness = tool === 'codex' && !!harnessFile
   const harnessNote = injectHarness
     ? `[하네스 주입] 2번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
     : ''
-  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로> ${schemaKind}\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+}
+
+// v1(verify-task.js)은 문자열(dealbreaker_reason) 동기화로 도구 실패를
+// 판별하지만, v2는 스키마마다 필드가 달라 문자열 위치가 스키마별로 다를 수
+// 있어 그 방식이 안 맞는다. 대신 모든 v2 실패 봉투가 공통으로 갖는
+// dispatchFailed 불리언 마커 하나로 스키마 무관하게 판별한다(score-dispatch.sh
+// FAILURE_ENVELOPE와 짝 — 필드명이 동기화 지점).
+function isDispatchFailure(result) {
+  return !!result && result.dispatchFailed === true
+}
+
+// v1의 scoreWithDispatchRetry와 동일한 목적(도구 실행/파싱 실패와 진짜 낮은
+// 평가를 구분해 1회만 자동 재시도) — v2는 호출부가 여러 종류라 제네릭하게
+// 구현. dispatchFn은 (isRetry) => Promise 형태를 받아 label 표시에만 쓴다.
+async function dispatchWithRetry(dispatchFn, label) {
+  let result = await dispatchFn(false)
+  if (isDispatchFailure(result)) {
+    log(`${label}: 도구 실행/파싱 실패로 보여 — 1회 재시도 중...`)
+    result = await dispatchFn(true)
+  }
+  return result
 }
 
 function buildExecuteDispatchInstruction(cwd, prompt, harnessFile) {
@@ -202,11 +229,11 @@ ${realDiff.content}
 반드시 JSON으로만 답해: {"completionCriteria":"","total":0,"escapeHatch":false,"escapeHatchReason":"","feedback":"구체적 감점 사유와 개선점"}`
 }
 
-async function codexEvaluateLight(task, context, summary, realDiff) {
+async function codexEvaluateLight(task, context, summary, realDiff, isRetry) {
   const prompt = buildLightEvalPrompt(task, context, summary, realDiff)
-  return agent(buildScoreDispatchInstruction('codex', prompt), {
+  return agent(buildScoreDispatchInstruction('codex', prompt, null, 'light-eval'), {
     phase: 'Light',
-    label: 'light-eval-codex',
+    label: isRetry ? 'light-eval-codex-retry' : 'light-eval-codex',
     schema: LIGHT_EVAL_SCHEMA,
   })
 }
@@ -238,11 +265,11 @@ ${context.contextText}
 JSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","plan":""}`
 }
 
-async function codexOwnPlan(task, context, harnessFile) {
+async function codexOwnPlan(task, context, harnessFile, isRetry) {
   const prompt = buildCodexPlanPrompt(task, context)
-  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile), {
+  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile, 'plan'), {
     phase: 'FullPlan',
-    label: 'codex-own-plan',
+    label: isRetry ? 'codex-own-plan-retry' : 'codex-own-plan',
     schema: CODEX_PLAN_SCHEMA,
   })
 }
@@ -291,10 +318,10 @@ async function claudeCritiquePlan(task, context, codexPlan) {
   })
 }
 
-async function antigravityCritiquePlan(task, context, codexPlan) {
-  return agent(buildScoreDispatchInstruction('agy', buildCritiquePrompt(task, context, codexPlan)), {
+async function antigravityCritiquePlan(task, context, codexPlan, isRetry) {
+  return agent(buildScoreDispatchInstruction('agy', buildCritiquePrompt(task, context, codexPlan), null, 'critique'), {
     phase: 'FullCritique',
-    label: 'critique-antigravity',
+    label: isRetry ? 'critique-antigravity-retry' : 'critique-antigravity',
     schema: CRITIQUE_SCHEMA,
   })
 }
@@ -351,11 +378,11 @@ ${antigravityCritique?.notes || ''}
 JSON으로만: {"compiledIssues":[{"description":"","source":""}],"disagreements":"","revisedPlan":""}`
 }
 
-async function codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, harnessFile) {
+async function codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, harnessFile, isRetry) {
   const prompt = buildReconcilePrompt(task, context, codexPlan, claudeCritique, antigravityCritique)
-  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile), {
+  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile, 'reconcile'), {
     phase: 'FullReconcile',
-    label: 'codex-reconcile',
+    label: isRetry ? 'codex-reconcile-retry' : 'codex-reconcile',
     schema: RECONCILE_SCHEMA,
   })
 }
@@ -453,10 +480,10 @@ async function claudeReviewDiff(task, context, realDiff) {
   })
 }
 
-async function antigravityReviewDiff(task, context, realDiff) {
-  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff)), {
+async function antigravityReviewDiff(task, context, realDiff, isRetry) {
+  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff), null, 'review'), {
     phase: 'FullReview',
-    label: 'review-antigravity',
+    label: isRetry ? 'review-antigravity-retry' : 'review-antigravity',
     schema: CODE_REVIEW_SCHEMA,
   })
 }
@@ -538,7 +565,10 @@ if (tier === 'light') {
     const realDiff = await gatherRealDiff(cwd)
 
     log(`[경량] 라운드 ${round}: 코덱스 평가 중...`)
-    const evalResult = await codexEvaluateLight(task, context, execResult?.summary, realDiff)
+    const evalResult = await dispatchWithRetry(
+      (isRetry) => codexEvaluateLight(task, context, execResult?.summary, realDiff, isRetry),
+      '코덱스 경량 평가'
+    )
     history.push({ tier: 'light', round, execResult, evalResult })
 
     const mechViolated = mechanicalTierViolated(realDiff)
@@ -589,14 +619,19 @@ if (tier === 'full' && !finalVerdict) {
     realDiff = await gatherRealDiff(cwd)
   } else {
     log('[전체] 1단계: 코덱스 자체 계획 작성...')
-    const codexPlan = await codexOwnPlan(task, context, HARNESS_FILE)
+    const codexPlan = await dispatchWithRetry(
+      (isRetry) => codexOwnPlan(task, context, HARNESS_FILE, isRetry),
+      '코덱스 계획 작성'
+    )
 
-    if (!codexPlan) {
+    if (!codexPlan || isDispatchFailure(codexPlan)) {
       finalVerdict = {
         passed: false,
         tier: 'full',
         error: 'codex_plan_failed',
-        reason: '코덱스 자체 계획 작성 단계가 실패함(세이프티 분류기 오류 등 일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+        reason: isDispatchFailure(codexPlan)
+          ? `코덱스 자체 계획 작성 단계가 도구 실행/파싱 실패로 1회 재시도 후에도 실패함: ${codexPlan.dispatchFailureReason}. 같은 task로 워크플로우를 재시도할 것.`
+          : '코덱스 자체 계획 작성 단계가 실패함(세이프티 분류기 오류 등 일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
       }
       log('[전체] 1단계: 코덱스 계획 작성 실패 — 재시도 필요')
       return await finalizeAndReturn()
@@ -618,18 +653,23 @@ if (tier === 'full' && !finalVerdict) {
     log('[전체] 2단계: 클로드/안티그래비티 블라인드 비평...')
     const [claudeCritique, antigravityCritique] = await parallel([
       () => claudeCritiquePlan(task, context, codexPlan),
-      () => antigravityCritiquePlan(task, context, codexPlan),
+      () => dispatchWithRetry((isRetry) => antigravityCritiquePlan(task, context, codexPlan, isRetry), '안티그래비티 비평'),
     ])
 
     log('[전체] 3단계: 코덱스 취합+판단+계획 개선...')
-    const reconciled = await codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, HARNESS_FILE)
+    const reconciled = await dispatchWithRetry(
+      (isRetry) => codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, HARNESS_FILE, isRetry),
+      '코덱스 취합'
+    )
 
-    if (!reconciled) {
+    if (!reconciled || isDispatchFailure(reconciled)) {
       finalVerdict = {
         passed: false,
         tier: 'full',
         error: 'codex_reconcile_failed',
-        reason: '코덱스 취합/계획개선 단계가 실패함(일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+        reason: isDispatchFailure(reconciled)
+          ? `코덱스 취합/계획개선 단계가 도구 실행/파싱 실패로 1회 재시도 후에도 실패함: ${reconciled.dispatchFailureReason}. 같은 task로 워크플로우를 재시도할 것.`
+          : '코덱스 취합/계획개선 단계가 실패함(일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
       }
       log('[전체] 3단계: 코덱스 취합 실패 — 재시도 필요')
       return await finalizeAndReturn()
@@ -648,7 +688,7 @@ if (tier === 'full' && !finalVerdict) {
     log(`[전체] ${round}라운드: 클로드/안티그래비티 블라인드 코드리뷰(무점수)...`)
     const [claudeReview, antigravityReview] = await parallel([
       () => claudeReviewDiff(task, context, realDiff),
-      () => antigravityReviewDiff(task, context, realDiff),
+      () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry), '안티그래비티 코드리뷰'),
     ])
 
     const combinedIssues = [

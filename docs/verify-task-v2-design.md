@@ -165,4 +165,6 @@ Codex·Antigravity·Plan 3자 만장일치 결론. Claude Code의 `UserPromptSub
 
 **경량→전체 탈출구 재매핑**: 탈출구가 발동하면 이미 실제 코드(클로드가 짠 것)가 있으므로, 1~8단계(계획 작성부터 실행까지)를 전부 생략하고 바로 9단계(듀얼 코드리뷰)로 직행한다. 단, 탈출구 경로의 **1라운드째**는 diff의 저자가 코덱스가 아니라 클로드(`lightExecute`)라는 점을 하네스 기록 시 `stageLabel`로 구분해서 남긴다(`code-review-of-claude-baseline`) — 그래야 "클로드 툴 사용 특유의 문제"가 "코덱스가 반복하는 실수"로 잘못 일반화되어 하네스에 쌓이는 걸 방지할 수 있다. 2라운드부터는 코덱스가 고치므로 정상적으로 `code-review`로 표기.
 
-**손 안 댄 것**: `score-dispatch.sh`, `codex-execute-dispatch.sh` 둘 다 스키마 비의존적 구조라 변경 없음. 다만 `score-dispatch.sh`의 `FAILURE_ENVELOPE`가 verify-task v1의 rubric 스키마를 하드코딩하고 있어 v2의 어떤 스키마와도 안 맞는 기존 결함을 발견했음 — 이번 개정 범위 밖이라 손대지 않고 여기 기록만 남김(후속 과제).
+**손 안 댄 것**: `codex-execute-dispatch.sh`는 스키마 비의존적 구조라 변경 없음.
+
+**후속 과제 해소 (2026-07-28)**: 위에서 발견했던 `score-dispatch.sh`의 `FAILURE_ENVELOPE` v1 rubric 스키마 하드코딩 결함을 고쳤다 — 3번째 인자로 `schema-kind`(rubric/light-eval/plan/critique/reconcile/review)를 받아 그 단계 스키마의 required 필드를 정확히 채우는 실패 봉투를 반환하도록 확장(인자 생략 시 기본값 `rubric`이라 v1 호출부는 무변경). v2 쪽은 문자열(`dealbreaker_reason`) 동기화 대신 스키마 공통 불리언 마커 `dispatchFailed`/`dispatchFailureReason`로 실패를 판별하고, v1의 `scoreWithDispatchRetry`와 동일하게 1회 자동 재시도(`dispatchWithRetry`)를 추가했다. `critique`/`review` kind는 실패를 "이슈 없음"으로 조용히 fail-open 시키지 않고, 실패 사실 자체를 blocking 이슈/비평 항목으로 넣어 fail-closed 처리. 각 kind별 실패 봉투 스키마 유효성을 `score-dispatch.sh` 직접 호출로 검증했고, scratch repo에 대한 full-track end-to-end 재실행(2026-07-28)으로 회귀 없음을 확인함.
