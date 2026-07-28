@@ -1,24 +1,27 @@
 # discord-bot.py + discord-notify.sh (일정비서 — Discord 연동)
 
-Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 답장 재시도 — 후자는 자유텍스트 3지선다를 그대로 해석하지 않고 재시도 의도 키워드(재시도/retry/다시)만 감지하는 방식으로 해결(사용자 확정, 2026-07-28). 자유 채팅(Phase 3)은 여전히 미구현.
+Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 답장 재시도 — 후자는 자유텍스트 3지선다를 그대로 해석하지 않고 재시도 의도 키워드(재시도/retry/다시)만 감지하는 방식으로 해결(사용자 확정, 2026-07-28). Phase 3(사용자 요청, 2026-07-29): 본인(free_chat_user_id) 전용 자유 채팅 — 접두어 없이 전부 릴레이, 전체 도구 허용, `--resume`로 세션 연속성 유지(`!새대화`로 초기화).
 
 ## 구성
 
 - `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`.
 - `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨. Phase 2부터 성공 시 게시된 메시지의 Discord id를 stdout으로 반환(실패 시 빈 문자열) — 호출한 스크립트가 그 id로 pending-job을 기록해 나중에 답장을 매칭할 수 있게 함.
-- 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 아직 미구현인 Phase 3(본인 전용 자유 채팅)을 위해 미리 넣어둔 값 — 현재 코드는 참조하지 않음.
+- 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 Phase 1부터 미리 넣어둔 값이었고, `!코덱스`(2026-07-28)에서 처음 참조하기 시작했으며 Phase 3(2026-07-29, 자유 채팅)에서도 그대로 재사용한다 — "Claude/코덱스에게 임의 지시를 내릴 수 있는 사람"이라는 같은 권한 레벨을 의미.
+- `~/.claude/discord-bot/free-chat-session.json` — Phase 3 세션 상태(레포 밖, git 추적 안 함). `{"session_id": <uuid>, "last_used_at": ISO시각}` 하나만 담는다 — 채널당 자유 채팅 사용자가 한 명뿐이라 여러 대화를 구분할 필요가 없음. `!새대화`로 삭제하면 다음 메시지가 새 세션을 시작한다.
 - `~/.claude/discord-bot/pending/<message_id>.json` — Phase 2 pending-job 저장소(레포 밖, git 추적 안 함). 에스컬레이션을 쏜 스크립트가 `discord-notify.sh`가 반환한 message id로 기록: `{"type":"weekly-report-retry"|"work-log-retry"|"verify-task-v2-retry"|"verify-task-v2-decision-retry","created_at":ISO시각,"params":{...}}` — `weekly-report-retry`는 `params`가 비어있고(자기완결 스크립트라 외부 상태 불필요), `work-log-retry`는 `params`에 `session_id`/`transcript_path`를, `verify-task-v2-retry`는 `params`에 `task`(원본 전체, 자르지 않음)/`cwd`/`persona`/`maxRounds`/`historyFile`/`harnessFile`/`questions`를, `verify-task-v2-decision-retry`는 `questions`만 빼고 동일한 필드를 담는다(각각 재실행에 필요한 상태를 스크립트/워크플로우 자체가 못 들고 있어서). `discord-bot.py`가 답장을 받으면 `message.reference.message_id`로 이 파일을 찾아 `type`에 따라 디스패치하고 처리 후 즉시 삭제(중복 답장 방지). 48시간 지난 항목은 만료 처리. `type`을 못 알아들으면(향후 미구현 소스 등) 조용히 로그만 남기고 무시 — 스키마가 깨지지 않고 확장 가능.
 
 ## 권한 경계 (사용자가 명시적으로 결정한 것, 재검토 없이 그냥 넓히지 말 것)
 
 - **인가된 채널만**: `config.json`의 `channel_id` 하나만 반응, 그 외 채널/DM/다른 서버/봇 자신의 메시지는 전부 무시. 이게 신뢰 경계 전부 — 그 채널은 초대받은 사람 전원이 완전히 신뢰된다는 사용자의 명시적 결정.
-- **자유 채팅(Claude Code에 임의 지시)은 본인만**: 아직 Phase 1이라 자유 채팅 자체가 없지만, Phase 3 구현 시에도 이 권한만은 채널 내 다른 사람에게 안 열기로 사용자가 이미 결정함 — 온디맨드 트리거/에스컬레이션 응답과 분리된 별도 권한 레벨.
+- **자유 채팅(Claude Code에 임의 지시)은 본인만**: Phase 3(2026-07-29)에서 실제로 구현됨 — `free_chat_user_id`와 발신자 id가 일치할 때만, 채널 내 다른 사람에게는 안 엶(사용자가 Phase 1 때부터 이미 결정해둔 것 그대로). 온디맨드 트리거/에스컬레이션 응답과 분리된 별도 권한 레벨.
 
 ## Phase 1 명령어
 
 - `!주간보고서` — `weekly-report.sh`를 즉시 실행(최대 20분 watchdog). 완료/실패 결과를 같은 채널에 보고.
 - `!상태` — 오늘자 weekly-report 로그 tail + 최근 work-log 처리 3건 요약.
-- 명령어도 아니고 pending-job에 대한 답장도 아닌 메시지는 전부 무시(자유 채팅 릴레이 없음).
+- `!새대화` (Phase 3, 본인 전용) — 자유 채팅 세션 상태 초기화.
+- 명령어도 아니고 pending-job에 대한 답장도 아닌 메시지는, 발신자가 `free_chat_user_id`면
+  Phase 3 자유 채팅으로 릴레이되고, 그 외엔 전부 무시.
 
 ## Phase 2 v1 — weekly-report.sh 답장 재시도
 
@@ -261,6 +264,56 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
 3. **별칭 allowlist**: 등록 안 된 저장소 별칭으로 호출 → 마찬가지로 즉시 거부, 사용 가능한
    별칭 목록 표시.
 셋 다 통과. scratch 저장소는 테스트 후 삭제.
+
+## Phase 3 — 자유 채팅 (본인 전용, 2026-07-29)
+
+`config.json`의 `free_chat_user_id`에 해당하는 사용자가 이 채널에 보내는, 인식된 명령어도
+아니고 pending-job 답장도 아닌 모든 메시지가 자유 채팅으로 릴레이된다. 원 계기는 사용자가 본
+유튜브의 Claude Cowork 데모(자연스러운 채팅으로 어디서나 Claude를 부림)를 구독형 Claude
+Code(CLI)로도 재현할 수 있는지 물은 것 — `!코덱스`가 "코딩 작업 하나를 코덱스에게"였다면
+Phase 3은 그보다 훨씬 넓은 "뭐든 클로드에게, 대화하듯"을 목표로 한다. 설계 갈림길 3개를
+사용자에게 직접 확인받고 결정함(2026-07-29):
+
+1. **트리거 — 접두어 없음**: `!채팅 <메시지>`처럼 명시적 접두어를 요구하는 대신, 그 사용자가
+   보내는 모든 비-명령어 메시지를 그대로 릴레이. Cowork 같은 자연스러운 대화 느낌을 위해
+   선택 — 대신 그 사용자가 채널에서 다른 사람과 잡담해도 지시로 해석될 수 있다는 트레이드오프를
+   사용자가 인지하고 감수함.
+2. **도구 권한 — 전체 허용**: `!코덱스`처럼 저장소 allowlist로 범위를 좁히는 대신, 인터랙티브
+   세션과 동일하게 Edit/Write/Bash 등 전체 도구를 그대로 씀. 안전 경계는 저장소 제한이 아니라
+   `free_chat_user_id` 하나뿐 — 사용자가 명시적으로 이 쪽(범위 제한보다 신뢰 기반)을 선택함.
+3. **대화 연속성 — `--resume` 유지**: 각 Discord 메시지가 독립된 새 세션이 아니라, 하나의
+   이어지는 대화로 유지됨(아래 구현 참고).
+
+**구현**:
+- `handle_free_chat()`: 세션 상태가 없으면(첫 메시지, 또는 `!새대화` 직후) Python
+  `uuid.uuid4()`로 새 id를 만들어 `claude -p "<메시지>" --session-id <uuid>`로 시작. 세션
+  상태가 있으면 `claude -p "<메시지>" --resume <uuid>`로 이어감. 세션 id는 Claude의 출력을
+  파싱해서 얻는 게 아니라 우리가 미리 만들어 넘기는 방식 — `--session-id`가 "이 UUID로 새
+  세션을 시작하라"는 뜻이라 가능한 접근. **실행이 실패(exit≠0)하면 세션 id를 저장하지 않는다**
+  — 시작도 못 한 세션을 이후 메시지들이 계속 resume 시도하게 되는 걸 방지.
+- `!새대화`: `free-chat-session.json`을 삭제해서 다음 메시지가 새 세션으로 시작하게 함.
+  대화 주제를 바꾸고 싶을 때 필요 — 없으면 무한정 이전 맥락을 끌고 감. `handle_codex_dispatch`와
+  같은 방식으로 핸들러 내부에서 자체적으로 `free_chat_user_id` 검사(디스패치 지점의 조건이
+  아니라) — 코드리뷰로 발견: 원래 `on_message`의 `!새대화` 분기엔 발신자 검사가 아예 없어서
+  아무 채널 멤버나 남의 대화 상태를 초기화할 수 있는 구멍이었음, 핸들러 안으로 옮겨 막음.
+- **`--permission-mode` 오버라이드 없음**: 이 파일의 다른 모든 헤드리스 `claude -p` 호출과
+  동일하게 아무 것도 안 정함 — 비대화형 기본 동작 + 이 맥의 `~/.claude/settings.json` 권한
+  설정에 그대로 맡김. `--dangerously-skip-permissions`류는 검토했지만 이 리뷰의 사용량 예산
+  안에서 실제로 검증할 방법이 없어 도입 안 함(새로운 미검증 위험을 추가하는 셈이라서).
+- 고정 cwd는 `$HOME`(`!코덱스`처럼 저장소 allowlist가 없으므로 "시작 위치"일 뿐 — 도구 자체는
+  절대경로면 어디든 접근 가능, 안전 경계는 위 1번 트리거·`free_chat_user_id` 게이트임).
+- 계정 사용량 사전 게이트(`usage_gate_check("claude")`, `!코덱스`/verify-task-v2 재시도와
+  공유)를 여기도 그대로 적용. 타임아웃 30분(`!코덱스`와 동일).
+
+**실측 검증(2026-07-29)**: 실제 계정이 이 시점 클로드 5시간창 0%라, 사용량 게이트가 진짜
+SKIP을 태우는 것까지 가짜 `discord.Message`로 확인(claude -p 스폰 자체가 안 일어나는 것을
+spawn 가드로 assert). PROCEED 경로는 `claude -p` 서브프로세스 자체를 모킹해서(실제 헤드리스
+세션은 안 띄움 — 자유 채팅이 실제 세션을 재귀적으로 새로 띄우는 구조라 라이브 테스트가
+자기 자신을 또 부르는 형태가 돼 특히 조심스러움) 세션 연속성 로직만 검증: 첫 메시지가
+`--session-id`로 새 uuid를 만들고 저장하는지, 두 번째 메시지가 저장된 uuid로 `--resume`하는지,
+실패 시 세션 파일이 손상되지 않고 그대로 남는지 3가지 확인. `!새대화`의 파일 삭제와 새로
+추가한 발신자 검사(권한 없는 사용자는 무조치)도 별도 확인. **실제 Discord 왕복이나 진짜
+헤드리스 `claude -p` 다중 턴 대화까지 라이브로 도는 건 아직 안 함** — 다음 실제 사용 때 확인.
 
 ## 에스컬레이션 알림 연결 지점
 

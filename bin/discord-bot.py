@@ -36,6 +36,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 import discord
@@ -755,6 +756,109 @@ async def on_ready():
     print(f"logged in as {client.user} (id={client.user.id})")
 
 
+FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-session.json"
+FREE_CHAT_CWD = Path.home()
+FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 — full tool access can run a real coding task
+
+
+def _load_free_chat_session_id() -> str | None:
+    try:
+        return json.loads(FREE_CHAT_SESSION_FILE.read_text()).get("session_id")
+    except Exception:
+        return None
+
+
+def _save_free_chat_session_id(session_id: str) -> None:
+    FREE_CHAT_SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+    FREE_CHAT_SESSION_FILE.write_text(json.dumps({
+        "session_id": session_id,
+        "last_used_at": datetime.datetime.now().isoformat(),
+    }))
+
+
+async def handle_free_chat_reset(message: discord.Message):
+    # Gated the same way handle_codex_dispatch gates itself (checked inside
+    # the handler, not left to the on_message dispatch site) — caught in
+    # review: unlike handle_free_chat, on_message's "!새대화" branch has no
+    # author-id condition of its own, so without this check any channel
+    # member could reset the one authorized user's conversation state.
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        return
+    FREE_CHAT_SESSION_FILE.unlink(missing_ok=True)
+    await message.channel.send("대화를 초기화했습니다 — 다음 메시지부터 새 대화로 시작합니다.")
+
+
+async def handle_free_chat(message: discord.Message):
+    """Phase 3 (2026-07-28/29): relay any non-command message from
+    FREE_CHAT_USER_ID straight to a headless `claude -p` with full tool
+    access (Edit/Write/Bash, same as an interactive session — no repo
+    allowlist like !코덱스 has, since the user explicitly chose the
+    broader-trust option here; FREE_CHAT_USER_ID is the only boundary).
+    No prefix required — every message from that user in this channel that
+    isn't a recognized command or a pending-job reply gets relayed
+    (user's explicit choice over requiring e.g. "!채팅 ..." — closer to the
+    Cowork-style natural chat this was modeled on).
+
+    Session continuity via `--resume`/`--session-id`: a session id is
+    generated once (Python's own uuid, not parsed from Claude's output) and
+    persisted to FREE_CHAT_SESSION_FILE. Every later message resumes that
+    same session, so context carries across separate Discord messages the
+    way an ongoing conversation would. `!새대화` (handle_free_chat_reset)
+    deletes the state file to start a fresh session on demand — necessary
+    once conversations persist, otherwise there's no way to change topics
+    without dragging the whole history along.
+
+    No --permission-mode override — deliberately matches every other
+    headless `claude -p` call in this file (weekly-report.sh,
+    kakao-morning-briefing.sh, work-log-stop-check.sh, both verify-task-v2
+    retry handlers): none of them set one either, relying on whatever
+    non-interactive default + this Mac's own ~/.claude/settings.json
+    permission config already resolves tool approval to. Introducing a new
+    permission mode just for this handler would be untested territory this
+    review didn't have session-limit budget to verify live.
+    """
+    skip_reason = await usage_gate_check("claude")
+    if skip_reason:
+        await message.channel.send(f"⏳ 지금 응답을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 말씀해주세요.")
+        return
+
+    text = message.content.strip()
+    if not text:
+        return
+
+    existing_session_id = _load_free_chat_session_id()
+    is_new_session = existing_session_id is None
+    session_id = existing_session_id or str(uuid.uuid4())
+
+    env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+    args = [str(CLAUDE_BIN), "-p", text, "--output-format", "text"]
+    args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args, cwd=str(FREE_CHAT_CWD), env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FREE_CHAT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+            return
+        out_text = (stdout or b"").decode(errors="replace").strip()
+        if proc.returncode != 0:
+            await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
+            return
+        # Only persist the session id AFTER a successful run — an id from a
+        # run that errored out (e.g. Claude Code couldn't start at all)
+        # would just make every subsequent message resume a session that
+        # never really began.
+        _save_free_chat_session_id(session_id)
+        await message.channel.send(out_text[:1900] if out_text else "(응답 없음)")
+    except Exception as e:
+        await message.channel.send(f"❌ 실행 중 예외: {e}")
+
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -772,7 +876,13 @@ async def on_message(message: discord.Message):
         await handle_status(message)
     elif content.startswith("!코덱스"):
         await handle_codex_dispatch(message)
-    # Phase 1: anything else is silently ignored (no free-chat relay yet).
+    elif content == "!새대화":
+        await handle_free_chat_reset(message)
+    elif FREE_CHAT_USER_ID and str(message.author.id) == FREE_CHAT_USER_ID:
+        # Phase 3: anything else from the one authorized user is free chat.
+        # Everyone else's non-command messages are still silently ignored —
+        # channel-wide trust covers commands, not arbitrary-instruction relay.
+        await handle_free_chat(message)
 
 
 if __name__ == "__main__":
