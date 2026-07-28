@@ -92,9 +92,9 @@ function buildDispatchInstruction(tool, prompt) {
   return `1. Bash로 \`mktemp /tmp/verify-task-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${DISPATCH_SCRIPT} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야(성공이든 실패든 스크립트가 결정적으로 만든 값) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
-async function scoreWithCodex(task, result, persona, cwd, verificationContent) {
+async function scoreWithCodex(task, result, persona, cwd, verificationContent, isRetry) {
   const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
-  return agent(buildDispatchInstruction('codex', prompt), { phase: 'Score', label: 'codex', schema: SCORE_SCHEMA })
+  return agent(buildDispatchInstruction('codex', prompt), { phase: 'Score', label: isRetry ? 'codex-retry' : 'codex', schema: SCORE_SCHEMA })
 }
 
 const CONTEXT_SCHEMA = {
@@ -105,18 +105,50 @@ const CONTEXT_SCHEMA = {
   required: ['content'],
 }
 
+// 주의: `git diff HEAD`는 아직 add된 적 없는 untracked 신규 파일을 절대 보여주지
+// 않는다 — 실측(verify-task-v2 종단 테스트, 2026-07-27~28)으로 이 누락 때문에
+// 셸 실행 불가 환경인 코덱스/제미나이 채점자(score-dispatch.sh는 -C 없이
+// 호출돼 둘 다 저장소를 직접 못 봄, 이 함수가 만든 텍스트만 봄)가 이미 정확히
+// 생성된 파일을 "누락됐다"고 거짓 채점한 사례가 실제로 발생함. 그래서
+// git status --porcelain으로 신규(untracked) 파일 목록을 뽑아 전체 내용을
+// 별도 섹션으로 반드시 덧붙인다 — git add 등으로 실제 git 상태를 건드리지 않고
+// 읽기만 한다.
 async function gatherVerificationContext(cwd) {
   if (!cwd) return null
   const gathered = await agent(
-    `Bash로 아래 한 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 그대로 content 필드에 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git log (최근 10개) ---'; git log --oneline -10; echo '--- 커밋되지 않은 변경 (git diff HEAD) ---'; git diff HEAD; echo '--- 최근 커밋 (git show HEAD) ---'; git show HEAD; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여서 반환해.`,
+    `Bash로 아래 한 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 그대로 content 필드에 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git log (최근 10개) ---'; git log --oneline -10; echo '--- git status --porcelain ---'; git status --porcelain; echo '--- 커밋되지 않은 tracked 변경 (git diff HEAD) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; echo '--- 최근 커밋 (git show HEAD) ---'; git show HEAD; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여서 반환해.`,
     { phase: 'Score', label: 'gather-context', schema: CONTEXT_SCHEMA }
   )
   return gathered?.content || null
 }
 
-async function scoreWithGemini(task, result, persona, cwd, verificationContent) {
+async function scoreWithGemini(task, result, persona, cwd, verificationContent, isRetry) {
   const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
-  return agent(buildDispatchInstruction('agy', prompt), { phase: 'Score', label: 'gemini', schema: SCORE_SCHEMA })
+  return agent(buildDispatchInstruction('agy', prompt), { phase: 'Score', label: isRetry ? 'gemini-retry' : 'gemini', schema: SCORE_SCHEMA })
+}
+
+// score-dispatch.sh는 codex/agy 실행 또는 JSON 파싱이 실패하면 항상 이 정확한
+// 문구를 dealbreaker_reason에 담아 고정 실패 봉투(scores 전부 0, total 0,
+// dealbreaker true)를 반환한다 — 실제 작업 품질에 대한 판단이 아니라 도구
+// 실행 자체의 실패 신호. 이 문구가 바뀌면 score-dispatch.sh의 FAILURE_ENVELOPE()
+// 도 같이 바꿔야 함(둘이 반드시 동기화돼야 하는 상수).
+const DISPATCH_FAILURE_REASON = '채점 도구 실행/파싱 실패 — 작업 내용에 대한 판단 아님'
+
+function isDispatchFailure(score) {
+  return !!score && score.dealbreaker_reason === DISPATCH_FAILURE_REASON
+}
+
+// 실측(2026-07-24, factorial 2차 시도): Codex 94점 vs Gemini 0점처럼 한쪽이
+// 도구 실행/파싱 실패로 극단적 이상치를 내는 사례가 실제로 있었음. 통과 기준
+// 자체(85점, 둘 다 만족)는 그대로 두고, 이런 이상치만 1회 자동 재채점해서
+// 진짜 낮은 점수와 도구 실패를 구분한다.
+async function scoreWithDispatchRetry(scoreFn, graderName) {
+  let score = await scoreFn(false)
+  if (isDispatchFailure(score)) {
+    log(`${graderName} 채점이 도구 실행/파싱 실패로 보여 — 1회 재채점 중...`)
+    score = await scoreFn(true)
+  }
+  return score
 }
 
 function passes(score) {
@@ -162,8 +194,8 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
 
   log(`라운드 ${round}: Codex + Gemini 채점 중...`)
   const [codexScore, geminiScore] = await parallel([
-    () => scoreWithCodex(task, result, persona, cwd, verificationContent),
-    () => scoreWithGemini(task, result, persona, cwd, verificationContent),
+    () => scoreWithDispatchRetry((isRetry) => scoreWithCodex(task, result, persona, cwd, verificationContent, isRetry), 'Codex'),
+    () => scoreWithDispatchRetry((isRetry) => scoreWithGemini(task, result, persona, cwd, verificationContent, isRetry), 'Gemini'),
   ])
   history.push({ round, result, codexScore, geminiScore })
 
