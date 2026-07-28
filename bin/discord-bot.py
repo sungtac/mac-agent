@@ -17,12 +17,17 @@ own explicit decision, not a default to weaken later without re-deciding).
 Reply-triggered retries inherit this same boundary (checked before dispatch).
 
 Phase 1 scope: two deterministic commands only. No free-form chat relay to
-`claude -p` yet (that's Phase 3) — a bare "!command" prefix keeps the
-surface small and auditable. Phase 2 v1 (weekly-report.sh) and Phase 2.5
-(work-log-stop-check.sh) both handle retries; verify-task-v2 clarification
-retry remains unimplemented (see docs/discord-bot.md) since it needs a
-resume mechanism that doesn't exist yet, unlike the other two which are
-just re-running a self-contained script.
+`claude -p` (that's still unimplemented, "Phase 3") — a bare "!command"
+prefix keeps the surface small and auditable. Phase 2 v1 (weekly-report.sh)
+and Phase 2.5 (work-log-stop-check.sh) both handle retries; verify-task-v2
+clarification retry remains unimplemented (see docs/discord-bot.md) since it
+needs a resume mechanism that doesn't exist yet, unlike the other two which
+are just re-running a self-contained script.
+
+`!코덱스 <repo-alias> <task>` (2026-07-28): dispatches a real, write-capable
+Codex run via workflows/lib/codex-execute-dispatch.sh, restricted to
+CODEX_REPO_ALIASES and gated by FREE_CHAT_USER_ID — this is NOT covered by
+the channel-wide trust boundary above (see handle_codex_dispatch).
 """
 import asyncio
 import datetime
@@ -30,6 +35,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 import discord
@@ -38,8 +44,23 @@ CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
+CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
+VERIFY_TASK_V2_JS = MAC_AGENT / "workflows" / "verify-task-v2.js"
+CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
+VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # full-track verify-task-v2 round-trips codex/antigravity several times, same budget as !코덱스
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
 WORK_LOG_DISPATCHED_MARKER_DIR = STATE_DIR / "work-log"
+
+# !코덱스 target allowlist — never let a Discord message pick an arbitrary
+# absolute path for `codex exec -s workspace-write`, which really writes
+# files. Add a line here (after confirming with the user) to expose another
+# repo; do not accept a free-typed path from the message itself.
+CODEX_REPO_ALIASES = {
+    "mac-agent": MAC_AGENT,
+    "hwpx-skill": Path.home() / "document-writing-project" / "hwpx-skill",
+    "pptx-skill": Path.home() / "document-writing-project" / "pptx-skill",
+}
+CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a report generation
 
 # Phase 2: pending-job store for reply-triggered retries. Written by scripts
 # that escalate via discord-notify.sh (keyed by that call's returned message
@@ -80,6 +101,11 @@ def load_config():
 
 CONFIG = load_config()
 AUTHORIZED_CHANNEL_ID = str(CONFIG["channel_id"])
+# Channel trust alone is not enough for a command that lets a channel member
+# cause arbitrary code execution (`!코덱스`, workspace-write) — this was the
+# documented intent for this field since Phase 1 (see docs/discord-bot.md
+# "권한 경계"), unused until now. Empty/missing = fail closed (nobody passes).
+FREE_CHAT_USER_ID = str(CONFIG.get("free_chat_user_id") or "")
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -222,6 +248,240 @@ async def handle_work_log_retry(message: discord.Message, params: dict):
         await message.channel.send(f"❌ work-log 재시도 실행 중 예외: {e}")
 
 
+async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
+    """Re-run verify-task-v2.js's full pipeline from scratch with the user's
+    Discord reply appended as the answer to a needs_clarification question.
+
+    verify-task-v2.js has no internal resume/checkpoint mechanism at all (see
+    docs/verify-task-v2-design.md and the workflow's own needs_clarification
+    comment) — the only documented recovery path is "answer the question,
+    append it to the original task string, and re-invoke the whole workflow
+    from the top." There is also no bash-script entry point the way
+    weekly-report.sh/work-log-stop-check.sh have — verify-task-v2.js can only
+    be invoked through Claude Code's own `Workflow` tool, which nothing in
+    this file had ever called before (weekly-report.sh/work-log-stop-check.sh
+    are bash scripts spawned directly; !코덱스 calls `codex exec` directly).
+    So this spawns a headless `claude -p` and instructs it, in natural
+    language, to call `Workflow({scriptPath: ..., args: {...}})` itself —
+    confirmed working via a live probe workflow before this was built
+    (2026-07-28): a trivial `probe.js` invoked this way returned its result
+    correctly through headless `claude -p`.
+
+    Unlike handle_work_log_retry, this DOES await the full run to completion
+    (stdout=PIPE + communicate(), not DEVNULL + wait()) — verify-task-v2.js
+    runs synchronously to completion inside the `claude -p` process itself,
+    it does not background+disown the way work-log-stop-check.sh does, so
+    there is no inherited-pipe-stays-open hazard here (see the docstring on
+    handle_work_log_retry for that bug and why it doesn't apply to this
+    function).
+
+    If this retry run itself hits needs_clarification again, that is not
+    handled specially here — the re-invoked verify-task-v2.js's own
+    notifyDiscordEscalation() fires again independently and writes a fresh
+    pending-job, so a reply chain (answer -> still unclear -> answer again)
+    works naturally without any extra code in this function.
+    """
+    task = params.get("task")
+    cwd = params.get("cwd")
+    if not task or not cwd:
+        await message.channel.send(f"❌ verify-task-v2 재시도 실패 — pending-job에 task/cwd가 없습니다: {params!r}")
+        return
+
+    answer = message.content.strip()
+    if not answer:
+        await message.channel.send("❌ 답장 내용이 비어있어서 재시도할 수 없습니다 — 답변 내용을 담아서 다시 답장해주세요.")
+        return
+
+    new_task = f"{task}\n\n[사용자 답변]\n{answer}"
+    workflow_args = {
+        "task": new_task,
+        "cwd": cwd,
+        "persona": params.get("persona", "일반 사용자"),
+        "maxRounds": params.get("maxRounds", 2),
+        "historyFile": params.get("historyFile"),
+        "harnessFile": params.get("harnessFile"),
+    }
+    workflow_args = {k: v for k, v in workflow_args.items() if v is not None}
+
+    await message.channel.send("답장 확인 — verify-task-v2를 답변 반영해서 처음부터 재실행합니다. 전체 트랙이면 코덱스/안티그래비티를 여러 번 오가서 몇 분 걸릴 수 있어요, 끝나면 알려드릴게요.")
+
+    prompt = (
+        "Workflow 툴을 사용해서 다음을 실행해줘: "
+        f"scriptPath는 {json.dumps(str(VERIFY_TASK_V2_JS))}, "
+        f"args는 {json.dumps(workflow_args, ensure_ascii=False)}. "
+        "실행이 끝나면 반환된 finalVerdict를 요약해서 한국어로 짧게 알려줘 "
+        "(통과 여부, needsUserDecision/needs_clarification로 또 끝났으면 그것도 명시)."
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+            return
+        tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
+        if proc.returncode == 0:
+            await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
+        else:
+            await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+    except Exception as e:
+        await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
+
+
+async def _git_output(cwd: Path, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "/usr/bin/git", "-C", str(cwd), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return out.decode(errors="replace").strip()
+
+
+async def _dirty_snapshot(cwd: Path) -> dict:
+    """filename -> its current unified-diff text (or "UNTRACKED" for a new
+    untracked file), for every file the working tree currently shows as
+    changed. Used to compute a before/after delta around a Codex run instead
+    of trusting a single post-run `git diff --stat` — this repo can have
+    other uncommitted work in flight (another terminal, a concurrent
+    session) that has nothing to do with this specific dispatch, and a bare
+    post-run diff cannot tell the two apart. Caught live (2026-07-28): a
+    `!코덱스` run to add one README line reported 3 unrelated files as
+    "changed" that were actually pre-existing/concurrent edits from another
+    terminal — this snapshot-delta approach is the fix.
+    """
+    diff_text = await _git_output(cwd, "diff", "--")
+    status_text = await _git_output(cwd, "status", "--porcelain")
+    snapshot: dict = {}
+    current_file = None
+    buf: list = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if current_file is not None:
+                snapshot[current_file] = "\n".join(buf)
+            current_file = line.rsplit(" b/", 1)[-1]
+            buf = [line]
+        else:
+            buf.append(line)
+    if current_file is not None:
+        snapshot[current_file] = "\n".join(buf)
+    for line in status_text.splitlines():
+        if line.startswith("?? "):
+            snapshot[line[3:]] = "UNTRACKED"
+    return snapshot
+
+
+async def handle_codex_dispatch(message: discord.Message):
+    """`!코덱스 <저장소별칭> <작업 지시>` — dispatch a real, write-capable
+    Codex run via workflows/lib/codex-execute-dispatch.sh (reused as-is; see
+    that script's own header for why it's the write-capable sibling of
+    score-dispatch.sh). Restricted to CODEX_REPO_ALIASES (never accept a
+    free-typed path — workspace-write really writes files) and to
+    FREE_CHAT_USER_ID (channel trust alone is not enough for this).
+
+    Per codex-execute-dispatch.sh's own documented design, Codex's self-report
+    is never trusted as a verification signal — this function independently
+    diffs the repo and reports THAT, not just Codex's claim, and calls out
+    the mismatch explicitly if Codex claims success but nothing actually
+    changed. Never commits/pushes — that stays a separate, explicit,
+    human-reviewed step.
+
+    Takes a `_dirty_snapshot()` before AND after the run and reports only the
+    files that differ between the two snapshots — NOT a plain post-run
+    `git diff --stat`. Live test (2026-07-28) caught this the hard way: a
+    request to add one README line reported 3 unrelated files as "changed"
+    that were pre-existing/concurrent edits from another terminal working in
+    the same repo. The before/after delta fixes the common case (dirt that
+    already existed when the run started) but cannot fully solve a file
+    another process edits DURING this run's window — that's a real residual
+    limitation of sharing a working tree with a concurrent editor, not
+    something a diff-based check alone can close.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        await message.channel.send("이 명령어는 본인만 사용 가능합니다.")
+        return
+
+    parts = message.content.strip().split(maxsplit=2)
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    if len(parts) < 3:
+        await message.channel.send(f"사용법: `!코덱스 <저장소별칭> <작업 지시>`\n사용 가능한 별칭: {aliases}")
+        return
+
+    _, alias, task = parts
+    cwd = CODEX_REPO_ALIASES.get(alias)
+    if cwd is None:
+        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    before = await _dirty_snapshot(cwd)
+    dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
+
+    prompt_file = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(task)
+            prompt_file = Path(f.name)
+
+        await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
+
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+            return
+
+        raw = (stdout or b"").decode(errors="replace")
+        try:
+            result = json.loads(raw)
+            ok = bool(result.get("ok"))
+            codex_message = str(result.get("message", ""))[:1000]
+        except Exception:
+            ok = False
+            codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[:1000]}"
+
+        # Never trust Codex's own report — confirm with a real before/after diff.
+        after = await _dirty_snapshot(cwd)
+        changed = sorted(f for f in after if after[f] != before.get(f))
+        changed_tracked = [f for f in changed if after[f] != "UNTRACKED"]
+        changed_untracked = [f for f in changed if after[f] == "UNTRACKED"]
+
+        diff_stat = ""
+        if changed_tracked:
+            diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+        if changed_untracked:
+            new_files_note = "\n".join(f"신규 파일: {f}" for f in changed_untracked)
+            diff_stat = f"{diff_stat}\n{new_files_note}" if diff_stat else new_files_note
+
+        lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
+        if diff_stat:
+            lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
+        elif ok:
+            lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
+        else:
+            lines.append("실제 파일 변경 없음.")
+        lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
+        lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
+        await message.channel.send("\n".join(lines)[:1900])
+    except Exception as e:
+        await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
+    finally:
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
+
+
 async def handle_pending_reply(message: discord.Message) -> bool:
     """If `message` is a reply to a message with a pending-job file, handle
     it and return True. Returns False for anything else (not a reply, or a
@@ -267,8 +527,13 @@ async def handle_pending_reply(message: discord.Message) -> bool:
         await handle_work_log_retry(message, job.get("params", {}))
         return True
 
-    # Unhandled type (e.g. a future Phase 2.5 source) — log and ignore rather
-    # than silently pretending we did something.
+    if job_type == "verify-task-v2-retry":
+        await handle_verify_task_v2_retry(message, job.get("params", {}))
+        return True
+
+    # Unhandled type (e.g. needsUserDecision, which never writes a pending-job
+    # by design, or a future source) — log and ignore rather than silently
+    # pretending we did something.
     print(f"pending job {ref.message_id}: unhandled type {job_type!r}", file=sys.stderr)
     return True
 
@@ -293,6 +558,8 @@ async def on_message(message: discord.Message):
         await handle_weekly_report(message)
     elif content == "!상태":
         await handle_status(message)
+    elif content.startswith("!코덱스"):
+        await handle_codex_dispatch(message)
     # Phase 1: anything else is silently ignored (no free-chat relay yet).
 
 
