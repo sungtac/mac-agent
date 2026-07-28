@@ -78,7 +78,7 @@ PROMPT=$(cat <<PROMPT_EOF
      ### 제안 (초안)
      이 소제목 바로 아래에 반드시 '※ 아래 항목은 에이전트가 제안하는 초안이며 실제 계획이 아닙니다. 검토 후 직접 수정해주세요.'라는 문구를 넣고, 그 아래에 이번 주 기록에서 보이는 미완료·후속 작업을 "- "로 시작하는 bullet로 제안하세요. 이 소제목 아래엔 확정된 사실을 절대 넣지 말고(확정 일정은 위 소제목에만), 순수 제안·초안만 적으세요.
 3. Write 도구로 이 보고서를 마크다운 파일로 저장하세요. 경로: "${REPORT_PATH}" (폴더가 없으면 Bash로 먼저 mkdir -p 하세요). 파일 맨 위에 "# ${TITLE}" 제목을 넣으세요.
-4. Google Calendar MCP 도구로 calendar_id \`${CALENDAR_ID}\`에 이번 주 금요일(${FRI}) 09:00~09:30 이벤트를 하나 새로 생성하세요. 제목은 "${TITLE}", description에는 2번에서 쓴 두 섹션 내용을 그대로(요약하지 말고) 넣고 맨 끝 줄에 "전체 파일: ${REPORT_PATH}"를 추가하세요.
+4. Google Calendar MCP \`search_events\`로 calendar_id \`${CALENDAR_ID}\`에서 ${FRI} 하루 동안 제목이 "${TITLE}"인 이벤트가 이미 있는지 먼저 확인하세요(재시도 등으로 이 스크립트가 같은 주에 두 번 실행될 수 있어 중복 생성을 막기 위함입니다). 이미 있으면 그 이벤트를 \`update_event\`로 description만 아래 내용으로 갱신하고 새로 만들지 마세요. 없으면 이번 주 금요일(${FRI}) 09:00~09:30 이벤트를 하나 새로 생성하세요. 제목은 "${TITLE}", description에는 2번에서 쓴 두 섹션 내용을 그대로(요약하지 말고) 넣고 맨 끝 줄에 "전체 파일: ${REPORT_PATH}"를 추가하세요.
 5. 마지막에 저장한 파일의 절대 경로와 생성한 캘린더 이벤트 ID를 각각 한 줄로 출력하세요.
 
 참고: Google Drive MCP 도구가 연결되어 있어도 이 작업에는 쓰지 마세요 — 의도된 설계이니 항상 로컬 파일시스템(Bash/Write)으로만 저장하세요.
@@ -144,6 +144,17 @@ done
 
 if [ "$SUCCESS" -ne 1 ]; then
   echo "all ${MAX_ATTEMPTS} attempts failed." >> "$LOGFILE"
-  bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 주간보고서 생성 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}" || true
+  # discord-notify.sh returns the posted message's Discord id on stdout (Phase 2).
+  # If we get one back, record a pending-job file keyed by that id so
+  # discord-bot.py can recognize a reply to THIS message and retry the script.
+  MSG_ID="$(bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 주간보고서 생성 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}
+이 메시지에 답장하면 다시 시도합니다." || true)"
+  if [ -n "$MSG_ID" ]; then
+    PENDING_DIR="$HOME/.claude/discord-bot/pending"
+    mkdir -p "$PENDING_DIR"
+    python3 -c "import json,sys,datetime
+json.dump({'type': 'weekly-report-retry', 'created_at': datetime.datetime.now().isoformat(), 'params': {}},
+           open(sys.argv[1], 'w'))" "$PENDING_DIR/${MSG_ID}.json"
+  fi
   exit 1
 fi

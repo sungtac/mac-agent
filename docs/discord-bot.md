@@ -1,12 +1,13 @@
 # discord-bot.py + discord-notify.sh (일정비서 — Discord 연동)
 
-Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2(에스컬레이션 양방향 응답), Phase 3(자유 채팅)는 아직 설계만 있고 미구현.
+Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. verify-task-v2 헤드리스 재호출·work-log-stop-check 재시도(Phase 2.5), 자유 채팅(Phase 3)은 아직 미구현.
 
 ## 구성
 
-- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행.
-- `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨.
-- 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음.
+- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`.
+- `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨. Phase 2부터 성공 시 게시된 메시지의 Discord id를 stdout으로 반환(실패 시 빈 문자열) — 호출한 스크립트가 그 id로 pending-job을 기록해 나중에 답장을 매칭할 수 있게 함.
+- 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 아직 미구현인 Phase 3(본인 전용 자유 채팅)을 위해 미리 넣어둔 값 — 현재 코드는 참조하지 않음.
+- `~/.claude/discord-bot/pending/<message_id>.json` — Phase 2 pending-job 저장소(레포 밖, git 추적 안 함). 에스컬레이션을 쏜 스크립트가 `discord-notify.sh`가 반환한 message id로 기록: `{"type":"weekly-report-retry","created_at":ISO시각,"params":{}}`. `discord-bot.py`가 답장을 받으면 `message.reference.message_id`로 이 파일을 찾아 `type`에 따라 디스패치하고 처리 후 즉시 삭제(중복 답장 방지). 48시간 지난 항목은 만료 처리. `type`을 못 알아들으면(향후 Phase 2.5 소스 등) 조용히 로그만 남기고 무시 — 스키마가 깨지지 않고 확장 가능.
 
 ## 권한 경계 (사용자가 명시적으로 결정한 것, 재검토 없이 그냥 넓히지 말 것)
 
@@ -17,13 +18,32 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 - `!주간보고서` — `weekly-report.sh`를 즉시 실행(최대 20분 watchdog). 완료/실패 결과를 같은 채널에 보고.
 - `!상태` — 오늘자 weekly-report 로그 tail + 최근 work-log 처리 3건 요약.
-- 그 외 메시지는 전부 무시(Phase 1은 명령어 패턴만, 자유 채팅 릴레이 없음).
+- 명령어도 아니고 pending-job에 대한 답장도 아닌 메시지는 전부 무시(자유 채팅 릴레이 없음).
 
-## 에스컬레이션 알림 연결 지점 (일방향)
+## Phase 2 v1 — weekly-report.sh 답장 재시도
 
-- `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출.
-- `hooks/work-log-stop-check.sh` — watchdog 타임아웃 시 `discord-notify.sh` 호출.
-- `workflows/verify-task-v2.js` — `needsUserDecision`/`needsClarification`로 끝나면(경량/전체 트랙 공통) `discord-notify.sh` 호출.
+세 에스컬레이션 소스 중 `weekly-report.sh`만 재시도가 안전하다고 판단해(2026-07-28) 이것부터
+구현했다: 락파일이 없어 재실행 자체가 안전하고, 유일한 중복 위험(Calendar 이벤트 매번 새로
+생성)은 4번 단계에 `search_events` 선확인 가드를 추가해 막았다. 나머지 둘은 아래처럼 이번에도
+일방향으로 남겨뒀다:
+
+- `verify-task-v2.js`의 `needsUserDecision`/`needsClarification`은 재개(resume) 메커니즘
+  자체가 없다 — 유일한 복구 경로가 "질문에 답 → 전체 워크플로우를 처음부터 재호출"이고, 이걸
+  헤드리스(활성 터미널 없이)로 하려면 `agent()` 셔임을 새로 만들어야 해서 Phase 2.5로 미룸.
+- `work-log-stop-check.sh`는 `.dispatched` 마커 때문에 단순 재실행이 즉시 no-op되고, 스크립트
+  자체 주석에 "중복 아카이브/캘린더 이벤트 위험 때문에 재시도를 의도적으로 안 만들었다"고
+  이미 적혀 있어 그 판단을 이번에도 그대로 존중함.
+
+동작: 실패 알림에 답장(Discord reply) → `discord-bot.py`가 `message.reference`로
+`~/.claude/discord-bot/pending/<id>.json`을 찾아 `type: "weekly-report-retry"`를 확인하고
+`handle_weekly_report()`를 재사용해 재실행. pending-job은 처리 즉시 삭제(중복 답장 방지),
+48시간 지나면 만료 처리. 코드 변경 후 launchd 재기동 필요(위 구성 항목 참조).
+
+## 에스컬레이션 알림 연결 지점
+
+- `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능).
+- `hooks/work-log-stop-check.sh` — watchdog 타임아웃 시 `discord-notify.sh` 호출(일방향, Phase 2.5 예정).
+- `workflows/verify-task-v2.js` — `needsUserDecision`/`needsClarification`로 끝나면(경량/전체 트랙 공통) `discord-notify.sh` 호출(일방향, Phase 2.5 예정).
 
 ## 알려진 제약
 

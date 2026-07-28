@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Discord bot — Phase 1: on-demand automation triggers + (later) escalation
-replies. Runs as a persistent process under launchd (KeepAlive) since it
-holds a Gateway WebSocket connection — this is NOT a periodic cron job like
+"""Discord bot — Phase 1 (on-demand automation triggers) + Phase 2 v1
+(reply-triggered retry for weekly-report.sh only; see handle_pending_reply).
+Runs as a persistent process under launchd (KeepAlive) since it holds a
+Gateway WebSocket connection — this is NOT a periodic cron job like
 weekly-report.sh.
 
 Config: ~/.claude/discord-bot/config.json — {"token": "...", "channel_id": "..."}
@@ -12,12 +13,16 @@ on. Everything else (other channels, DMs, other servers, the bot's own
 messages) is ignored — this is the whole trust boundary, since the channel
 is invite-only and everyone in it is treated as fully trusted (the user's
 own explicit decision, not a default to weaken later without re-deciding).
+Reply-triggered retries inherit this same boundary (checked before dispatch).
 
 Phase 1 scope: two deterministic commands only. No free-form chat relay to
 `claude -p` yet (that's Phase 3) — a bare "!command" prefix keeps the
-surface small and auditable.
+surface small and auditable. Phase 2 v1 only handles weekly-report.sh
+retries — verify-task-v2 clarification and work-log-stop-check retries are
+Phase 2.5, not yet implemented (see docs/discord-bot.md).
 """
 import asyncio
+import datetime
 import json
 import os
 import subprocess
@@ -30,6 +35,15 @@ CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
+
+# Phase 2: pending-job store for reply-triggered retries. Written by scripts
+# that escalate via discord-notify.sh (keyed by that call's returned message
+# id), read here when a reply comes in. Schema: {"type": ..., "created_at":
+# ISO string, "params": {...}}. `type` is dispatched below; unrecognized
+# types (future Phase 2.5 sources) are logged and ignored rather than erroring,
+# so this store can grow without breaking older/newer bot code.
+PENDING_DIR = Path.home() / ".claude" / "discord-bot" / "pending"
+PENDING_MAX_AGE_HOURS = 48
 
 # Subprocesses we spawn (weekly-report.sh etc.) shell out to codex/agy/claude
 # by absolute path already (fixed 2026-07-26), but git/date/etc still resolve
@@ -125,6 +139,45 @@ async def handle_weekly_report(message: discord.Message):
         await message.channel.send(f"❌ 주간보고서 실행 중 예외: {e}")
 
 
+async def handle_pending_reply(message: discord.Message) -> bool:
+    """If `message` is a reply to a message with a pending-job file, handle
+    it and return True. Returns False for anything else (not a reply, or a
+    reply to a message with no/expired pending job) so on_message can fall
+    through to the normal command checks."""
+    ref = message.reference
+    if ref is None or ref.message_id is None:
+        return False
+    job_path = PENDING_DIR / f"{ref.message_id}.json"
+    if not job_path.exists():
+        return False
+
+    try:
+        job = json.loads(job_path.read_text())
+        created = datetime.datetime.fromisoformat(job["created_at"])
+    except Exception as e:
+        print(f"pending job {ref.message_id}: unreadable ({e}), removing", file=sys.stderr)
+        job_path.unlink(missing_ok=True)
+        return False
+
+    if (datetime.datetime.now() - created).total_seconds() > PENDING_MAX_AGE_HOURS * 3600:
+        job_path.unlink(missing_ok=True)
+        await message.channel.send("이 요청은 48시간이 지나 만료됐습니다 — 다시 실행하려면 `!주간보고서`를 입력해주세요.")
+        return True
+
+    job_type = job.get("type")
+    job_path.unlink(missing_ok=True)  # delete first so a second reply can't double-trigger
+
+    if job_type == "weekly-report-retry":
+        await message.channel.send("답장 확인 — 주간보고서 재시도합니다.")
+        await handle_weekly_report(message)
+        return True
+
+    # Unhandled type (e.g. a future Phase 2.5 source) — log and ignore rather
+    # than silently pretending we did something.
+    print(f"pending job {ref.message_id}: unhandled type {job_type!r}", file=sys.stderr)
+    return True
+
+
 @client.event
 async def on_ready():
     print(f"logged in as {client.user} (id={client.user.id})")
@@ -135,6 +188,9 @@ async def on_message(message: discord.Message):
     if message.author.bot:
         return
     if str(message.channel.id) != AUTHORIZED_CHANNEL_ID:
+        return
+
+    if await handle_pending_reply(message):
         return
 
     content = message.content.strip()

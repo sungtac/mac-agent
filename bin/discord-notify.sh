@@ -7,6 +7,11 @@
 #
 # Usage: discord-notify.sh "message text"
 #
+# On success, prints the posted message's Discord id to stdout (Phase 2) so
+# a calling script can record a pending-job file keyed by that id and let
+# discord-bot.py recognize a reply to it later. Prints nothing on failure —
+# callers must treat an empty stdout as "no id, don't expect a reply".
+#
 # Deliberately never fails the caller: config missing, malformed, or the
 # Discord API call itself failing are all logged to stderr and exit 0 — a
 # notification side-channel going down should never take the primary
@@ -43,13 +48,21 @@ if [ -z "$BODY" ]; then
   exit 0
 fi
 
-HTTP_CODE="$(curl -s --max-time 10 -o /dev/null -w '%{http_code}' -X POST \
+RESPONSE="$(curl -s --max-time 10 -X POST \
   "https://discord.com/api/v10/channels/${CHANNEL_ID}/messages" \
   -H "Authorization: Bot ${TOKEN}" \
   -H "Content-Type: application/json" \
   -d "$BODY")"
 
-if [ "$HTTP_CODE" != "200" ] && [ "$HTTP_CODE" != "201" ]; then
-  echo "discord-notify: Discord API returned HTTP ${HTTP_CODE}" >&2
+MESSAGE_ID="$(python3 -c "import json,sys
+try:
+    print(json.loads(sys.argv[1])['id'])
+except Exception:
+    pass" "$RESPONSE" 2>/dev/null)"
+
+if [ -z "$MESSAGE_ID" ]; then
+  echo "discord-notify: Discord API call failed or returned no id: ${RESPONSE:0:200}" >&2
+else
+  echo "$MESSAGE_ID"
 fi
 exit 0
