@@ -301,6 +301,16 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
         await message.channel.send("❌ 답장 내용이 비어있어서 재시도할 수 없습니다 — 답변 내용을 담아서 다시 답장해주세요.")
         return
 
+    skip_reason = await usage_gate_check("claude")
+    if skip_reason:
+        await send_and_requeue(
+            message,
+            f"⏳ 지금 재시도를 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 이 메시지에 답변을 다시 담아 답장해주세요(방금 보낸 답변은 저장되지 않았습니다).",
+            "verify-task-v2-retry",
+            params,
+        )
+        return
+
     new_task = f"{task}\n\n[사용자 답변]\n{answer}"
     workflow_args = {
         "task": new_task,
@@ -415,6 +425,16 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
         await message.channel.send("확인했습니다 — 재시도 키워드(재시도/retry/다시)가 없어서 자동 조치 없이 종료합니다.")
         return
 
+    skip_reason = await usage_gate_check("claude")
+    if skip_reason:
+        await send_and_requeue(
+            message,
+            f"⏳ 지금 재시도를 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 이 메시지에 재시도 키워드(재시도/retry/다시)를 담아 다시 답장해주세요.",
+            "verify-task-v2-decision-retry",
+            params,
+        )
+        return
+
     bumped_max_rounds = params.get("maxRounds", 2) + 2
     workflow_args = {
         "task": task,
@@ -462,6 +482,58 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
             await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
     except Exception as e:
         await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
+
+
+USAGE_PREFLIGHT_GATE_SH = MAC_AGENT / "workflows" / "lib" / "usage-preflight-gate.sh"
+
+
+async def usage_gate_check(actor: str) -> str | None:
+    """Runs usage-preflight-gate.sh <actor> and returns the human-readable
+    skip reason (SKIP:'s text with that prefix stripped) if usage is too low
+    to safely start, or None if it's fine to proceed.
+
+    Unlike the bash-script call sites (weekly-report.sh, kakao-morning-
+    briefing.sh, work-log-stop-check.sh — see docs/discord-bot.md's "사용량
+    사전 게이트" notes), these three Discord-triggered handlers are already
+    live replies to a real message.channel, so on SKIP they just tell the
+    user directly and return — no pending-job/auto-retry needed here, the
+    user can just re-send the command once usage recovers.
+
+    Fails open (returns None, i.e. "proceed") on any subprocess error — a
+    broken gate must not become a new way for these commands to stop
+    working, same posture as every bash call site's `|| echo "PROCEED..."`.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(USAGE_PREFLIGHT_GATE_SH), actor,
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        out, _ = await proc.communicate()
+        text = out.decode(errors="replace").strip()
+    except Exception:
+        return None
+    if text.startswith("SKIP:"):
+        return text[len("SKIP:"):].strip()
+    return None
+
+
+async def send_and_requeue(message: discord.Message, text: str, job_type: str, params: dict) -> None:
+    """Send `text` and register a FRESH pending-job (same type/params) keyed
+    to the message we just sent, so a reply to it re-triggers the same
+    retry path. Needed because handle_pending_reply() deletes the inbound
+    pending-job BEFORE dispatch ("delete first so a second reply can't
+    double-trigger") — by the time a handler like
+    handle_verify_task_v2_retry()/handle_verify_task_v2_decision_retry()
+    decides to bail out on the usage gate, the original pending-job is
+    already gone, so telling the user to "just reply again" would silently
+    do nothing without this. Caught in code review, 2026-07-28, before it
+    was ever hit live.
+    """
+    sent = await message.channel.send(text)
+    PENDING_DIR.mkdir(parents=True, exist_ok=True)
+    job = {"type": job_type, "created_at": datetime.datetime.now().isoformat(), "params": params}
+    (PENDING_DIR / f"{sent.id}.json").write_text(json.dumps(job, ensure_ascii=False))
 
 
 async def _git_output(cwd: Path, *args: str) -> str:
@@ -546,6 +618,14 @@ async def handle_codex_dispatch(message: discord.Message):
     cwd = CODEX_REPO_ALIASES.get(alias)
     if cwd is None:
         await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    # No pending-job/requeue here (unlike the two verify-task-v2 handlers) —
+    # !코덱스 is a one-shot manual command, not a reply-triggered retry chain,
+    # so there's nothing to requeue: the user just re-sends !코덱스 later.
+    skip_reason = await usage_gate_check("codex")
+    if skip_reason:
+        await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
         return
 
     before = await _dirty_snapshot(cwd)
