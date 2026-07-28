@@ -793,6 +793,23 @@ def _save_free_chat_session_id(session_id: str) -> None:
     }))
 
 
+async def handle_free_chat_stop(message: discord.Message):
+    """!중지 — kills FREE_CHAT_CURRENT_PROC if a free-chat run is in flight.
+    Only kills the OS subprocess, not the enclosing handle_free_chat()
+    coroutine/task — its own `await proc.communicate()` simply returns once
+    the killed process's pipes close, and the handler's existing
+    `proc.returncode != 0` branch reports it as a failure, which is exactly
+    what actually happened. No separate cancellation path needed.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        return
+    if FREE_CHAT_CURRENT_PROC is None:
+        await message.channel.send("지금 실행 중인 응답이 없습니다.")
+        return
+    FREE_CHAT_CURRENT_PROC.kill()
+    await message.channel.send("중단 요청을 보냈습니다.")
+
+
 async def handle_free_chat_reset(message: discord.Message):
     # Gated the same way handle_codex_dispatch gates itself (checked inside
     # the handler, not left to the on_message dispatch site) — caught in
@@ -922,6 +939,8 @@ async def on_message(message: discord.Message):
         await handle_codex_dispatch(message)
     elif content == "!새대화":
         await handle_free_chat_reset(message)
+    elif content == "!중지":
+        await handle_free_chat_stop(message)
     elif FREE_CHAT_USER_ID and str(message.author.id) == FREE_CHAT_USER_ID:
         # Phase 3: anything else from the one authorized user is free chat.
         # Everyone else's non-command messages are still silently ignored —
