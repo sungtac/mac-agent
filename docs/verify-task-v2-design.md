@@ -165,6 +165,14 @@ Codex·Antigravity·Plan 3자 만장일치 결론. Claude Code의 `UserPromptSub
 
 **경량→전체 탈출구 재매핑**: 탈출구가 발동하면 이미 실제 코드(클로드가 짠 것)가 있으므로, 1~8단계(계획 작성부터 실행까지)를 전부 생략하고 바로 9단계(듀얼 코드리뷰)로 직행한다. 단, 탈출구 경로의 **1라운드째**는 diff의 저자가 코덱스가 아니라 클로드(`lightExecute`)라는 점을 하네스 기록 시 `stageLabel`로 구분해서 남긴다(`code-review-of-claude-baseline`) — 그래야 "클로드 툴 사용 특유의 문제"가 "코덱스가 반복하는 실수"로 잘못 일반화되어 하네스에 쌓이는 걸 방지할 수 있다. 2라운드부터는 코덱스가 고치므로 정상적으로 `code-review`로 표기.
 
-**손 안 댄 것**: `codex-execute-dispatch.sh`는 스키마 비의존적 구조라 변경 없음.
+**`codex-execute-dispatch.sh` 후속 수정 (2026-07-29, `!코덱스` 코드리뷰로 발견)**: 애초엔
+스키마 비의존적 구조라 변경 없다고 기록했었으나, `!코덱스`를 면밀히 재검토하며 이 스크립트
+자체의 결함 두 개를 찾아 고쳤다 — 둘 다 verify-task-v2 실행 단계에도 그대로 적용됨(같은
+스크립트를 공유하므로). (1) `--skip-git-repo-check`가 켜져 있어서 cwd가 non-git이면
+호출자의 diff 기반 검증(자기보고 불신 원칙)이 통째로 조용히 무력화될 수 있었음 — git 저장소
+여부를 직접 확인하는 가드 추가, 플래그 제거. (2) 실패 시 `head -c 2000`(앞부분)을 잘라 보여줬는데,
+codex의 실제 출력은 배너+작업로그가 앞에 쌓이고 진짜 실패 사유는 끝에 나오는 구조라 실패 메시지가
+거의 항상 무의미한 앞부분만 보여줬을 것 — `tail -c 2000`(끝부분)으로 수정, 성공 경로의
+`raw[-4000:]`와 방향 통일.
 
 **후속 과제 해소 (2026-07-28)**: 위에서 발견했던 `score-dispatch.sh`의 `FAILURE_ENVELOPE` v1 rubric 스키마 하드코딩 결함을 고쳤다 — 3번째 인자로 `schema-kind`(rubric/light-eval/plan/critique/reconcile/review)를 받아 그 단계 스키마의 required 필드를 정확히 채우는 실패 봉투를 반환하도록 확장(인자 생략 시 기본값 `rubric`이라 v1 호출부는 무변경). v2 쪽은 문자열(`dealbreaker_reason`) 동기화 대신 스키마 공통 불리언 마커 `dispatchFailed`/`dispatchFailureReason`로 실패를 판별하고, v1의 `scoreWithDispatchRetry`와 동일하게 1회 자동 재시도(`dispatchWithRetry`)를 추가했다. `critique`/`review` kind는 실패를 "이슈 없음"으로 조용히 fail-open 시키지 않고, 실패 사실 자체를 blocking 이슈/비평 항목으로 넣어 fail-closed 처리. 각 kind별 실패 봉투 스키마 유효성을 `score-dispatch.sh` 직접 호출로 검증했고, scratch repo에 대한 full-track end-to-end 재실행(2026-07-28)으로 회귀 없음을 확인함.

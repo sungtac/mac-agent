@@ -73,8 +73,17 @@ RAW_OUTPUT="$(/opt/homebrew/bin/codex exec -s workspace-write -C "$CWD" "$(cat "
 EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -ne 0 ]; then
-  TRUNCATED="$(printf '%s' "$RAW_OUTPUT" | head -c 2000)"
-  FAILURE_ENVELOPE "codex exec 종료코드 ${EXIT_CODE}. 원본 출력(앞 2000자): ${TRUNCATED}"
+  # tail, not head (2026-07-29, found in review before ever hit live): a
+  # verbose codex run (banner + per-tool-call chatter) puts its actual
+  # failure reason near the END of RAW_OUTPUT, not the start — confirmed by
+  # simulating a realistic-length failing run, where the real error text
+  # fell entirely outside a `head -c 2000` cut but was still present in the
+  # last 2000 chars. The success path below already uses `raw[-4000:]`
+  # (tail) for the same reason; this was the one path still cutting from
+  # the wrong end, meaning most real failures likely showed generic
+  # boilerplate instead of the actual error.
+  TRUNCATED="$(printf '%s' "$RAW_OUTPUT" | tail -c 2000)"
+  FAILURE_ENVELOPE "codex exec 종료코드 ${EXIT_CODE}. 원본 출력(끝 2000자): ${TRUNCATED}"
   exit 0
 fi
 
