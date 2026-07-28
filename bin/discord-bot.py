@@ -816,14 +816,25 @@ async def handle_free_chat_stop(message: discord.Message):
     the killed process's pipes close, and the handler's existing
     `proc.returncode != 0` branch reports it as a failure, which is exactly
     what actually happened. No separate cancellation path needed.
+
+    Checks FREE_CHAT_LOCK, not just FREE_CHAT_CURRENT_PROC (2026-07-29,
+    caught in review before ever hit live): the lock is acquired BEFORE the
+    usage gate check and subprocess spawn, so there's a real (short but
+    nonzero — confirmed via a deliberately widened test) window where a run
+    has genuinely started (lock held) but FREE_CHAT_CURRENT_PROC is still
+    None because no OS process exists yet to kill. Without this, !중지
+    during that window falsely claimed "nothing is running" even though one
+    was actively starting.
     """
     if str(message.author.id) != FREE_CHAT_USER_ID:
         return
-    if FREE_CHAT_CURRENT_PROC is None:
+    if FREE_CHAT_CURRENT_PROC is not None:
+        FREE_CHAT_CURRENT_PROC.kill()
+        await message.channel.send("중단 요청을 보냈습니다.")
+    elif FREE_CHAT_LOCK.locked():
+        await message.channel.send("응답을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
+    else:
         await message.channel.send("지금 실행 중인 응답이 없습니다.")
-        return
-    FREE_CHAT_CURRENT_PROC.kill()
-    await message.channel.send("중단 요청을 보냈습니다.")
 
 
 async def handle_free_chat_reset(message: discord.Message):
