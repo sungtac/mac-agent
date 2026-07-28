@@ -4,7 +4,7 @@
 에이전트에 스킬을 재설치할 때 따르는 절차. 세 갈래로 나뉜다:
 
 1. **mac-agent 자산** (훅·워크플로우·cron) — 이 저장소 자체
-2. **Claude Skills** (hwpx, pptx, 이식형 패턴 5종) — `skill-catalog`로 설치
+2. **Claude Skills** (hwpx, pptx, 이식형 패턴 5종, 외부 도입 5종) — `skill-catalog`로 설치
 3. **hwpx/pptx 개발환경** — 스킬을 쓰기만 할 게 아니라 고칠 때만 필요
 
 전체 목록·상태 요약은 스킬 카탈로그 아티팩트(맥 바탕화면 `구현스킬카탈로그.html`)를 참고.
@@ -30,7 +30,8 @@ cd ~/mac-agent && ./setup.sh   # Codex/Antigravity CLI 확인·설치
 ```bash
 python3 ~/.claude/skills/skill-catalog/generator/catalog.py --list
 python3 ~/.claude/skills/skill-catalog/generator/catalog.py --install \
-  hwpx,pptx,grounded-rigor,agent-model-board,independent-critique-loop,rnd-consortium-rnr-strategy,workflow-follow-through \
+  hwpx,pptx,grounded-rigor,agent-model-board,independent-critique-loop,rnd-consortium-rnr-strategy,workflow-follow-through,\
+diagnosing-bugs,tdd,handoff,design-taste-frontend,last30days \
   --yes
 python3 ~/.claude/skills/skill-catalog/generator/catalog.py --doctor
 ```
@@ -38,6 +39,10 @@ python3 ~/.claude/skills/skill-catalog/generator/catalog.py --doctor
 - `three-role-work-verification`은 내장 `verify-task-v2`와 개념이 겹쳐 설치 시점에
   의도적으로 거부된다(정상 동작).
 - 재설치(덮어쓰기)는 항상 멱등 — 안전하게 반복 실행 가능.
+- `diagnosing-bugs`/`tdd`/`handoff`(mattpocock/skills), `design-taste-frontend`(Leonxlnx/taste-skill),
+  `last30days`(mvanhorn/last30days-skill)는 2026-07-28에 검토 후 편입한 외부(MIT) 스킬 —
+  각 폴더의 `SOURCE.md`에 원본 저장소·커밋·라이선스 기록. `last30days`는 `node`, `python3`
+  바이너리가 있어야 동작(대부분 소스는 API 키 불필요, X/TikTok 등 일부만 선택적 키 필요).
 
 ## 3. skill-catalog 자신 + `_shared/adapters` 편입 (신규 머신 최초 1회 한정)
 
@@ -91,3 +96,4 @@ ln -sfn ~/document-writing-project/pptx-skill ~/.claude/skills/pptx
 | mac-agent 훅·워크플로우·cron | GitHub `sungtac/mac-agent` | git clone + symlink |
 | hwpx, pptx 스킬 | GitHub `sungtac/hwpx-skill`, `sungtac/pptx-skill` (개발) | Drive `portable-skills/` (설치, `catalog.py`) |
 | 이식형 패턴 5종 + skill-catalog + `_shared` | Drive `portable-skills/` (GitHub 없음) | `catalog.py --install` (skill-catalog·`_shared`는 수동 rsync) |
+| 외부 도입 스킬 5종(diagnosing-bugs·tdd·handoff·design-taste-frontend·last30days) | 각 원저자 GitHub(MIT, `SOURCE.md` 참조) → Drive `portable-skills/`로 편입 | `catalog.py --install` |
