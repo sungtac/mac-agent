@@ -46,9 +46,30 @@ if [ ! -f "$PROMPT_FILE" ]; then
   exit 0
 fi
 
+# CWD must be a real git repo (2026-07-29, found in code review before ever
+# hit live): every caller of this script (verify-task-v2.js's own design
+# doc says cwd is mandatory specifically so it can run `git status`/`git
+# diff` unconditionally; discord-bot.py's !코덱스 verifies via before/after
+# `git diff`/`git status` snapshots, never trusting Codex's self-report)
+# already assumes this. Without this check, a non-git $CWD would silently
+# defeat that entire verification model: `git diff`/`git status` against a
+# non-repo print usage/fatal-error text (confirmed via local repro) that
+# the caller's line-based parser doesn't recognize, so it just sees an
+# empty diff and reports "no changes" even if Codex actually wrote files —
+# a completely silent safety-net failure, not an error. Explicit check here
+# closes that instead of relying on it never happening to be hit (today's
+# CODEX_REPO_ALIASES only points at real repos, but nothing enforced that).
+if ! /usr/bin/git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  FAILURE_ENVELOPE "작업 디렉토리가 git 저장소가 아님: $CWD (이 스크립트를 호출하는 쪽의 diff 기반 검증이 git 저장소를 전제하므로, 아닐 경우 실행하지 않음)"
+  exit 0
+fi
+
 # Absolute path, not bare `codex` — a Workflow-spawned agent's Bash
 # environment can have a PATH stripped of /opt/homebrew/bin (see score-dispatch.sh).
-RAW_OUTPUT="$(/opt/homebrew/bin/codex exec --skip-git-repo-check -s workspace-write -C "$CWD" "$(cat "$PROMPT_FILE")" 2>&1)"
+# No --skip-git-repo-check — the check above already guarantees this is a
+# real git repo, so there's nothing to skip; keeping the flag would have
+# silently masked the check above's own guarantee if the two ever drifted.
+RAW_OUTPUT="$(/opt/homebrew/bin/codex exec -s workspace-write -C "$CWD" "$(cat "$PROMPT_FILE")" 2>&1)"
 EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -ne 0 ]; then
