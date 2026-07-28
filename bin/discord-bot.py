@@ -69,8 +69,10 @@ CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a r
 # access at once, and _dirty_snapshot()'s own before/after diff already
 # admits it can't fully attribute changes made by another process editing
 # DURING its window — this bot itself could be that other process. Keyed
-# per-alias (not one global lock) since two DIFFERENT repos genuinely don't
-# share any state and running them concurrently is fine.
+# per resolved cwd (not the alias string, not one global lock — see
+# handle_codex_dispatch's lock_key comment for why the alias name isn't
+# used) since two DIFFERENT repos genuinely don't share any state and
+# running them concurrently is fine.
 CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Phase 2: pending-job store for reply-triggered retries. Written by scripts
@@ -514,8 +516,8 @@ async def usage_gate_check(actor: str) -> str | None:
     `|| echo "PROCEED..."`.
 
     15s timeout (2026-07-29, found in review before ever hit live): this is
-    called from INSIDE FREE_CHAT_LOCK / CODEX_DISPATCH_LOCKS[alias] (see
-    those callers), so an unbounded hang here doesn't just delay one
+    called from INSIDE FREE_CHAT_LOCK / CODEX_DISPATCH_LOCKS[resolved cwd]
+    (see those callers), so an unbounded hang here doesn't just delay one
     message — it permanently wedges that lock, since nothing else in this
     function can ever un-block it. `coach` (the underlying data source,
     via usage-preflight-gate.sh) has been observed mid-session to report a
@@ -662,7 +664,15 @@ async def handle_codex_dispatch(message: discord.Message):
         await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
         return
 
-    lock = CODEX_DISPATCH_LOCKS.setdefault(alias, asyncio.Lock())
+    # Keyed by resolved path, not the alias string (2026-07-29, found in
+    # review): CODEX_REPO_ALIASES has no distinct-paths invariant enforced
+    # anywhere — if two aliases ever pointed at the same actual directory,
+    # locking per-alias-name would let !코덱스 runs against them race each
+    # other exactly like before this lock existed. Resolving symlinks/`..`
+    # first means two aliases for the same real repo always collide on the
+    # same lock object regardless of which name was used to reach it.
+    lock_key = str(cwd.resolve())
+    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
     if lock.locked():
         await message.channel.send(f"`{alias}`에 대한 다른 `!코덱스` 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
         return
