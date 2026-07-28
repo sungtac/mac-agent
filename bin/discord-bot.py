@@ -760,6 +760,23 @@ FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-se
 FREE_CHAT_CWD = Path.home()
 FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 — full tool access can run a real coding task
 
+# Concurrency guard (2026-07-29, found in review before ever hit live):
+# handle_free_chat() reads the session id at the START and only writes it
+# back at the END, after up to 30 minutes of awaiting a subprocess.
+# discord.py dispatches on_message per-message as separate concurrent tasks
+# (that's why e.g. !상태 still answers instantly while a long !주간보고서 is
+# running), so a natural follow-up message sent before the first reply
+# lands would read the SAME stale (pre-save) session id, spawn a second
+# claude -p with a fresh random uuid of its own, and whichever finishes
+# last silently overwrites the session file — the other reply is lost and
+# the conversation the user thinks they're continuing quietly diverges.
+# One process-wide lock is enough (this channel has exactly one free-chat
+# user and one session file — no per-user keying needed). Rejects instead
+# of queuing: a queued 30-minute-budget message piling up behind another
+# is worse than just asking the user to wait and re-send.
+FREE_CHAT_LOCK = asyncio.Lock()
+FREE_CHAT_CURRENT_PROC = None  # the asyncio subprocess currently running under the lock, if any — lets !중지 kill it (see handle_free_chat_stop)
+
 
 def _load_free_chat_session_id() -> str | None:
     try:
@@ -783,6 +800,16 @@ async def handle_free_chat_reset(message: discord.Message):
     # author-id condition of its own, so without this check any channel
     # member could reset the one authorized user's conversation state.
     if str(message.author.id) != FREE_CHAT_USER_ID:
+        return
+    # Also caught in review (2026-07-29): resetting while a run is still in
+    # flight used to be silently undone — that run's own eventual
+    # _save_free_chat_session_id() call would land AFTER this delete and
+    # re-establish the old (or a stale new) session, making the reset look
+    # like it worked but not actually stick. Reusing FREE_CHAT_LOCK (the
+    # same lock handle_free_chat holds for its whole duration) means this
+    # can't run concurrently with that save.
+    if FREE_CHAT_LOCK.locked():
+        await message.channel.send("지금 응답을 처리 중이라 초기화할 수 없습니다 — 끝나거나 `!중지`한 뒤 다시 시도해주세요.")
         return
     FREE_CHAT_SESSION_FILE.unlink(missing_ok=True)
     await message.channel.send("대화를 초기화했습니다 — 다음 메시지부터 새 대화로 시작합니다.")
@@ -816,47 +843,64 @@ async def handle_free_chat(message: discord.Message):
     permission config already resolves tool approval to. Introducing a new
     permission mode just for this handler would be untested territory this
     review didn't have session-limit budget to verify live.
+
+    Concurrency: rejects instead of queuing if FREE_CHAT_LOCK is already
+    held (see that constant's comment for the race this closes) — checked
+    BEFORE the usage gate so a busy reply doesn't also cost a gate-script
+    spawn. Holds the lock for the entire subprocess lifetime, including the
+    usage gate check, so two messages can never race on session-id
+    load/save. FREE_CHAT_CURRENT_PROC is published while held so
+    handle_free_chat_stop() (!중지) has something to kill.
     """
-    skip_reason = await usage_gate_check("claude")
-    if skip_reason:
-        await message.channel.send(f"⏳ 지금 응답을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 말씀해주세요.")
+    if FREE_CHAT_LOCK.locked():
+        await message.channel.send("이전 메시지를 아직 처리 중입니다 — 끝나면 다시 말씀해주세요 (중단하려면 `!중지`).")
         return
 
-    text = message.content.strip()
-    if not text:
-        return
+    async with FREE_CHAT_LOCK:
+        skip_reason = await usage_gate_check("claude")
+        if skip_reason:
+            await message.channel.send(f"⏳ 지금 응답을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 말씀해주세요.")
+            return
 
-    existing_session_id = _load_free_chat_session_id()
-    is_new_session = existing_session_id is None
-    session_id = existing_session_id or str(uuid.uuid4())
+        text = message.content.strip()
+        if not text:
+            return
 
-    env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
-    args = [str(CLAUDE_BIN), "-p", text, "--output-format", "text"]
-    args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
+        existing_session_id = _load_free_chat_session_id()
+        is_new_session = existing_session_id is None
+        session_id = existing_session_id or str(uuid.uuid4())
 
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *args, cwd=str(FREE_CHAT_CWD), env=env,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
+        env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+        args = [str(CLAUDE_BIN), "-p", text, "--output-format", "text"]
+        args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
+
+        global FREE_CHAT_CURRENT_PROC
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FREE_CHAT_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            proc.kill()
-            await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
-            return
-        out_text = (stdout or b"").decode(errors="replace").strip()
-        if proc.returncode != 0:
-            await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
-            return
-        # Only persist the session id AFTER a successful run — an id from a
-        # run that errored out (e.g. Claude Code couldn't start at all)
-        # would just make every subsequent message resume a session that
-        # never really began.
-        _save_free_chat_session_id(session_id)
-        await message.channel.send(out_text[:1900] if out_text else "(응답 없음)")
-    except Exception as e:
-        await message.channel.send(f"❌ 실행 중 예외: {e}")
+            proc = await asyncio.create_subprocess_exec(
+                *args, cwd=str(FREE_CHAT_CWD), env=env,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            )
+            FREE_CHAT_CURRENT_PROC = proc
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FREE_CHAT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+                return
+            out_text = (stdout or b"").decode(errors="replace").strip()
+            if proc.returncode != 0:
+                await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
+                return
+            # Only persist the session id AFTER a successful run — an id from a
+            # run that errored out (e.g. Claude Code couldn't start at all)
+            # would just make every subsequent message resume a session that
+            # never really began.
+            _save_free_chat_session_id(session_id)
+            await message.channel.send(out_text[:1900] if out_text else "(응답 없음)")
+        except Exception as e:
+            await message.channel.send(f"❌ 실행 중 예외: {e}")
+        finally:
+            FREE_CHAT_CURRENT_PROC = None
 
 
 @client.event
