@@ -33,6 +33,7 @@ import asyncio
 import datetime
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -547,6 +548,23 @@ async def send_and_requeue(message: discord.Message, text: str, job_type: str, p
     (PENDING_DIR / f"{sent.id}.json").write_text(json.dumps(job, ensure_ascii=False))
 
 
+def _kill_process_group(proc) -> None:
+    """`proc.kill()` only SIGKILLs that one direct child — if it spawned its
+    own children (e.g. `claude -p` running a Bash tool call), those become
+    orphans that keep running after "kill" (confirmed: a `sleep 60 & wait`
+    child under a plain `create_subprocess_exec`d bash survived `proc.kill()`
+    with the sleep still alive; the same repro under
+    `start_new_session=True` + `os.killpg` left nothing behind). Requires the
+    process to have been spawned with `start_new_session=True` so it's its
+    own process-group leader — falls back to a plain `proc.kill()` if the
+    group lookup fails (process already gone, or wasn't a group leader).
+    """
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        proc.kill()
+
+
 async def _git_output(cwd: Path, *args: str) -> str:
     proc = await asyncio.create_subprocess_exec(
         "/usr/bin/git", "-C", str(cwd), *args,
@@ -829,7 +847,7 @@ async def handle_free_chat_stop(message: discord.Message):
     if str(message.author.id) != FREE_CHAT_USER_ID:
         return
     if FREE_CHAT_CURRENT_PROC is not None:
-        FREE_CHAT_CURRENT_PROC.kill()
+        _kill_process_group(FREE_CHAT_CURRENT_PROC)
         await message.channel.send("중단 요청을 보냈습니다.")
     elif FREE_CHAT_LOCK.locked():
         await message.channel.send("응답을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
@@ -920,15 +938,24 @@ async def handle_free_chat(message: discord.Message):
 
         global FREE_CHAT_CURRENT_PROC
         try:
+            # start_new_session=True (2026-07-29, found in review): makes
+            # this process its own group leader, so _kill_process_group()
+            # (used by both the timeout below and handle_free_chat_stop's
+            # !중지) can clean up anything IT spawns too — full tool access
+            # means a Bash call here can easily start a long-running child
+            # that a plain proc.kill() would just orphan (confirmed via a
+            # local repro before this fix: proc.kill() left a backgrounded
+            # grandchild alive; start_new_session + os.killpg left nothing).
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=str(FREE_CHAT_CWD), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
             FREE_CHAT_CURRENT_PROC = proc
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FREE_CHAT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                proc.kill()
+                _kill_process_group(proc)
                 await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
                 return
             out_text = (stdout or b"").decode(errors="replace").strip()
