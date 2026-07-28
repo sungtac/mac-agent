@@ -32,6 +32,22 @@ mkdir -p "$STATE_DIR"
 TODAY="$(date +%Y-%m-%d)"
 LOGFILE="$STATE_DIR/${TODAY}.log"
 
+# Usage pre-flight gate (2026-07-28, same rationale as weekly-report.sh):
+# this script's whole job is a headless `claude -p` run, so check account
+# usage before even starting the mcporter daemon. No mutex/pending-job
+# machinery here (this script was never wired into discord-bot.py's
+# reply-retry system) — on SKIP, just log it and send a one-way
+# discord-notify.sh, same as this script's existing all-attempts-failed
+# path below. Fails open on gate error (script missing, etc.) — a broken
+# gate must not become a new failure point for the briefing itself.
+GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
+if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
+  echo "usage gate: ${GATE_OUTPUT} — skipping today's briefing." >> "$LOGFILE"
+  bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 오늘 카톡 모닝 브리핑을 건너뛰었습니다 — 계정 사용량 부족.
+${GATE_OUTPUT#SKIP: }" || true
+  exit 4
+fi
+
 # Absolute path, not bare `mcporter` — a launchd-triggered process has PATH
 # stripped to /usr/bin:/bin:/usr/sbin:/sbin (same recurring gotcha as
 # codex/agy/ffmpeg/whisper-cli/tmux/coach elsewhere in this repo, see

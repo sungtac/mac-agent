@@ -55,3 +55,7 @@ claude mcp login kakao-playmcp
 - 뉴스 요약 3주제(종합/IT·AI/경제) 각각 별도 도구 호출 — `KakaoPNB-summarize_news`는 최종 요약이 아니라 "이렇게 요약하라"는 지시문+원본 기사 목록을 반환하는 도구라, 실제 요약 작성은 그 지시문을 받은 Claude가 매번 수행함 — 도구 자체의 결정적 출력이 아니므로 매일 문체/분량이 미세하게 달라질 수 있음.
 - `weekly-report.sh`와 동일한 launchd-트리거 headless `claude -p` 간헐적 행 이슈(원인: Bun 기반 CLI의 HTTP 커넥션 풀 내부 스톨, `docs/weekly-report.md` 참고)에 이 스크립트도 동일하게 노출됨 — 동일한 재시도+워치독(240초, 3회) 그대로 적용.
 - To port to another agent/machine: `cron/kakao-morning-briefing.sh`와 plist를 복사하고, mcporter를 새로 설치해 Play MCP 게이트웨이를 위 Plan B 절차로 재연결해야 함(계정마다 별도 OTT 필요) — nx/ny 좌표와 뉴스 주제는 사용자 지역/관심사에 맞게 조정.
+
+## 사용량 사전 게이트 (2026-07-28, P4)
+
+`mcporter daemon start`를 부르기 전에 `workflows/lib/usage-preflight-gate.sh claude`부터 확인한다 — 이 스크립트도 결국 headless `claude -p` 실행이라, 계정 사용량이 바닥인 채로 시작해봐야 위 "간헐적 행 이슈"만 반복될 뿐이라서. `SKIP:`이면 로그만 남기고 `discord-notify.sh`로 일방향 알림(이 스크립트는 애초에 discord-bot.py의 답장-재시도 시스템에 안 물려 있어 pending-job은 안 씀 — 실패 3회 소진 시 알림과 동일한 성격), exit 4. 게이트 자체가 실패하면 fail-open으로 그냥 진행. 실제 계정 사용량(클로드 5시간창 0%)으로 SKIP 분기까지 샌드박스 검증 완료 — 실제 09:00 launchd 트리거로 라이브 검증은 아직 안 함.
