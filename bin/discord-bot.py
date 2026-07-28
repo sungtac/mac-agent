@@ -687,16 +687,30 @@ async def handle_codex_dispatch(message: discord.Message):
 
             await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
 
+            # start_new_session=True + _kill_process_group() (2026-07-29,
+            # found in review before ever hit live): codex-execute-dispatch.sh
+            # runs the real `codex exec` as `RAW_OUTPUT="$(codex exec ...)"` —
+            # a command substitution, so codex is a CHILD of this bash
+            # process, not the process itself. A plain proc.kill() here
+            # only killed the bash wrapper; the actual codex process (full
+            # workspace-write access) kept running in the background,
+            # completely undetected, while the user was told it had been
+            # "강제 종료" — confirmed via a local repro mirroring this exact
+            # structure (a bash script backgrounding a long command via
+            # command substitution survived plain proc.kill() with its
+            # child still alive). Same fix already applied to free chat's
+            # subprocess; this closes the same gap here.
             proc = await asyncio.create_subprocess_exec(
                 "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
                 env=SUBPROCESS_ENV,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
             )
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                proc.kill()
+                _kill_process_group(proc)
                 await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
                 return
 

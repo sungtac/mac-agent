@@ -255,6 +255,14 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
   같은 "대기 대신 거부" 해법).
 - **타임아웃**: 30분(`CODEX_DISPATCH_TIMEOUT_SECONDS`) — `codex exec`엔 자체 타임아웃
   플래그가 없어(`--help`에 없음 확인됨) 호출자 쪽(`asyncio.wait_for`)에서 건다.
+  **프로세스 그룹 종료(2026-07-29, 코드리뷰로 발견)**: `codex-execute-dispatch.sh`는
+  `RAW_OUTPUT="$(codex exec ...)"`(명령어 치환)으로 코덱스를 부르므로 실제 코덱스는 이
+  bash 스크립트의 자식이다 — 타임아웃 때 `proc.kill()`로 그 bash만 죽이면 실제
+  `workspace-write` 코덱스 프로세스는 백그라운드에서 계속 살아있는데도 사용자에겐 "강제
+  종료했다"고 알리는 셈이었다(로컬 재현으로 확인: 명령어 치환으로 오래 걸리는 자식을 배경에
+  둔 bash 스크립트가 plain `proc.kill()`엔 자식을 살려둔 채 살아남음). 자유 채팅과 동일하게
+  `start_new_session=True`+`_kill_process_group()`으로 교체 — 실제 코덱스 프로세스까지
+  같이 정리되는 것을 동일한 구조의 가짜 디스패치 스크립트로 재현·확인.
 - **사용량 사전 게이트(2026-07-28, P4)**: 저장소 별칭 확인 직후, 코덱스를 실제로 부르기 전에
   `usage_gate_check("codex")`(공용 헬퍼, `verify-task-v2` 답장 재시도 두 핸들러와 공유)로
   확인한다. `!코덱스`는 pending-job 기반 재시도 체인이 아예 없는 일회성 수동 명령이라, SKIP이면
