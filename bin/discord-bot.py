@@ -34,6 +34,7 @@ usage_gate_check, _kill_process_group) rather than duplicating those.
 import asyncio
 import datetime
 import json
+import re
 import sys
 import uuid
 from pathlib import Path
@@ -130,11 +131,20 @@ async def handle_weekly_report(message: discord.Message):
             env=SUBPROCESS_ENV,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # start_new_session + _kill_process_group, not plain proc.kill()
+            # (2026-07-29 fix, matches handle_free_chat's already-fixed
+            # pattern below in this same file): weekly-report.sh's own
+            # `claude -p` sub-call is a grandchild of this proc, so a bare
+            # kill() only kills the bash wrapper and orphans that headless
+            # call running full-tool-access work undetected in the
+            # background — the exact failure this repo's own
+            # _kill_process_group() docstring confirms via live repro.
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=WEEKLY_REPORT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_group(proc)
             await message.channel.send(f"⚠️ 주간보고서 실행이 {WEEKLY_REPORT_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 스크립트 자체 watchdog도 못 잡은 이상 상황이라 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-10:])
@@ -331,11 +341,19 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
             env=verify_task_v2_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # start_new_session + _kill_process_group, not plain proc.kill()
+            # (2026-07-29 fix, matches handle_free_chat's already-fixed
+            # pattern below in this same file): this headless claude -p call
+            # runs verify-task-v2.js, which itself spawns codex/antigravity
+            # subprocess children — a bare kill() only kills this wrapper
+            # and orphans those children running full-tool-access work
+            # undetected in the background.
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_group(proc)
             await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
@@ -359,8 +377,20 @@ RETRY_INTENT_KEYWORDS = ("재시도", "retry", "다시")
 # marker match here means "take no automated action", same as the existing
 # no-keyword-found path — an unwanted retry (burns quota/time on a live
 # workspace-write run) is worse than a missed one (user can just reply again).
+# 2026-07-29 fix: "필요없"/"필요 없"(붙여쓰기·한 칸 띄어쓰기)만 문자열매칭하던
+# 것을, 한국어 조사가 그 사이에 끼는 경우(예: "다시 검토할 필요는 없고 수동으로
+# 처리할게요"의 "필요는 없")도 잡도록 정규식으로 바꿨다. "필요"와 "없" 사이에
+# 최대 2글자(조사·공백)까지 허용 — "필요없"(0글자)·"필요 없"(공백)·"필요는
+# 없"(조사)·"필요도 없" 등을 모두 잡되, 임의 길이 문장 전체를 건너뛸 만큼
+# 느슨하지는 않다. "하지마"류·"안 해도"류도 같은 이유로 정규식화했다. 영어
+# 부정어·"그만"/"말고"/"말자"처럼 조사 삽입 문제가 구조적으로 없는 것들은
+# 기존 문자열매칭 그대로 둔다.
+RETRY_NEGATION_PATTERNS = (
+    re.compile(r"필요.{0,2}없"),
+    re.compile(r"하지.{0,1}(마|말)"),
+    re.compile(r"안.{0,1}해도"),
+)
 RETRY_NEGATION_MARKERS = (
-    "필요없", "필요 없", "하지마", "하지 마", "하지말", "안 해도", "안해도",
     "그만", "말고", "말자",
     "no need", "don't", "dont ", "not necessary", "never mind", "nevermind",
 )
@@ -371,6 +401,8 @@ def _has_retry_intent(reply_text: str) -> bool:
     if not any(kw in lowered for kw in RETRY_INTENT_KEYWORDS):
         return False
     if any(neg in lowered for neg in RETRY_NEGATION_MARKERS):
+        return False
+    if any(pat.search(lowered) for pat in RETRY_NEGATION_PATTERNS):
         return False
     return True
 
@@ -445,11 +477,19 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
             env=verify_task_v2_env,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            # start_new_session + _kill_process_group, not plain proc.kill()
+            # (2026-07-29 fix, matches handle_free_chat's already-fixed
+            # pattern below in this same file): this headless claude -p call
+            # runs verify-task-v2.js, which itself spawns codex/antigravity
+            # subprocess children — a bare kill() only kills this wrapper
+            # and orphans those children running full-tool-access work
+            # undetected in the background.
+            start_new_session=True,
         )
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            proc.kill()
+            _kill_process_group(proc)
             await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
@@ -599,13 +639,23 @@ async def handle_free_chat_stop(message: discord.Message):
     """
     if str(message.author.id) != FREE_CHAT_USER_ID:
         return
-    if FREE_CHAT_CURRENT_PROC is not None:
-        _kill_process_group(FREE_CHAT_CURRENT_PROC)
-        await message.channel.send("중단 요청을 보냈습니다.")
-    elif FREE_CHAT_LOCK.locked():
-        await message.channel.send("응답을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
-    else:
-        await message.channel.send("지금 실행 중인 응답이 없습니다.")
+    try:
+        if FREE_CHAT_CURRENT_PROC is not None:
+            _kill_process_group(FREE_CHAT_CURRENT_PROC)
+            await message.channel.send("중단 요청을 보냈습니다.")
+        elif FREE_CHAT_LOCK.locked():
+            await message.channel.send("응답을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
+        else:
+            await message.channel.send("지금 실행 중인 응답이 없습니다.")
+    except Exception as e:
+        # 2026-07-29 fix: `_kill_process_group`의 os.killpg 실패 폴백인
+        # `proc.kill()`도 프로세스가 이미 완전히 종료된 상태면 자체적으로
+        # ProcessLookupError를 던질 수 있다(예: !중지를 연달아 두 번 보내는
+        # 경우) — on_message는 이걸 감싸는 예외처리가 없어서 그대로 전파되면
+        # 사용자는 아무 응답도 못 받는다(이 저장소가 이미 codex-bot.py의
+        # handle_codex_chat_reset에서 동일 클래스 문제를 고치며 확립한 "무응답
+        # 절대 금지" 관례를 여기도 적용).
+        await message.channel.send(f"❌ 중단 처리 중 예외: {e}")
 
 
 async def handle_free_chat_reset(message: discord.Message):

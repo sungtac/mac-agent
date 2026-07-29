@@ -68,7 +68,21 @@ fi
 [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ] && exit 0
 
 # cheap gate: only bother with sessions that actually wrote/edited something
-EDIT_WRITE_COUNT="$(grep -o '"name":"\(Edit\|Write\)"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
+#
+# jq-based, not raw `grep -o '"name":"\(Edit\|Write\)"'` (2026-07-29 fix,
+# for consistency with SESSION_ID/TRANSCRIPT_PATH parsing right above,
+# which already use jq): a raw string grep assumes the exact minified-JSON
+# key ordering/whitespace the serializer happens to produce today — if that
+# ever changes (e.g. a space after the colon), this count silently drops to
+# 0 and even a genuinely substantial work session gets skipped with no
+# error. jq walks the actual message.content[].{type,name} structure
+# instead of guessing at raw-JSON formatting (same fix already applied to
+# hooks/usage-routing-check.sh and hooks/verify-task-stop-check.sh this
+# round).
+EDIT_WRITE_COUNT="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name == "Edit" or .name == "Write") | .name
+' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 [ "${EDIT_WRITE_COUNT:-0}" -lt 1 ] && exit 0
 
 mkdir -p "$STATE_DIR"
@@ -88,7 +102,34 @@ touch "$MARKER"
 # handle_work_log_retry(), which re-runs directly from the saved
 # session_id/transcript_path and does not depend on this marker at all.
 # Fails open on gate error.
-GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
+# Watchdog around the gate call itself (2026-07-29 fix): the `claude -p`
+# dispatch below already has a 300s watchdog specifically because the same
+# kind of headless-call hang was confirmed live in weekly-report.sh — but
+# this gate call had zero timeout protection of its own. If
+# usage-preflight-gate.sh ever hangs for any reason, the whole backgrounded
+# subshell blocks forever BEFORE reaching that watchdog, defeating it
+# entirely (a stuck process with no visibility, exactly what the watchdog
+# below exists to prevent). This script is a lightweight local lookup
+# (coach CLI + JSON parse, no LLM call) so 30s is a generous ceiling, not a
+# tight one.
+GATE_TIMEOUT_SECONDS=30
+GATE_OUT_FILE="$STATE_DIR/${SESSION_ID}.gate.out"
+bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude > "$GATE_OUT_FILE" 2>/dev/null &
+GATE_PID=$!
+GATE_ELAPSED=0
+while kill -0 "$GATE_PID" 2>/dev/null; do
+  if [ "$GATE_ELAPSED" -ge "$GATE_TIMEOUT_SECONDS" ]; then
+    kill -9 "$GATE_PID" 2>/dev/null
+    wait "$GATE_PID" 2>/dev/null
+    break
+  fi
+  sleep 2
+  GATE_ELAPSED=$((GATE_ELAPSED + 2))
+done
+wait "$GATE_PID" 2>/dev/null
+GATE_OUTPUT="$(cat "$GATE_OUT_FILE" 2>/dev/null)"
+rm -f "$GATE_OUT_FILE"
+[ -z "$GATE_OUTPUT" ] && GATE_OUTPUT="PROCEED (gate script error/timeout — not enforced)"
 if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
   write_pending_job "⏳ work-log 세션 기록을 건너뛰었습니다 — 계정 사용량 부족. 세션 ${SESSION_ID}.
 ${GATE_OUTPUT#SKIP: }

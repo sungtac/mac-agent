@@ -492,20 +492,6 @@ function formatFixInstruction(combinedIssues) {
   return combinedIssues.map((it, i) => `${i + 1}. [${it.source}] ${it.description}`).join('\n')
 }
 
-// ---------- 노이즈 감지 (경량 트랙 전용 — 전체 트랙은 무점수라 해당 없음) ----------
-// 설계상 "구현 시 정할 파라미터"로 남겨둔 부분 — 라운드 간 점수 변동폭이
-// 실제 diff 변화량에 비해 과하면 "결함"이 아니라 "측정 노이즈 가능성"으로
-// 표시. 임계값은 보수적으로 시작 — 실측 데이터(verify-task-history) 쌓이면
-// 조정할 것. 2026-07-27 개정으로 전체 트랙은 무점수가 되어 이 함수를 더 이상
-// 호출하지 않지만, 경량 트랙은 그대로 이 함수를 쓴다 — 삭제하지 말 것.
-function flagNoise(prevTotal, currTotal, prevFileCount, currFileCount) {
-  const scoreDelta = Math.abs(currTotal - prevTotal)
-  const fileDelta = Math.abs(currFileCount - prevFileCount)
-  if (fileDelta <= 1 && scoreDelta >= 20) return true
-  if (fileDelta <= 3 && scoreDelta >= 40) return true
-  return false
-}
-
 // ---------- 히스토리 로깅 ----------
 
 async function appendHistory(record, historyFile) {
@@ -570,6 +556,34 @@ if (tier === 'light') {
       '코덱스 경량 평가'
     )
     history.push({ tier: 'light', round, execResult, evalResult })
+
+    // 2026-07-29 fix: `dispatchWithRetry`가 재시도까지 다 쓰고도 채점
+    // dispatch 자체가 실패하면(도구 실행/파싱 실패) evalResult는
+    // dispatchFailed:true 봉투를 그대로 갖고 있는데, 아래 원래 로직은
+    // `evalResult?.total ?? 0`으로 이를 조용히 "진짜 0점"으로 취급했다 —
+    // MAX_ROUNDS 소진 후 "90점을 못 넘김"이라는 사실과 다른 사유로
+    // needsUserDecision이 뜨는 오분류. FullPlan/FullReconcile/FullCritique
+    // 단계는 이미 isDispatchFailure()로 이 구분을 명시적으로 하는데(같은
+    // 파일 위쪽 참고), 경량 트랙만 이 처리가 빠져 있었다 — 여기서도 동일하게
+    // dispatch 실패와 진짜 낮은 점수를 구분한다.
+    if (isDispatchFailure(evalResult)) {
+      if (round === MAX_ROUNDS) {
+        finalVerdict = {
+          passed: false,
+          tier: 'light',
+          round,
+          execResult,
+          evalResult,
+          error: 'light_eval_dispatch_failed',
+          needsUserDecision: true,
+          reason: `경량 트랙 최대 ${MAX_ROUNDS}라운드 안에 코덱스 채점 도구 실행/파싱이 계속 실패함(${evalResult.dispatchFailureReason}) — 실제로 낮은 점수를 받은 게 아니라 채점 자체가 안 된 상태이니 통과/실패 어느 쪽으로도 간주하면 안 됨. 같은 task로 재시도할 것.`,
+        }
+        break
+      }
+      log(`[경량] 라운드 ${round}: 코덱스 채점 도구 실행/파싱 실패(${evalResult.dispatchFailureReason}) — 채점 결과 없이 재시도`)
+      feedback = null
+      continue
+    }
 
     const mechViolated = mechanicalTierViolated(realDiff)
     const codexEscapeHatch = !!evalResult?.escapeHatch && !!evalResult?.escapeHatchReason

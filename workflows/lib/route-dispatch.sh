@@ -33,7 +33,23 @@ fi
 # treats an actually-empty response or literal rate-limit/quota wording as
 # a depletion signal.
 AGY_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat "$PROMPT_FILE")" 2>&1)"
-if [ -n "$AGY_OUTPUT" ] && ! printf '%s' "$AGY_OUTPUT" | grep -qi 'rate.limit\|rate limit\|quota exceeded\|HTTP 429\|"code": *429'; then
+# Phrase match alone false-positives when agy's own LEGITIMATE answer
+# happens to discuss rate limiting as its actual subject (e.g. the prompt
+# asked how to implement rate limiting) — a real depletion/error message
+# from the CLI is short (an error line or two), while a substantive answer
+# that merely mentions the phrase in passing is typically much longer.
+# Requiring the phrase match AND a short output (2026-07-29 fix) doesn't
+# eliminate false positives (a short reply that happens to define "rate
+# limiting" in one sentence could still trip it) but meaningfully narrows
+# the window versus matching on content alone, which used to misroute on
+# any mention anywhere in an arbitrarily long real answer.
+AGY_LOOKS_DEPLETED=0
+if [ -z "$AGY_OUTPUT" ]; then
+  AGY_LOOKS_DEPLETED=1
+elif [ "${#AGY_OUTPUT}" -lt 200 ] && printf '%s' "$AGY_OUTPUT" | grep -qi 'rate.limit\|rate limit\|quota exceeded\|HTTP 429\|"code": *429'; then
+  AGY_LOOKS_DEPLETED=1
+fi
+if [ "$AGY_LOOKS_DEPLETED" -eq 0 ]; then
   echo "ROUTED-TO: antigravity"
   printf '%s\n' "$AGY_OUTPUT"
   exit 0

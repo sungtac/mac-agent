@@ -19,7 +19,14 @@
 # default, not a coin flip.
 set -uo pipefail
 
-COACH_HEADROOM="/Users/edge_ai/mac-agent/workflows/lib/coach-headroom.sh"
+# $(dirname "$0")-relative, not a hardcoded absolute path (2026-07-29 fix,
+# matches route-dispatch.sh's own sibling-file pattern in this same
+# directory) — the old hardcoded "/Users/edge_ai/mac-agent/..." path breaks
+# silently if this repo is ever cloned somewhere else: `bash` fails to find
+# the file, `read` gets nothing, and the `${CLAUDE_PCT:-0}`/`${CODEX_PCT:-0}`
+# fallbacks below quietly turn that into "always prefer codex" with no error
+# at all — the worst kind of failure (wrong answer, no signal).
+COACH_HEADROOM="$(dirname "$0")/coach-headroom.sh"
 
 read -r CLAUDE_PCT CODEX_PCT < <(bash "$COACH_HEADROOM")
 CLAUDE_PCT="${CLAUDE_PCT:-0}"

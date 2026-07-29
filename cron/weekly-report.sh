@@ -75,7 +75,22 @@ LOCK_FILE="$STATE_DIR/.lock"
 LOCK_MAX_AGE_SECONDS=1800   # generous above the ~13min worst-case full run
 if [ -f "$LOCK_FILE" ]; then
   LOCK_PID="$(head -1 "$LOCK_FILE" 2>/dev/null)"
-  LOCK_AGE=$(( $(date +%s) - $(stat -f %m "$LOCK_FILE" 2>/dev/null || echo 0) ))
+  LOCK_MTIME="$(stat -f %m "$LOCK_FILE" 2>/dev/null)"
+  if [ -z "$LOCK_MTIME" ]; then
+    # stat failed even though `-f` above confirmed the file exists
+    # (transient fs hiccup) — treat as "just created" (age 0), not "ancient"
+    # (2026-07-29 fix). The old `|| echo 0` fallback computed LOCK_AGE as
+    # `now - epoch 0` — a huge number that always looks maximally stale
+    # regardless of the lock's real age, defeating this lock exactly when a
+    # transient stat failure coincides with a real concurrent run (the one
+    # moment it exists to protect). Falling back to "fresh" is safe because
+    # the `kill -0 "$LOCK_PID"` check right below is the real staleness
+    # signal: a genuinely dead owner still gets correctly taken over either
+    # way, so only a fresh live lock is now correctly preserved instead of
+    # being defeated by an unrelated stat failure.
+    LOCK_MTIME="$(date +%s)"
+  fi
+  LOCK_AGE=$(( $(date +%s) - LOCK_MTIME ))
   if [ -n "$LOCK_PID" ] && kill -0 "$LOCK_PID" 2>/dev/null && [ "$LOCK_AGE" -lt "$LOCK_MAX_AGE_SECONDS" ]; then
     echo "already running (pid ${LOCK_PID}, lock age ${LOCK_AGE}s) — skipping to avoid duplicate Calendar events." >> "$LOGFILE"
     echo "SKIPPED_ALREADY_RUNNING (pid ${LOCK_PID})"
