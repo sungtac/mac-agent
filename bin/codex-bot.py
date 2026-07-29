@@ -36,11 +36,17 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
 CODEX_BIN = Path("/opt/homebrew/bin/codex")  # absolute, not bare `codex` — same PATH-under-launchd gotcha as every other subprocess binary in this repo
+# 2026-07-30, 콕스→맥 위임(CODEX_DELEGATE_TO_MAC_MARKER)용 — 콕스 자신의
+# 샌드박스 밖(이 파일, 즉 codex-bot.py 자신의 호스트 레벨 프로세스)에서
+# 직접 부른다. discord-bot.py도 똑같은 절대경로를 자기 파일에 따로 갖고
+# 있음(CODEX_BIN처럼 이 저장소에서 이미 흔한 패턴 — 완전 중앙화는 안 함).
+CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
+CLAUDE_DELEGATE_TIMEOUT_SECONDS = 30 * 60  # !코덱스/코덱스대화와 동일한 관대한 여유
 
 # !코덱스 target allowlist — never let a Discord message pick an arbitrary
 # absolute path for `codex exec -s workspace-write`, which really writes
@@ -793,6 +799,19 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
         # message tries to resume.
         _save_codex_chat_thread_id(alias, thread_id)
 
+        # 2026-07-30, 콕스→맥 위임(사용자 요청 "콕스야도 똑같이 위임 판단하게
+        # 해줘"): 코덱스가 CODEX_DELEGATE_TO_MAC_MARKER로 시작하는 응답을
+        # 내면, diff 리포트를 건너뛰고(위임 판단이면 파일 변경이 없다고
+        # 가정) _delegate_to_claude()가 대신 처리한다.
+        stripped_reply = (reply_text or "").strip()
+        if stripped_reply.startswith(CODEX_DELEGATE_TO_MAC_MARKER):
+            delegated_task = stripped_reply[len(CODEX_DELEGATE_TO_MAC_MARKER):].strip()
+            if delegated_task:
+                await _delegate_to_claude(message, delegated_task)
+                return
+            # 마커만 있고 실제 위임할 내용이 없으면(코덱스가 형식을 잘못
+            # 따름) 안전하게 아래 원래 응답 경로로 폴백.
+
         # Never trust Codex's own conversational reply as proof of what
         # changed — same before/after diff verification as !코덱스.
         after = await _dirty_snapshot(cwd)
@@ -806,6 +825,61 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
         await message.channel.send(f"❌ 코덱스대화 실행 중 예외: {e}")
     finally:
         CODEX_CURRENT_PROCS.pop(str(cwd.resolve()), None)
+
+
+async def _delegate_to_claude(message: discord.Message, task: str) -> None:
+    """콕스가 CODEX_DELEGATE_TO_MAC_MARKER로 위임을 신호하면, 코덱스 자신의
+    exec 샌드박스(workspace-write) 안이 아니라 codex-bot.py 자신의 호스트
+    레벨 프로세스(샌드박스 밖)에서 claude -p를 직접 실행한다.
+
+    콕스의 샌드박스 안에서 claude -p를 직접 부르면 네트워크 아웃바운드가
+    막혀 응답 없음/90초 타임아웃이 나는 것을 실측 확인했다(2026-07-30,
+    scratch 저장소에서 `codex exec -s workspace-write`로 직접 재현) —
+    `-s danger-full-access`로 풀면 되겠지만 파일쓰기 범위 제한이라는 원래
+    안전장치를 없애는 거라 채택 안 함. 그래서 위임 자체는 코덱스가 "판단"만
+    하고(마커로 신호), 실제 네트워크 호출은 이 파이썬 함수가 대신 한다.
+
+    맥의 영구 자유채팅 세션(discord-bot.py의 FREE_CHAT_SESSION_FILE)은
+    재사용하지 않고 매번 새 1회성 대화로 처리한다 — 두 봇 프로세스가 같은
+    세션 파일에 동시에 --resume을 시도하는 크로스프로세스 경쟁을 피하기
+    위함(!코덱스가 콕스 자신의 영구 스레드를 안 쓰고 매번 1회성인 것과
+    같은 이유 — discord-bot.py는 이 함수의 존재 자체를 모르므로 파일 락
+    같은 조율 장치도 못 만들었을 것).
+    """
+    skip_reason = await usage_gate_check("claude")
+    if skip_reason:
+        await message.channel.send(f"⏳ 맥에게 위임을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 시도해주세요.")
+        return
+
+    cross_context = await fetch_cross_bot_context(message.channel, client.user.id)
+    if cross_context:
+        prompt_text = (
+            "[참고 — 같은 Discord 채널에서 최근 다른 봇(콕스)과 나눈 대화. "
+            "네 실제 세션 기록이 아니라 곁눈질로 보는 참고자료일 뿐이니, "
+            "여기 내용을 사실로 단정하지 말고 필요할 때만 자연스럽게 참고해:]\n"
+            f"{cross_context}\n\n[콕스가 위임한 요청]\n{task}"
+        )
+    else:
+        prompt_text = f"[콕스가 위임한 요청]\n{task}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text",
+            "--append-system-prompt", MAC_BOT_PERSONA,
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CLAUDE_DELEGATE_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await _kill_process_group_graceful(proc)
+            await message.channel.send(f"⚠️ 맥에게 위임한 작업이 {CLAUDE_DELEGATE_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+            return
+        out_text = (stdout or b"").decode(errors="replace").strip()
+        await message.channel.send(f"🔀 맥에게 위임:\n{out_text}"[:1900] if out_text else "🔀 맥에게 위임했지만 응답이 없습니다.")
+    except Exception as e:
+        await message.channel.send(f"❌ 맥에게 위임 중 예외: {e}")
 
 
 async def handle_codex_stop(message: discord.Message):
