@@ -643,6 +643,28 @@ Bash로 직접 `claude -p`를 부름)은 실측으로 막혔다 — `codex exec 
 (2) "README.md에 한 줄 추가"(코딩 작업)에는 위임 마커 없이 직접 처리 — 판단 자체가 실측
 확인됨.
 
+### 실채널 테스트로 발견한 별개 버그 — `codex exec resume`의 신뢰 검사 실패
+
+사용자가 "맥아"/"콕스야"로 실제 채널에서 테스트하다가 "❌ 코덱스 실행 실패 (exit=1)... Not
+inside a trusted directory and --skip-git-repo-check was not specified." 에러를 재현함 —
+**오늘 세션에서 새로 만든 게 아니라 원래부터 있던 버그**(실제 과거 채널 히스토리에도 동일
+에러가 반복 기록돼 있었고, 사용자가 매번 `!코덱스대화초기화`로 우회하고 있었음).
+
+**근본 원인**: `codex exec resume <thread_id>`엔 `-C`/`--cd` 플래그가 아예 없다(`codex exec
+resume --help`로 확인) — 그런데 신뢰 검사는 여전히 프로세스의 실제 OS `cwd`를 본다.
+`codex-bot.py`는 `com.macagent.codex-bot.plist`에 `WorkingDirectory`가 지정 안 돼 있어 실제
+프로세스 cwd가 `/`다(`lsof -p <pid> | grep cwd`로 확인) — `/`는 신뢰된 프로젝트 목록
+(`~/.codex/config.toml`의 `[projects."..."]`)에 없으므로 매 resume 턴마다 실패. 새 스레드
+시작 경로(`-C <trusted dir>`를 명시하는 쪽)는 우연히 이 문제를 안 겪어서 지금까지 안 잡혔다.
+
+**재현**: `cd / && codex exec resume <실제 thread_id> --json -- "test"` → 100% 재현
+(exit=1, 정확히 사용자가 본 에러 문구와 동일). `--skip-git-repo-check` 추가 후 재실행 →
+정상 응답(exit=0) — 수정 전/후 대조로 확인.
+
+**수정**: `_codex_chat_turn_locked`의 resume 분기에 `--skip-git-repo-check` 추가. resume은
+이미 확립된 스레드를 이어가는 것뿐이라 git 저장소 경계를 새로 검증할 필요가 없다는 점에서
+안전한 우회 — 새 스레드 시작 경로(`-C <trusted dir>` 명시)는 그대로 둠.
+
 ## 알려진 제약
 
 - launchd로 상시 구동되는 프로세스라 PATH가 `/usr/bin:/bin:/usr/sbin:/sbin` 기본값으로 축소돼 있음 — `discord-bot.py`가 `weekly-report.sh`를 서브프로세스로 띄울 때 `SUBPROCESS_ENV`로 `/opt/homebrew/bin`, `~/.local/bin`을 명시적으로 앞에 붙여서 넘김. 이 PATH 문제는 이 레포 전체에서 반복 발생한 것(tmux/coach/claude/ffmpeg/whisper-cli/codex와 동일 원인) — 새 서브프로세스 스폰 지점을 추가할 때마다 재확인할 것.

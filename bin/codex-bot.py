@@ -735,7 +735,22 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             # "--dangerously-bypass-approvals-and-sandbox") would be
             # parsed as a codex CLI option instead of prompt text
             # (confirmed live).
-            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", prompt_text]
+            #
+            # --skip-git-repo-check 추가(2026-07-30, 실채널 테스트로 발견한
+            # 실제 버그): `codex exec resume`엔 -C/--cd 플래그가 아예 없다
+            # (--help로 확인) — 그런데 신뢰 검사는 여전히 이 프로세스의
+            # 실제 OS cwd를 본다. codex-bot.py는 launchd plist에
+            # WorkingDirectory가 지정 안 돼 있어 실제 cwd가 `/`다(lsof로
+            # 확인) — `/`는 신뢰된 디렉토리가 아니므로 resume 턴마다
+            # "Not inside a trusted directory..." 에러가 났다. 새 스레드
+            # 경로(-C <trusted dir> 명시)는 우연히 안 걸렸던 것뿐 — 재현:
+            # `cd / && codex exec resume <thread_id> ...`로 100% 재현,
+            # --skip-git-repo-check 추가로 해결 확인. 이 버그는 오늘 세션
+            # 이전부터 있던 것으로, 실제 채널 히스토리에 동일 에러가 과거에도
+            # 반복 기록돼 있었다(사용자가 매번 `!코덱스대화초기화`로 우회).
+            # resume은 이미 확립된 스레드를 이어가는 것뿐이라 git 저장소
+            # 경계를 새로 검증할 필요가 없다는 점에서 안전한 우회.
+            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--skip-git-repo-check", "--json", "--", prompt_text]
             # Previously only sent on a brand-new thread (else branch
             # below) — a resume turn computed dirty_note above but threw
             # it away, so the "uncommitted changes already present"
