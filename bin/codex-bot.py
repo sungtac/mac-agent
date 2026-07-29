@@ -470,17 +470,25 @@ async def handle_codex_chat_reset(message: discord.Message):
         await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
         return
 
-    # Block while a turn for this alias is in flight, so that turn's own
-    # eventual _save_codex_chat_thread_id() call can't land after this
-    # delete and silently undo the reset.
-    lock_key = str(CODEX_REPO_ALIASES[alias].resolve())
-    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
-    if lock.locked():
-        await message.channel.send(f"`{alias}`에 대한 실행이 진행 중이라 초기화할 수 없습니다 — 끝난 뒤 다시 시도해주세요.")
-        return
+    try:
+        # Block while a turn for this alias is in flight, so that turn's own
+        # eventual _save_codex_chat_thread_id() call can't land after this
+        # delete and silently undo the reset.
+        lock_key = str(CODEX_REPO_ALIASES[alias].resolve())
+        lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
+        if lock.locked():
+            await message.channel.send(f"`{alias}`에 대한 실행이 진행 중이라 초기화할 수 없습니다 — 끝난 뒤 다시 시도해주세요.")
+            return
 
-    _codex_chat_session_path(alias).unlink(missing_ok=True)
-    await message.channel.send(f"`{alias}` 코덱스 대화를 초기화했습니다 — 다음 메시지부터 새 대화로 시작합니다.")
+        _codex_chat_session_path(alias).unlink(missing_ok=True)
+        await message.channel.send(f"`{alias}` 코덱스 대화를 초기화했습니다 — 다음 메시지부터 새 대화로 시작합니다.")
+    except Exception as e:
+        # This handler previously had no try/except at all — on_message has
+        # no wrapping try/except of its own, so an exception here (e.g. a
+        # permissions error on the session file) meant total silence, the
+        # one path in this codebase that broke its own "무응답 절대 금지"
+        # rule. Same posture as handle_codex_dispatch/_codex_chat_turn below.
+        await message.channel.send(f"❌ 코덱스대화 초기화 중 예외: {e}")
 
 
 async def handle_codex_chat(message: discord.Message):
@@ -537,6 +545,16 @@ async def handle_codex_chat_wake(message: discord.Message):
     await _codex_chat_turn(message, CODEX_CHAT_DEFAULT_ALIAS, text)
 
 
+def _codex_chat_reset_hint(alias: str, existing_thread_id: str | None) -> str:
+    """Appended to resume-turn failure/timeout messages so a broken saved
+    thread_id doesn't repeat the same failure forever with no documented way
+    out — only meaningful when there IS a saved thread to reset (a brand-new
+    first turn has nothing to point at yet)."""
+    if not existing_thread_id:
+        return ""
+    return f" 계속 실패하면 `!코덱스대화초기화 {alias}`로 초기화해보세요."
+
+
 async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> None:
     """Shared body for both handle_codex_chat (explicit `!코덱스대화 <별칭>`)
     and handle_codex_chat_wake (natural "코덱스야 ..." chat) — everything
@@ -578,9 +596,21 @@ async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> N
 
             existing_thread_id = _load_codex_chat_thread_id(alias)
             if existing_thread_id:
-                args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", text]
+                # "--" stops codex's own flag parsing before `text` — without
+                # it, a message starting with "-" (e.g. a stray
+                # "--dangerously-bypass-approvals-and-sandbox") would be
+                # parsed as a codex CLI option instead of prompt text
+                # (confirmed live).
+                args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", text]
+                # Previously only sent on a brand-new thread (else branch
+                # below) — a resume turn computed dirty_note above but threw
+                # it away, so the "uncommitted changes already present"
+                # warning silently disappeared after the first turn of a
+                # conversation.
+                if dirty_note:
+                    await message.channel.send(dirty_note.lstrip("\n"))
             else:
-                args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), text]
+                args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", text]
                 await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
 
             proc = await asyncio.create_subprocess_exec(
@@ -592,14 +622,20 @@ async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> N
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_CHAT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 await _kill_process_group_graceful(proc)
-                await message.channel.send(f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+                # On a resumed turn, a timeout/failure never overwrites the
+                # saved thread_id (only a SUCCESSFUL run does, below), so a
+                # broken resume just fails the same way forever without this
+                # hint.
+                reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
+                await message.channel.send(f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.{reset_hint}")
                 return
 
             raw = (stdout or b"").decode(errors="replace")
             thread_id, reply_text = _parse_codex_json_events(raw)
 
             if proc.returncode != 0 or thread_id is None:
-                await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).\n```\n{raw[-1500:]}\n```"[:1900])
+                reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
+                await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).{reset_hint}\n```\n{raw[-1500:]}\n```"[:1900])
                 return
 
             # Only persist AFTER a successful run: an id from a run that
