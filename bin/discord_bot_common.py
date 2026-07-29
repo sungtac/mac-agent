@@ -107,8 +107,15 @@ def is_group_address(content: str) -> bool:
     specifically. Used by codex-bot.py to also answer such messages even
     without an explicit "콕스야" — see GROUP_ADDRESS_WORDS comment above for
     why this is a bare substring check (unlike is_codex_wake_word) and the
-    false-positive tradeoff that implies."""
-    return any(word in content for word in GROUP_ADDRESS_WORDS)
+    false-positive tradeoff that implies.
+
+    Whitespace is collapsed before matching (2026-07-30, 실측 버그: 사용자가
+    실제로 보낸 "둘  다 소개 좀 해줘"는 "둘"과 "다" 사이에 스페이스가 두
+    칸이라 리터럴 "둘 다"(한 칸) 매칭에 실패해 콕스가 응답하지 않았다 —
+    다중 단어 항목("둘 다", "모두 다")은 모두 이 문제에 취약하므로 개별
+    스페이스 개수를 맞추는 대신 입력 쪽 공백을 정규화한다)."""
+    normalized = " ".join(content.split())
+    return any(word in normalized for word in GROUP_ADDRESS_WORDS)
 
 
 # 2026-07-30, 사용자 명시적 요청: 두 봇 다 지금까지 자기 자신이 누구인지,
