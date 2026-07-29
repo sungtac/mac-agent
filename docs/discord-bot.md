@@ -821,6 +821,40 @@ medium=4.1초 — 실제로 더 빠르지만, 라이브에서 관측된 19.5초�
 불렀어?"로 짧게 응답하는 것을 실제 `claude -p` 호출로 확인(수정 전엔 긴 기술 분석문이
 나왔던 바로 그 조건). 두 봇 프로세스 재기동 확인.
 
+### 남은 콕스 지연 추가 조사 — `coach`의 순차 provider 조회가 진짜 병목이었음
+
+사용자 요청: "콕스 남은 지연도 파봐줘." `codex-bot.py`를 venv 파이썬으로 직접 import해서
+`_codex_chat_turn_locked`의 각 단계(`usage_gate_check`, `_dirty_snapshot`, `_git_output`,
+`fetch_cross_bot_context`)를 실제 함수로 개별 실측.
+
+**결과**: `_dirty_snapshot`(전/후 2회 합쳐 0.04초)과 `fetch_cross_bot_context`(0.32초)는
+범인이 아니었다 — 애초에 mac-agent 저장소에 untracked 파일이 없어서(`git status --porcelain`
+결과 0건) 파일 해싱 경로 자체가 실행 안 됨. 진짜 범인은 `usage_gate_check("codex")` —
+**5.98초**. `usage-preflight-gate.sh` → `coach --json` → `coach`의 `gather()` 함수를 직접
+읽어보니, provider 필터 없이 부르면 claude/codex/antigravity **세 개를 순차 for 루프로**(병렬
+아님) 각각 `codexbar` 서브프로세스로 조회 — `codexbar` 단발 호출이 ~1.5~2초라 3개 곱하면
+그대로 게이트 지연이 됨. `coach --json`은 이미 `--providers` 옵션을 지원하는데,
+`usage-preflight-gate.sh`가 그 옵션을 안 쓰고 있었다.
+
+**실측 대조**: `coach --json`(3개 전부)=6.3~6.4초, `--providers codex` 하나만=1.9초,
+`--providers claude` 하나만=1.8초.
+
+**수정**: `usage-preflight-gate.sh`의 `$ACTOR`(claude/codex/dual)에 따라 `--providers`를
+정확히 필요한 것만 넘기도록 — `claude`→`claude`, `codex`→`codex`, `dual`→`claude,codex`
+(antigravity는 이 게이트가 애초에 안 씀, 기존 주석 그대로). 이 스크립트를 쓰는 다른
+호출자(`weekly-report.sh`, `work-log-stop-check.sh`, `kakao-morning-briefing.sh`,
+`discord-bot.py`의 `usage_gate_check("claude")`)도 전수 확인 — 전부 `claude`/`codex`만
+쓰고 `dual`은 실사용 없음, 그대로 다 이 최적화의 수혜자.
+
+**검증**: 수정 후 `codex`=1.92초, `claude`=1.39초, `dual`=3.47초로 재측정, 실제 판정
+결과(claude=`SKIP: ... 잔여 56%(red)`, codex=`PROCEED`)도 정확히 그대로 유지되는 것까지
+확인(로직 회귀 없음). `usage_gate_check("codex")` 재측정: 5.98초 → **2.21초**.
+
+**최종 추정치**(각 단계 실측값을 그대로 합산): `usage_gate_check` 2.21초 + `_dirty_snapshot`
+0.04초 + `fetch_cross_bot_context` 0.32초 + `codex exec`(reasoning=medium) ~4.1초 ≈
+**~6.7초** — 원래 라이브 실측치 19.5~19.8초에서 약 66% 단축 추정(전체 파이프라인을
+Discord 왕복까지 다시 라이브로 재본 건 아님).
+
 ## 알려진 제약
 
 - launchd로 상시 구동되는 프로세스라 PATH가 `/usr/bin:/bin:/usr/sbin:/sbin` 기본값으로 축소돼 있음 — `discord-bot.py`가 `weekly-report.sh`를 서브프로세스로 띄울 때 `SUBPROCESS_ENV`로 `/opt/homebrew/bin`, `~/.local/bin`을 명시적으로 앞에 붙여서 넘김. 이 PATH 문제는 이 레포 전체에서 반복 발생한 것(tmux/coach/claude/ffmpeg/whisper-cli/codex와 동일 원인) — 새 서브프로세스 스폰 지점을 추가할 때마다 재확인할 것.
