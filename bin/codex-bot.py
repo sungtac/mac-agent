@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -805,6 +805,18 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
         thread_id, reply_text = _parse_codex_json_events(raw)
 
         if proc.returncode != 0 or thread_id is None:
+            # 2026-07-30, 사용자 명시적 요청("실제 계정을 따라가지 말고
+            # 멀티에이전트를 따라가야 한다") — discord-bot.py의
+            # _fallback_to_codex와 대칭: 콕스가 계정/사용량 한도로 실패하면
+            # "재시도하세요"로 끝내지 말고 맥으로 자동 폴백한다.
+            # _delegate_to_claude()는 콕스→맥 위임 마커 처리에 이미 쓰던
+            # 헬퍼를 그대로 재사용 — "판단해서 위임"이든 "실패해서 폴백"이든
+            # 맥에게 결국 필요한 건 "이 요청에 최선을 다해 답하라"는 같은
+            # 지시라 새 함수를 만들 필요가 없다.
+            if QUOTA_LIMIT_PATTERN.search(raw):
+                await message.channel.send(f"⏳ 콕스(코덱스)가 계정 사용 한도로 응답하지 못했습니다 — 맥으로 자동 전환합니다.\n```\n{raw[-300:]}\n```")
+                await _delegate_to_claude(message, text)
+                return
             reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
             await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).{reset_hint}\n```\n{raw[-1500:]}\n```"[:1900])
             return

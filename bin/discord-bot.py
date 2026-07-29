@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -719,6 +719,18 @@ async def on_ready():
 FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-session.json"
 FREE_CHAT_CWD = Path.home()
 FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 — full tool access can run a real coding task
+# 2026-07-30, 사용자 명시적 요청: 맥이 계정 한도로 응답 자체가 실패하면
+# "기다리세요"로 끝내지 말고, 이 저장소 다른 곳(route-dispatch.sh Rule B —
+# "단순 작업은 안티그래비티 먼저, 실패하면 코덱스로 폴백")에 이미 있는
+# 멀티에이전트 폴백 원칙을 그대로 적용해서 discord-bot.py 자신(파이썬,
+# 맥의 claude -p 밖)이 같은 메시지를 코덱스로 자동 재시도한다 — 맥 자신은
+# claude -p 프로세스라 API 호출이 계정 한도로 막히면 내부에서 다른
+# provider로 못 갈아탄다(자기 자신이 곧 그 호출이므로), 그래서 이 폴백은
+# 반드시 감싸는 파이썬 코드 레벨에서 해야 한다. codex-bot.py도 같은
+# 절대경로 상수를 자기 파일에 따로 갖고 있음(이 저장소에서 이미 흔한
+# 패턴 — 완전 중앙화는 안 함).
+CODEX_BIN = Path("/opt/homebrew/bin/codex")
+CODEX_FALLBACK_TIMEOUT_SECONDS = 30 * 60  # 다른 provider 호출들과 동일 예산
 
 # Concurrency guard (2026-07-29, found in review before ever hit live):
 # handle_free_chat() reads the session id at the START and only writes it
@@ -860,13 +872,19 @@ async def handle_free_chat(message: discord.Message):
         return
 
     async with FREE_CHAT_LOCK:
-        skip_reason = await usage_gate_check("claude")
-        if skip_reason:
-            await message.channel.send(f"⏳ 지금 응답을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 말씀해주세요.")
-            return
-
         text = message.content.strip()
         if not text:
+            return
+
+        skip_reason = await usage_gate_check("claude")
+        if skip_reason:
+            # 2026-07-30, 사용자 명시적 요청: 사전 게이트에서 이미 낮다고
+            # 판단된 경우에도 실행 후 실패 케이스와 동일하게 코덱스로
+            # 자동 폴백 — "계정 한도 낮음"을 감지하는 두 지점(사전 게이트 vs
+            # 사후 실패 문구 매칭) 모두 같은 멀티에이전트 폴백 원칙을 따르게
+            # 통일한다.
+            await message.channel.send(f"⏳ 맥(Claude) 계정 사용량 부족으로 코덱스로 자동 전환합니다.\n{skip_reason}")
+            await _fallback_to_codex(message, text)
             return
 
         existing_session_id = _load_free_chat_session_id()
@@ -927,17 +945,19 @@ async def handle_free_chat(message: discord.Message):
                 return
             out_text = (stdout or b"").decode(errors="replace").strip()
             if proc.returncode != 0:
-                # 2026-07-30 fix (실채널 테스트로 발견): 계정 사용 한도 초과는
-                # weekly-report.sh가 이미 fail-fast로 친절하게 안내하는데,
-                # 여기는 그 처리가 없어서 "You've hit your session limit..."
-                # 같은 원문을 그대로 exit=1 에러처럼 던지고 있었다 — 자유채팅
-                # 사용자 입장에선 코드가 고장난 것처럼 보이지만 실제로는 계정
-                # 5시간/7일 한도 소진일 뿐. weekly-report.sh와 동일한 패턴
-                # 매칭(hit your ... limit/rate limit/overloaded/429 등)으로
-                # 구분해서, 이 경우만 별도의 안내 메시지를 보낸다 — 코드 결함이
-                # 아니라는 걸 명확히 하고, 재시도 타이밍도 알려준다.
-                if re.search(r'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b', out_text, re.IGNORECASE):
-                    await message.channel.send(f"⏳ 계정 사용 한도로 지금은 응답할 수 없습니다.\n```\n{out_text[-500:]}\n```\n한도가 회복되면 다시 말씀해주세요(코드 결함이 아니라 계정 한도 문제입니다).")
+                # 2026-07-30, 사용자 명시적 요청("맥은 실제 계정을 따라가지
+                # 않고, 멀티에이전트를 따라가야 하는데"): 계정 한도 초과를
+                # 그냥 "기다리세요"로 끝내는 건 시스템 전체가 죽은 것처럼
+                # 취급하는 단일장애점식 사고다 — 이 저장소 다른 곳
+                # (route-dispatch.sh Rule B: "단순 작업은 안티그래비티
+                # 먼저, 실패하면 코덱스로 폴백")에 이미 있는 멀티에이전트
+                # 폴백 원칙을 맥의 실패 처리에도 반영한다. 맥 자신(claude -p)은
+                # API 호출이 막히면 내부에서 못 갈아타므로(자기 자신이 곧
+                # 그 호출), 감싸는 이 파이썬 코드가 같은 메시지를 코덱스로
+                # 자동 재시도한다.
+                if QUOTA_LIMIT_PATTERN.search(out_text):
+                    await message.channel.send(f"⏳ 맥(Claude)이 계정 사용 한도로 응답하지 못했습니다 — 코덱스로 자동 전환합니다.\n```\n{out_text[-300:]}\n```")
+                    await _fallback_to_codex(message, text)
                 else:
                     await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
                 return
@@ -951,6 +971,61 @@ async def handle_free_chat(message: discord.Message):
             await message.channel.send(f"❌ 실행 중 예외: {e}")
         finally:
             FREE_CHAT_CURRENT_PROC = None
+
+
+async def _fallback_to_codex(message: discord.Message, text: str) -> None:
+    """맥(Claude)이 계정 한도로 응답 못 할 때, discord-bot.py 자신이
+    코덱스로 같은 메시지를 자동 재시도한다(2026-07-30, 사용자 명시적 요청 —
+    "실제 계정을 따라가지 말고 멀티에이전트를 따라가야 한다").
+
+    codex-bot.py의 _delegate_to_claude()와 대칭 구조: 코덱스의 샌드박스
+    문제(네트워크 아웃바운드 막힘)와 달리, 이쪽은 discord-bot.py가 이미
+    호스트 레벨 프로세스이므로 codex exec를 직접 부르는 데 아무 제약이
+    없다 — 별도 우회 계층 불필요.
+
+    자유채팅과 동일한 넓은 범위(FREE_CHAT_CWD = 홈 디렉터리, 저장소 제한
+    없음)를 그대로 준다 — 이미 handle_free_chat 진입 시점에
+    FREE_CHAT_USER_ID 검사를 통과한 요청이므로, 그 신뢰 범위를 그대로
+    승계하는 게 맞다(대체 provider로 바뀌었다고 권한 범위가 갑자기 좁아질
+    이유가 없음).
+    """
+    skip_reason = await usage_gate_check("codex")
+    if skip_reason:
+        await message.channel.send(f"❌ 코덱스도 지금 사용량 부족으로 응답할 수 없습니다.\n{skip_reason}\n두 provider 모두 한도 문제이니, 한도 회복 후 다시 말씀해주세요.")
+        return
+
+    cross_context = await fetch_cross_bot_context(message.channel, client.user.id)
+    fallback_note = (
+        "[알림: '맥'(Claude)이 지금 계정 사용 한도로 응답할 수 없어서, 네가 대신 사용자 요청에 "
+        "최선을 다해 답해줘. 코딩/저장소 작업이 아니어도 아는 선에서 직접 답변해 — 맥에게 다시 "
+        "위임하려 하지 마(맥은 지금 응답 불가 상태야).]"
+    )
+    if cross_context:
+        prompt_text = f"{fallback_note}\n\n[참고 — 같은 채널 최근 대화]\n{cross_context}\n\n[사용자 메시지]\n{text}"
+    else:
+        prompt_text = f"{fallback_note}\n\n[사용자 메시지]\n{text}"
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            str(CODEX_BIN), "exec", "-s", "workspace-write", "-C", str(FREE_CHAT_CWD), "--", prompt_text,
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_FALLBACK_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await _kill_process_group_graceful(proc)
+            await message.channel.send(f"⚠️ 코덱스 폴백 응답이 {CODEX_FALLBACK_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+            return
+        out_text = (stdout or b"").decode(errors="replace").strip()
+        if proc.returncode != 0:
+            await message.channel.send(f"❌ 코덱스 폴백도 실패했습니다 (exit={proc.returncode}).\n```\n{out_text[-1000:]}\n```"[:1900])
+            return
+        await message.channel.send(f"🔀 (맥 대신 코덱스가 응답)\n{out_text}"[:1900] if out_text else "🔀 코덱스로 전환했지만 응답이 없습니다.")
+    except Exception as e:
+        await message.channel.send(f"❌ 코덱스 폴백 실행 중 예외: {e}")
 
 
 @client.event

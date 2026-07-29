@@ -14,10 +14,25 @@ import contextlib
 import fcntl
 import hashlib
 import os
+import re
 import signal
 from pathlib import Path
 
 MAC_AGENT = Path.home() / "mac-agent"
+
+# weekly-report.sh(2026-07-30 확장)와 동일한 패턴 — 계정 사용/속도 한도 초과를
+# 나타내는 흔한 문구들의 근사치(정확한 오류 카탈로그가 없어 grep 휴리스틱일
+# 수밖에 없음). discord-bot.py/codex-bot.py 둘 다 "이건 코드 결함이 아니라
+# 계정 한도"를 구분하는 데 쓰고(사용자에게 친절한 안내), 2026-07-30 사용자
+# 요청 이후로는 "실패했다고 그냥 기다리라고 하지 말고 다른 provider로 자동
+# 폴백하라"는 판단 트리거로도 쓴다 — 이 저장소 다른 곳(route-dispatch.sh의
+# Rule B)에 이미 있는 "한쪽이 낮으면 다른 쪽으로" 멀티에이전트 원칙을 두
+# 봇의 실패 처리에도 반영한 것. 파이썬 re 모듈 문법으로 옮김(원본은 bash
+# grep -E 문법).
+QUOTA_LIMIT_PATTERN = re.compile(
+    r'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b',
+    re.IGNORECASE,
+)
 
 # Natural-chat wake words for codex-bot.py's handle_codex_chat_wake — a
 # message starting with one of these (e.g. "코덱스야 ...", "콕스 ...") is
