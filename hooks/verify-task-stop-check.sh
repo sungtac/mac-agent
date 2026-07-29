@@ -79,10 +79,28 @@ HAS_PLAN_MODE="$(jq -r '
 # reached. Parsed with jq (already a hard dependency here) so it walks the
 # real message.content[].{type,name,input} structure instead of guessing at
 # raw-JSON key ordering/whitespace.
+# 2026-07-30 fix (Codex 코드리뷰로 발견): `grep -c 'verify-task'`는 여전히
+# 부분 문자열 매칭이라, scriptPath 어딘가에 "verify-task"가 들어있기만 하면
+# 실제로 존재하지도 않는 가짜 경로(예: /tmp/fake-verify-task.js)나 무관한
+# 스크립트도 통과시켰다 — 성공 여부는 물론 "진짜 그 파일인지"조차 확인
+# 안 함. basename이 정확히 verify-task(.js)/verify-task-v2(.js) 또는 그
+# Workflow 재개용 사본(예: verify-task-wf_<runid>.js — Workflow 툴이
+# resumeFromRunId로 재개할 때 실제로 이런 이름의 사본을 만든다, 이번 세션에서
+# 직접 확인함)일 때만 인정하도록 좁힘. 여전히 "성공했는지"는 안 보는
+# 기계적 프록시다(파일 헤더 주석 참고) — 그 이상의 결과 검증은 이 훅의
+# 설계 범위 밖.
+#
+# 2026-07-30 추가 수정(자체 end-to-end 재현으로 발견, Codex 리뷰엔 없었음):
+# 위 수정을 실제로 이 세션 자신의 트랜스크립트에 돌려봤더니, 이 세션에서
+# 실행한 진짜 verify-task 호출이 여전히 안 잡혀서 훅이 오탐 차단했다 —
+# `Workflow({name: "verify-task", args:{...}})`처럼 `scriptPath`가 아니라
+# 등록된 `name`으로 부르는 방식(docs/verify-task.md가 명시적으로 유효한
+# 호출법이라고 문서화한 두 번째 형태)은 `.input.scriptPath`만 보는 이
+# jq 쿼리에 아예 안 잡혔다. `.input.name`도 함께 확인하도록 확장.
 HAS_VERIFY_TASK="$(jq -r '
   select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
-  select(.name == "Workflow") | (.input.scriptPath // "")
-' "$TRANSCRIPT_PATH" 2>/dev/null | grep -c 'verify-task')"
+  select(.name == "Workflow") | ((.input.scriptPath // ""), (.input.name // ""))
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -cE '/verify-task(-v2)?(-wf_[A-Za-z0-9_-]+)?\.js$|^verify-task(-v2)?$')"
 
 [ "${HAS_VERIFY_TASK:-0}" -gt 0 ] && exit 0
 

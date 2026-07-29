@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -368,35 +368,42 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
     # workflow (not the trivial one) returning correctly with this var set.
     verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
 
+    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): codex-bot.py의
+    # CODEX_DISPATCH_LOCKS는 그 프로세스 안에서만 유효해서, discord-bot.py의
+    # 이 재시도가 codex-bot.py의 !코덱스와 거의 동시에 같은 저장소를 건드리는
+    # 경우를 못 막았다. 크로스프로세스 파일 락으로 한 번 더 확인.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
-            env=verify_task_v2_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            # start_new_session + _kill_process_group, not plain proc.kill()
-            # (2026-07-29 fix, matches handle_free_chat's already-fixed
-            # pattern below in this same file): this headless claude -p call
-            # runs verify-task-v2.js, which itself spawns codex/antigravity
-            # subprocess children — a bare kill() only kills this wrapper
-            # and orphans those children running full-tool-access work
-            # undetected in the background.
-            start_new_session=True,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            # graceful kill (2026-07-30 fix, same rationale as
-            # handle_weekly_report above): this claude -p run itself spawns
-            # codex/antigravity subprocess children doing real file writes.
-            await _kill_process_group_graceful(proc)
-            await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
-            return
-        tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
-        if proc.returncode == 0:
-            await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
-        else:
-            await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+        with try_acquire_repo_lock(str(Path(cwd).resolve())):
+            proc = await asyncio.create_subprocess_exec(
+                str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+                env=verify_task_v2_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                # start_new_session + _kill_process_group, not plain proc.kill()
+                # (2026-07-29 fix, matches handle_free_chat's already-fixed
+                # pattern below in this same file): this headless claude -p call
+                # runs verify-task-v2.js, which itself spawns codex/antigravity
+                # subprocess children — a bare kill() only kills this wrapper
+                # and orphans those children running full-tool-access work
+                # undetected in the background.
+                start_new_session=True,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # graceful kill (2026-07-30 fix, same rationale as
+                # handle_weekly_report above): this claude -p run itself spawns
+                # codex/antigravity subprocess children doing real file writes.
+                await _kill_process_group_graceful(proc)
+                await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+                return
+            tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
+            if proc.returncode == 0:
+                await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
+            else:
+                await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+    except RepoLockBusy:
+        await message.channel.send("이 저장소에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 잠시 후 이 메시지에 다시 답장해주세요.")
     except Exception as e:
         await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
 
@@ -515,35 +522,42 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
     # short give-up-and-detach default silently turns into a false success.
     verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
 
+    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): codex-bot.py의
+    # CODEX_DISPATCH_LOCKS는 그 프로세스 안에서만 유효해서, discord-bot.py의
+    # 이 재시도가 codex-bot.py의 !코덱스와 거의 동시에 같은 저장소를 건드리는
+    # 경우를 못 막았다. 크로스프로세스 파일 락으로 한 번 더 확인.
     try:
-        proc = await asyncio.create_subprocess_exec(
-            str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
-            env=verify_task_v2_env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-            # start_new_session + _kill_process_group, not plain proc.kill()
-            # (2026-07-29 fix, matches handle_free_chat's already-fixed
-            # pattern below in this same file): this headless claude -p call
-            # runs verify-task-v2.js, which itself spawns codex/antigravity
-            # subprocess children — a bare kill() only kills this wrapper
-            # and orphans those children running full-tool-access work
-            # undetected in the background.
-            start_new_session=True,
-        )
-        try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            # graceful kill (2026-07-30 fix, same rationale as
-            # handle_weekly_report above): this claude -p run itself spawns
-            # codex/antigravity subprocess children doing real file writes.
-            await _kill_process_group_graceful(proc)
-            await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
-            return
-        tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
-        if proc.returncode == 0:
-            await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
-        else:
-            await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+        with try_acquire_repo_lock(str(Path(cwd).resolve())):
+            proc = await asyncio.create_subprocess_exec(
+                str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+                env=verify_task_v2_env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                # start_new_session + _kill_process_group, not plain proc.kill()
+                # (2026-07-29 fix, matches handle_free_chat's already-fixed
+                # pattern below in this same file): this headless claude -p call
+                # runs verify-task-v2.js, which itself spawns codex/antigravity
+                # subprocess children — a bare kill() only kills this wrapper
+                # and orphans those children running full-tool-access work
+                # undetected in the background.
+                start_new_session=True,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                # graceful kill (2026-07-30 fix, same rationale as
+                # handle_weekly_report above): this claude -p run itself spawns
+                # codex/antigravity subprocess children doing real file writes.
+                await _kill_process_group_graceful(proc)
+                await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+                return
+            tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
+            if proc.returncode == 0:
+                await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
+            else:
+                await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+    except RepoLockBusy:
+        await message.channel.send("이 저장소에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 잠시 후 이 메시지에 다시 답장해주세요.")
     except Exception as e:
         await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
 

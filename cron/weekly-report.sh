@@ -204,7 +204,12 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   # 작업만 조용히 실패하는 경우가 있어 EXIT_CODE 체크로는 못 잡는다 — exit
   # code와 무관하게 먼저 확인. 재시도로는 OAuth 토큰을 고칠 수 없으므로
   # fail-fast하고 재인증 방법을 안내한다.
-  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'calendar.*(not authenticated|requires?.*auth|unauthorized|needs?.*(re)?auth)|(not authenticated|unauthorized).*calendar'; then
+  # 2026-07-30 확장(Codex 코드리뷰로 발견, 낮은 우선순위로 보류했다가 처리):
+  # 기존 패턴이 실제 CLI가 쓸 수 있는 다른 문구(OAuth 만료/토큰 문제/MCP
+  # 서버 자체 불가)는 못 잡았다 — 여전히 "grep 휴리스틱"이라 완벽하진
+  # 않지만(정확한 오류 문구 카탈로그가 없어 근사할 수밖에 없음), 흔한
+  # 변형들을 추가로 커버.
+  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'calendar.*(not authenticated|requires?.*auth|unauthorized|needs?.*(re)?auth|oauth.*(expired|invalid|fail)|token.*(missing|expired|invalid))|(not authenticated|unauthorized|oauth.*(expired|invalid)).*calendar|mcp.*(server)?.*(unavailable|not available|unreachable|connection required)'; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Calendar MCP 미인증 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
     bash "$HOME/mac-agent/bin/discord-notify.sh" "🔑 주간보고서 생성 실패 — Google Calendar MCP 미인증으로 보입니다. /mcp 명령으로 재인증 후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
     exit 1
@@ -218,7 +223,10 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
 
   # 계정 사용 한도 초과도 재시도로 해결 불가(한도 리셋 전까지는 몇 번을
   # 더 돌려도 동일하게 실패) — 나머지 시도를 낭비하지 않고 바로 알린다.
-  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'hit your (session|usage) limit|rate_limit_error'; then
+  # 2026-07-30 확장(Codex 코드리뷰): "hit your ... limit"/"rate_limit_error"
+  # 만 잡아서 429/"rate limit exceeded"/"overloaded"/"quota exceeded" 같은
+  # 표현은 놓쳤다 — 흔한 변형 추가.
+  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b'; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: 사용 한도 초과 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
     bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 주간보고서 생성 실패 — 계정 사용 한도 초과. 한도 리셋 이후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
     exit 1

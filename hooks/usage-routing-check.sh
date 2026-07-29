@@ -80,12 +80,22 @@ esac
 # hard dependency here) instead of raw grep, since jq walks the actual
 # message.content[].{type,name,input} structure rather than guessing at key
 # ordering/whitespace in the serialized JSON.
+# 2026-07-30 fix (Codex 코드리뷰로 발견, verify-task-stop-check.sh와 동일
+# 클래스): 부분 문자열 매칭이라 존재하지도 않는 가짜 경로나 무관한 스킬
+# 이름 안에 우연히 "verify-task"가 들어가도 통과했다. Workflow 쪽은
+# scriptPath의 basename이 verify-task(-v2)?(.js)/재개용 사본
+# (verify-task-wf_<runid>.js)일 때만, Skill 쪽은 이름이 정확히
+# "independent-critique-loop"일 때만(부분 매칭 아님) 인정하도록 좁힘.
+# 2026-07-30 추가 수정(자체 end-to-end 재현으로 발견): `Workflow({name:
+# "verify-task", ...})`처럼 scriptPath 대신 등록된 name으로 부르는 방식
+# (docs/verify-task.md가 명시한 유효한 두 번째 호출법)은 scriptPath만
+# 보던 이전 버전엔 아예 안 잡혔다 — .input.name도 함께 확인.
 HAS_VERIFY_SKILL="$(jq -r '
   select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
-  if .name == "Workflow" then (.input.scriptPath // "")
+  if .name == "Workflow" then ((.input.scriptPath // ""), (.input.name // ""))
   elif .name == "Skill" then (.input.skill // .input.name // "")
   else empty end
-' "$TRANSCRIPT_PATH" 2>/dev/null | grep -c 'verify-task\|independent-critique-loop')"
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -cE '(^|/)verify-task(-v2)?(-wf_[A-Za-z0-9_-]+)?\.js$|^verify-task(-v2)?$|^independent-critique-loop$')"
 HAS_BROWSER_TOOL="$(jq -r '
   select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
   select(.name | startswith("mcp__claude-in-chrome__")) | .name

@@ -18,8 +18,16 @@ const PREFLIGHT_SCHEMA = {
 }
 
 async function preflightCheck() {
+  // 2026-07-30 fix (Codex 코드리뷰로 발견, 낮은 우선순위로 보류했다가
+  // 처리): score-dispatch.sh는 CODEX_BIN/AGY_BIN 환경변수 override를
+  // 지원하는데, 이 preflight 프롬프트는 그거랑 무관하게 항상 이 머신의
+  // 절대경로를 하드코딩해서 실제로는 "다른 머신으로 포팅 가능"이라는
+  // 주장이 이 지점에서 깨져 있었다. score-dispatch.sh와 동일한
+  // `${VAR:-기본값}` bash 파라미터 확장 관례를 그대로 프롬프트 텍스트에
+  // 심어서, 실행 시점에 그 Bash 호출 환경에 CODEX_BIN/AGY_BIN이 설정돼
+  // 있으면 그걸 쓰고 없으면 기존 기본값으로 폴백하도록 통일.
   return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (둘 다 절대경로 — 이 실행 환경 PATH에 /opt/homebrew/bin이 없을 수 있어서 bare 명령어 "codex"는 "command not found"로 실패할 수 있음):\n1. /opt/homebrew/bin/codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 /opt/homebrew/bin/codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 아래 기본 절대경로를 써 — 이 실행 환경 PATH에 /opt/homebrew/bin이 없을 수 있어서 bare 명령어 "codex"는 "command not found"로 실패할 수 있음):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-/Users/edge_ai/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행(CODEX_BIN 설정돼 있으면 그 경로로)" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
     { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
   )
 }

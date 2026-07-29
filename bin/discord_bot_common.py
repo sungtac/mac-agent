@@ -10,6 +10,9 @@ Discord token/config — this module has no discord.py dependency of its own
 and no side effects at import time, so either bot can import from it freely.
 """
 import asyncio
+import contextlib
+import fcntl
+import hashlib
 import os
 import signal
 from pathlib import Path
@@ -153,3 +156,66 @@ async def _kill_process_group_graceful(proc, grace_seconds: float = 2.0) -> None
     except (ProcessLookupError, PermissionError, OSError):
         return  # group is confirmed empty (or we can't check further)
     _force_kill_pgid(pgid)
+
+
+REPO_LOCK_DIR = Path.home() / ".claude" / "discord-bot" / "repo-locks"
+
+
+class RepoLockBusy(Exception):
+    """Raised by try_acquire_repo_lock() when another PROCESS (not just
+    another coroutine in this same process) already holds the lock for this
+    resolved repo path."""
+
+
+def _repo_lock_path(resolved_path: str) -> Path:
+    # A hash, not the raw path, as the filename — resolved repo paths can be
+    # long/contain characters awkward for a filename, and a hash keeps the
+    # lock directory flat and collision-free without needing to sanitize.
+    digest = hashlib.sha256(resolved_path.encode()).hexdigest()[:32]
+    return REPO_LOCK_DIR / f"{digest}.lock"
+
+
+@contextlib.contextmanager
+def try_acquire_repo_lock(resolved_path: str):
+    """Cross-process, non-blocking file lock keyed by a repo's resolved
+    absolute path (2026-07-30, added in the same integration audit that
+    fixed the !코덱스 double-fire bug).
+
+    `CODEX_DISPATCH_LOCKS` (codex-bot.py's own asyncio.Lock dict) only
+    protects against races WITHIN that one process — it has no visibility
+    into discord-bot.py, a separate OS process with its own Python heap.
+    Since discord-bot.py's verify-task-v2 retry handlers and codex-bot.py's
+    `!코덱스`/`!코덱스대화` dispatch can both end up writing to the same
+    resolved repo path (independently of the wake-word bug already fixed —
+    e.g. two genuinely different user commands issued close together), a
+    second, cross-process layer is needed for the same "reject immediately,
+    never queue/wait" semantics the in-process locks already use.
+
+    Uses `flock(2)` via a plain lock file under `REPO_LOCK_DIR`, one per
+    resolved path (hashed filename). Non-blocking (`LOCK_NB`): raises
+    `RepoLockBusy` immediately if any other process — this one's sibling
+    coroutine included, though callers should keep using the cheaper
+    in-process `asyncio.Lock` as the first check for that case — already
+    holds it, rather than waiting. Usage:
+
+        try:
+            with try_acquire_repo_lock(str(cwd.resolve())):
+                ... do the write-capable work ...
+        except RepoLockBusy:
+            await message.channel.send("다른 실행이 이미 이 저장소를 건드리고 있습니다 — 끝나면 다시 시도해주세요.")
+    """
+    REPO_LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = _repo_lock_path(resolved_path)
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise RepoLockBusy(resolved_path)
+    try:
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)

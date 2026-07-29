@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -63,6 +63,14 @@ CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a r
 # handle_codex_dispatch and handle_codex_chat/handle_codex_chat_reset so a
 # one-shot dispatch and a chat turn against the same repo can't race either.
 CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+
+# 2026-07-30 fix (사용자 확정, 기능 패리티 갭): discord-bot.py엔 자유채팅을
+# 중간에 멈추는 !중지가 있는데 이쪽엔 대응 명령이 없었다 — 오래 걸리는
+# !코덱스/!코덱스대화를 멈추려면 타임아웃(30분)을 그냥 기다려야 했다.
+# discord-bot.py의 FREE_CHAT_CURRENT_PROC과 같은 패턴이지만, 여러 별칭이
+# 동시에 독립적으로 돌 수 있으므로 단일 전역이 아니라 lock_key(정규화된
+# cwd)별 dict로 관리한다.
+CODEX_CURRENT_PROCS: dict[str, asyncio.subprocess.Process] = {}
 
 
 def load_config():
@@ -366,96 +374,113 @@ async def handle_codex_dispatch(message: discord.Message):
         await message.channel.send(f"`{alias}`에 대한 다른 `!코덱스` 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
         return
 
-    async with lock:
-        # No pending-job/requeue here — !코덱스 is a one-shot manual command,
-        # not a reply-triggered retry chain, so there's nothing to requeue:
-        # the user just re-sends !코덱스 later.
-        skip_reason = await usage_gate_check("codex")
-        if skip_reason:
-            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
-            return
+    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): 위 asyncio.Lock은
+    # 이 codex-bot.py 프로세스 안에서만 유효하다 — discord-bot.py의
+    # verify-task-v2 재시도가 다른 프로세스에서 같은 저장소를 거의 동시에
+    # 건드리는 경우까지는 못 막았다(!코덱스 이중발동 버그는 이미 닫혔지만,
+    # 서로 다른 명령이 우연히 겹치는 경우는 여전히 가능). 파일 기반 락으로
+    # 프로세스 경계를 넘어 한 번 더 확인.
+    try:
+        with try_acquire_repo_lock(lock_key):
+            async with lock:
+                await _handle_codex_dispatch_locked(message, alias, cwd, task)
+    except RepoLockBusy:
+        await message.channel.send(f"`{alias}`에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
+    return
 
-        # `before` inside the try (not before it): an exception here (e.g. a
-        # git subprocess failure) must not propagate out of this handler
-        # uncaught — on_message has no wrapping try/except of its own, so the
-        # user would get total silence, not even the "코덱스에게
-        # 지시했습니다" starting message, let alone an error.
-        prompt_file = None
+
+async def _handle_codex_dispatch_locked(message: discord.Message, alias: str, cwd: Path, task: str) -> None:
+    # No pending-job/requeue here — !코덱스 is a one-shot manual command,
+    # not a reply-triggered retry chain, so there's nothing to requeue:
+    # the user just re-sends !코덱스 later.
+    skip_reason = await usage_gate_check("codex")
+    if skip_reason:
+        await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
+        return
+
+    # `before` inside the try (not before it): an exception here (e.g. a
+    # git subprocess failure) must not propagate out of this handler
+    # uncaught — on_message has no wrapping try/except of its own, so the
+    # user would get total silence, not even the "코덱스에게
+    # 지시했습니다" starting message, let alone an error.
+    prompt_file = None
+    try:
+        before = await _dirty_snapshot(cwd)
+        dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
+
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+            f.write(task)
+            prompt_file = Path(f.name)
+
+        await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
+
+        # start_new_session=True + _kill_process_group_graceful():
+        # codex-execute-dispatch.sh runs the real `codex exec` as
+        # `RAW_OUTPUT="$(codex exec ...)"` — a command substitution, so
+        # codex is a CHILD of this bash process, not the process itself.
+        # A plain proc.kill() here only kills the bash wrapper, leaving
+        # the actual codex process (full workspace-write access) running
+        # undetected in the background.
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        CODEX_CURRENT_PROCS[str(cwd.resolve())] = proc
         try:
-            before = await _dirty_snapshot(cwd)
-            dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
-
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-                f.write(task)
-                prompt_file = Path(f.name)
-
-            await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
-
-            # start_new_session=True + _kill_process_group_graceful():
-            # codex-execute-dispatch.sh runs the real `codex exec` as
-            # `RAW_OUTPUT="$(codex exec ...)"` — a command substitution, so
-            # codex is a CHILD of this bash process, not the process itself.
-            # A plain proc.kill() here only kills the bash wrapper, leaving
-            # the actual codex process (full workspace-write access) running
-            # undetected in the background.
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
-                env=SUBPROCESS_ENV,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                await _kill_process_group_graceful(proc)
-                # 2026-07-29 fix: show the partial diff up to the kill point
-                # instead of only "직접 확인해주세요" with zero information —
-                # `before` was already captured above, so this is the same
-                # before/after comparison the success path below does, just
-                # triggered by a forced kill instead of a clean finish.
-                after = await _dirty_snapshot(cwd)
-                diff_stat = await _diff_summary(cwd, before, after)
-                timeout_msg = f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
-                if diff_stat:
-                    timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
-                else:
-                    timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
-                await message.channel.send(timeout_msg[:1900])
-                return
-
-            raw = (stdout or b"").decode(errors="replace")
-            try:
-                result = json.loads(raw)
-                ok = bool(result.get("ok"))
-                # tail, not head: codex-execute-dispatch.sh already returns
-                # its message tail-truncated so it ends at Codex's actual
-                # failure reason — cutting the FIRST 1000 chars here instead
-                # would re-discard the ending it just preserved.
-                codex_message = str(result.get("message", ""))[-1000:]
-            except Exception:
-                ok = False
-                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[-1000:]}"
-
-            # Never trust Codex's own report — confirm with a real before/after diff.
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await _kill_process_group_graceful(proc)
+            # 2026-07-29 fix: show the partial diff up to the kill point
+            # instead of only "직접 확인해주세요" with zero information —
+            # `before` was already captured above, so this is the same
+            # before/after comparison the success path below does, just
+            # triggered by a forced kill instead of a clean finish.
             after = await _dirty_snapshot(cwd)
             diff_stat = await _diff_summary(cwd, before, after)
-
-            lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
+            timeout_msg = f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
             if diff_stat:
-                lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
-            elif ok:
-                lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
+                timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
             else:
-                lines.append("실제 파일 변경 없음.")
-            lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
-            lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
-            await message.channel.send("\n".join(lines)[:1900])
-        except Exception as e:
-            await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
-        finally:
-            if prompt_file is not None:
-                prompt_file.unlink(missing_ok=True)
+                timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
+            await message.channel.send(timeout_msg[:1900])
+            return
+
+        raw = (stdout or b"").decode(errors="replace")
+        try:
+            result = json.loads(raw)
+            ok = bool(result.get("ok"))
+            # tail, not head: codex-execute-dispatch.sh already returns
+            # its message tail-truncated so it ends at Codex's actual
+            # failure reason — cutting the FIRST 1000 chars here instead
+            # would re-discard the ending it just preserved.
+            codex_message = str(result.get("message", ""))[-1000:]
+        except Exception:
+            ok = False
+            codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[-1000:]}"
+
+        # Never trust Codex's own report — confirm with a real before/after diff.
+        after = await _dirty_snapshot(cwd)
+        diff_stat = await _diff_summary(cwd, before, after)
+
+        lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
+        if diff_stat:
+            lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
+        elif ok:
+            lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
+        else:
+            lines.append("실제 파일 변경 없음.")
+        lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
+        lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
+        await message.channel.send("\n".join(lines)[:1900])
+    except Exception as e:
+        await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
+    finally:
+        CODEX_CURRENT_PROCS.pop(str(cwd.resolve()), None)
+        if prompt_file is not None:
+            prompt_file.unlink(missing_ok=True)
 
 
 # `!코덱스대화` — a ChatGPT/`codex` CLI-style ongoing conversation, distinct
@@ -662,88 +687,145 @@ async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> N
         await message.channel.send(f"`{alias}`에 대한 다른 코덱스 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
         return
 
-    async with lock:
-        skip_reason = await usage_gate_check("codex")
-        if skip_reason:
-            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 시도해주세요.")
-            return
+    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): handle_codex_dispatch와
+    # 동일한 이유로 크로스프로세스 파일 락 추가.
+    try:
+        with try_acquire_repo_lock(lock_key):
+            async with lock:
+                await _codex_chat_turn_locked(message, alias, text, cwd)
+    except RepoLockBusy:
+        await message.channel.send(f"`{alias}`에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
 
+
+async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: str, cwd: Path) -> None:
+    skip_reason = await usage_gate_check("codex")
+    if skip_reason:
+        await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 시도해주세요.")
+        return
+
+    try:
+        before = await _dirty_snapshot(cwd)
+        dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 턴만 골라 보여드릴게요." if before else ""
+
+        existing_thread_id = _load_codex_chat_thread_id(alias)
+        if existing_thread_id:
+            # "--" stops codex's own flag parsing before `text` — without
+            # it, a message starting with "-" (e.g. a stray
+            # "--dangerously-bypass-approvals-and-sandbox") would be
+            # parsed as a codex CLI option instead of prompt text
+            # (confirmed live).
+            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", text]
+            # Previously only sent on a brand-new thread (else branch
+            # below) — a resume turn computed dirty_note above but threw
+            # it away, so the "uncommitted changes already present"
+            # warning silently disappeared after the first turn of a
+            # conversation.
+            if dirty_note:
+                await message.channel.send(dirty_note.lstrip("\n"))
+        else:
+            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", text]
+            await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
+
+        proc = await asyncio.create_subprocess_exec(
+            *args, env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        CODEX_CURRENT_PROCS[str(cwd.resolve())] = proc
         try:
-            before = await _dirty_snapshot(cwd)
-            dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 턴만 골라 보여드릴게요." if before else ""
-
-            existing_thread_id = _load_codex_chat_thread_id(alias)
-            if existing_thread_id:
-                # "--" stops codex's own flag parsing before `text` — without
-                # it, a message starting with "-" (e.g. a stray
-                # "--dangerously-bypass-approvals-and-sandbox") would be
-                # parsed as a codex CLI option instead of prompt text
-                # (confirmed live).
-                args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", text]
-                # Previously only sent on a brand-new thread (else branch
-                # below) — a resume turn computed dirty_note above but threw
-                # it away, so the "uncommitted changes already present"
-                # warning silently disappeared after the first turn of a
-                # conversation.
-                if dirty_note:
-                    await message.channel.send(dirty_note.lstrip("\n"))
-            else:
-                args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", text]
-                await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
-
-            proc = await asyncio.create_subprocess_exec(
-                *args, env=SUBPROCESS_ENV,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_CHAT_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                await _kill_process_group_graceful(proc)
-                # On a resumed turn, a timeout/failure never overwrites the
-                # saved thread_id (only a SUCCESSFUL run does, below), so a
-                # broken resume just fails the same way forever without this
-                # hint.
-                reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
-                # 2026-07-29 fix: show the partial diff up to the kill point
-                # instead of only "직접 확인해주세요" with zero information —
-                # `before` was already captured above, same as !코덱스's
-                # handle_codex_dispatch (which got this same fix).
-                after = await _dirty_snapshot(cwd)
-                diff_stat = await _diff_summary(cwd, before, after)
-                timeout_msg = f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
-                if diff_stat:
-                    timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
-                else:
-                    timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
-                timeout_msg += reset_hint
-                await message.channel.send(timeout_msg[:1900])
-                return
-
-            raw = (stdout or b"").decode(errors="replace")
-            thread_id, reply_text = _parse_codex_json_events(raw)
-
-            if proc.returncode != 0 or thread_id is None:
-                reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
-                await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).{reset_hint}\n```\n{raw[-1500:]}\n```"[:1900])
-                return
-
-            # Only persist AFTER a successful run: an id from a run that
-            # failed to even start properly shouldn't become what the next
-            # message tries to resume.
-            _save_codex_chat_thread_id(alias, thread_id)
-
-            # Never trust Codex's own conversational reply as proof of what
-            # changed — same before/after diff verification as !코덱스.
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_CHAT_TIMEOUT_SECONDS)
+        except asyncio.TimeoutError:
+            await _kill_process_group_graceful(proc)
+            # On a resumed turn, a timeout/failure never overwrites the
+            # saved thread_id (only a SUCCESSFUL run does, below), so a
+            # broken resume just fails the same way forever without this
+            # hint.
+            reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
+            # 2026-07-29 fix: show the partial diff up to the kill point
+            # instead of only "직접 확인해주세요" with zero information —
+            # `before` was already captured above, same as !코덱스's
+            # handle_codex_dispatch (which got this same fix).
             after = await _dirty_snapshot(cwd)
             diff_stat = await _diff_summary(cwd, before, after)
-
-            lines = [reply_text or "(응답 없음)"]
+            timeout_msg = f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
             if diff_stat:
-                lines.append(f"\n변경된 파일:\n```\n{diff_stat}\n```")
-            await message.channel.send("\n".join(lines)[:1900])
-        except Exception as e:
-            await message.channel.send(f"❌ 코덱스대화 실행 중 예외: {e}")
+                timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
+            else:
+                timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
+            timeout_msg += reset_hint
+            await message.channel.send(timeout_msg[:1900])
+            return
+
+        raw = (stdout or b"").decode(errors="replace")
+        thread_id, reply_text = _parse_codex_json_events(raw)
+
+        if proc.returncode != 0 or thread_id is None:
+            reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
+            await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).{reset_hint}\n```\n{raw[-1500:]}\n```"[:1900])
+            return
+
+        # Only persist AFTER a successful run: an id from a run that
+        # failed to even start properly shouldn't become what the next
+        # message tries to resume.
+        _save_codex_chat_thread_id(alias, thread_id)
+
+        # Never trust Codex's own conversational reply as proof of what
+        # changed — same before/after diff verification as !코덱스.
+        after = await _dirty_snapshot(cwd)
+        diff_stat = await _diff_summary(cwd, before, after)
+
+        lines = [reply_text or "(응답 없음)"]
+        if diff_stat:
+            lines.append(f"\n변경된 파일:\n```\n{diff_stat}\n```")
+        await message.channel.send("\n".join(lines)[:1900])
+    except Exception as e:
+        await message.channel.send(f"❌ 코덱스대화 실행 중 예외: {e}")
+    finally:
+        CODEX_CURRENT_PROCS.pop(str(cwd.resolve()), None)
+
+
+async def handle_codex_stop(message: discord.Message):
+    """!코덱스중지 <별칭> — kills the in-flight !코덱스/!코덱스대화 run for
+    that repo, if any. 기능 패리티 갭 해소(2026-07-30, 사용자 확정) —
+    discord-bot.py의 handle_free_chat_stop과 동일한 목적이지만, 이쪽은 여러
+    별칭이 독립적으로 동시에 돌 수 있어 단일 전역 대신 별칭(정확히는
+    정규화된 cwd)별로 대상을 지정해야 한다.
+
+    discord-bot.py의 !중지와 같은 이유로 CODEX_DISPATCH_LOCKS도 함께
+    확인한다 — 락은 잡았지만 실제 subprocess가 아직 안 뜬 짧은 창(프리플라이트
+    게이트 대기 중 등)에는 CODEX_CURRENT_PROCS에 아직 없어서, 그 상태를
+    "실행 중인 게 없다"로 잘못 알리지 않기 위함.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        return
+
+    parts = message.content.strip().split(maxsplit=1)
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    if len(parts) < 2:
+        await message.channel.send(f"사용법: `!코덱스중지 <저장소별칭>`\n사용 가능한 별칭: {aliases}")
+        return
+
+    alias = parts[1].strip()
+    cwd = CODEX_REPO_ALIASES.get(alias)
+    if cwd is None:
+        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    lock_key = str(cwd.resolve())
+    proc = CODEX_CURRENT_PROCS.get(lock_key)
+    lock = CODEX_DISPATCH_LOCKS.get(lock_key)
+    try:
+        if proc is not None:
+            # graceful kill — 이 프로세스는 workspace-write 코덱스 실행이라
+            # mid-write SIGKILL 손상 위험이 동일하게 적용됨.
+            await _kill_process_group_graceful(proc)
+            await message.channel.send(f"`{alias}`에 대한 중단 요청을 보냈습니다.")
+        elif lock is not None and lock.locked():
+            await message.channel.send(f"`{alias}` 실행을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
+        else:
+            await message.channel.send(f"`{alias}`에 대해 지금 실행 중인 게 없습니다.")
+    except Exception as e:
+        await message.channel.send(f"❌ 중단 처리 중 예외: {e}")
 
 
 @client.event
@@ -759,13 +841,17 @@ async def on_message(message: discord.Message):
         return
 
     content = message.content.strip()
-    # "!코덱스대화초기화" must be checked before the plainer
-    # "!코덱스대화"/"!코덱스" prefixes below — all three share the "!코덱스"
-    # prefix, and Python's elif chain takes the first match, so ordering here
-    # is load-bearing (same gotcha discord-bot.py hit when this same routing
-    # first shipped there).
+    # "!코덱스대화초기화"/"!코덱스중지"는 더 일반적인 "!코덱스대화"/"!코덱스"보다
+    # 먼저 체크해야 한다 — 넷 다 "!코덱스" 접두어를 공유하고, Python의 elif
+    # 체인은 첫 매치를 취하므로 순서가 로직 그 자체다(discord-bot.py에서 이
+    # 라우팅이 처음 나왔을 때 겪은 것과 같은 함정).
     if content.startswith("!코덱스대화초기화"):
         await handle_codex_chat_reset(message)
+    elif content.startswith("!코덱스중지"):
+        # 2026-07-30 추가(사용자 확정, 기능 패리티 갭 해소): discord-bot.py의
+        # !중지에 대응하는 명령이 이쪽엔 없어서, 오래 걸리는 !코덱스/
+        # !코덱스대화를 멈추려면 30분 타임아웃을 기다려야 했다.
+        await handle_codex_stop(message)
     elif content.startswith("!코덱스대화"):
         await handle_codex_chat(message)
     elif content.startswith("!코덱스"):

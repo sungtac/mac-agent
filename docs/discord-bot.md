@@ -345,6 +345,22 @@ process" 커밋으로 옮겨졌다. 메커니즘 서술(before/after 델타 검�
 
 **타임아웃**: `CODEX_CHAT_TIMEOUT_SECONDS`(30분), `!코덱스`와 동일한 관대한 여유.
 
+### `!코덱스중지` — 실행 중단 (본인 전용, 2026-07-30, 기능 패리티 갭 해소)
+
+```
+!코덱스중지 <저장소별칭>
+```
+
+`discord-bot.py`의 `!중지`(자유채팅 중단)에 대응하는 명령이 이쪽엔 없어서, 오래 걸리는
+`!코덱스`/`!코덱스대화`를 중간에 멈추려면 `CODEX_DISPATCH_TIMEOUT_SECONDS`/
+`CODEX_CHAT_TIMEOUT_SECONDS`(각 30분) 타임아웃을 그냥 기다려야 했다. `CODEX_CURRENT_PROCS`
+(정규화된 cwd별 dict — `!중지`의 `FREE_CHAT_CURRENT_PROC`과 같은 목적이지만, 여러 별칭이
+독립적으로 동시에 돌 수 있어 단일 전역이 아니라 dict)에 발행된 실행 중인 프로세스를
+`_kill_process_group_graceful`로 정리한다. `CODEX_DISPATCH_LOCKS`도 함께 확인해서, 락은
+잡혔지만 아직 실제 프로세스가 안 뜬 짧은 창(사용량 게이트 대기 등)에 "실행 중인 게 없다"고
+잘못 알리지 않는다(discord-bot.py의 `!중지`가 `FREE_CHAT_LOCK`도 같이 확인하는 것과 같은
+이유).
+
 ## Phase 3 — 자유 채팅 (본인 전용, 2026-07-29)
 
 `config.json`의 `free_chat_user_id`에 해당하는 사용자가 이 채널에 보내는, 인식된 명령어도
@@ -497,13 +513,28 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
 - **[medium → 수정됨] `diff_stat` 캡이 untracked 파일 많을 때 진짜 요약줄을 밀어냄** —
   같은 날 앞서 한 첫 번째 캡 수정(D1)이 놓쳤던 케이스. tracked 요약과 untracked 메모를
   각각 별도 예산으로 캡하도록 재수정(재현 테스트로 확인: untracked 60개에서도 요약줄 보존).
-- **검증 안 하고 낮은 우선순위로 남긴 것**: `verify-task-stop-check.sh`/`usage-routing-check.sh`의
-  fail-open 판정(가짜 경로도 통과), `weekly-report.sh`의 Calendar/사용량 감지 정규식이 실제
-  에러 문구 변형(예: "OAuth expired", "429")을 다 못 잡을 가능성, `score-dispatch.sh`의
-  `CODEX_BIN`/`AGY_BIN` override가 있어도 `verify-task-v2.js`의 preflight가 여전히 절대경로를
-  하드코딩해서 완전한 portability는 아니라는 지적, `docs/discord-bot.md`(이 파일)에 분리 전
-  `discord-bot.py` 기준 서술이 일부 남아있다는 지적(`!코덱스` 절 상단에 이동 안내를 달아
-  완화했으나 본문 전체를 재작성하진 않음).
+**낮은 우선순위 항목 처리 (2026-07-30, 뒤이은 세션에서 순서대로 완료)**:
+- `verify-task-stop-check.sh`/`usage-routing-check.sh`의 fail-open 판정 — scriptPath
+  basename이 정확히 `verify-task(.js)`/`verify-task-v2(.js)`/재개용 사본
+  (`verify-task-wf_<runid>.js`)일 때만, Skill 이름은 정확히 일치할 때만 인정하도록 좁힘.
+  **거기서 그치지 않고 자체 end-to-end 재현으로 추가 결함 발견**: `Workflow({name:
+  "verify-task", ...})`처럼 `scriptPath` 대신 등록된 `name`으로 부르는 방식(docs가 명시한
+  유효한 두 번째 호출법)은 아예 안 잡혔다 — `.input.name`도 함께 확인하도록 확장, 실제
+  세션 트랜스크립트로 재현·수정 확인.
+- `weekly-report.sh`의 Calendar/사용량 감지 정규식 — OAuth 만료/토큰 문제/MCP 서버 불가,
+  429/rate limit exceeded/overloaded/quota exceeded 등 흔한 변형 추가, 배터리 테스트로 신규
+  포착·기존 회귀 없음·오탐 없음 확인.
+- `score-dispatch.sh`의 `CODEX_BIN`/`AGY_BIN` override가 `verify-task(-v2).js`의 preflight엔
+  적용 안 되던 것 — 같은 `${VAR:-기본값}` bash 파라미터 확장 관례를 preflight 프롬프트에도
+  적용해 일관성 확보.
+- `CODEX_DISPATCH_LOCKS` 크로스프로세스 미보호(사용자 확정, blocking 등급) — 파일 기반
+  `try_acquire_repo_lock`(`flock`, non-blocking, 즉시 거부)을 `discord_bot_common.py`에 추가,
+  codex-bot.py의 `!코덱스`/`!코덱스대화`와 discord-bot.py의 verify-task-v2 재시도 2곳 전부에
+  적용. 실제 별도 OS 프로세스 두 개로 mac-agent 실제 경로를 놓고 경쟁하는 시나리오까지
+  재현해 확인.
+- codex-bot.py `!중지` 패리티 갭(사용자 확정) — `!코덱스중지 <별칭>` 추가.
+  `CODEX_CURRENT_PROCS`(별칭/정규화된 cwd별 dict — discord-bot.py의 `FREE_CHAT_CURRENT_PROC`과
+  달리 여러 별칭이 동시에 돌 수 있어 dict) + 기존 `CODEX_DISPATCH_LOCKS`를 함께 확인.
 
 ## 알려진 제약
 
