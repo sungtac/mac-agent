@@ -107,13 +107,34 @@ fi
 # have a stripped PATH missing /opt/homebrew/bin (same recurring gotcha as
 # tmux/coach/claude/ffmpeg/whisper-cli elsewhere on this Mac), which silently
 # turns "codex not found" into a fabricated preflight/scoring failure instead
-# of an actual tool problem.
+# of an actual tool problem. The absolute paths below are this machine's
+# known-good defaults, but they're overridable via CODEX_BIN/AGY_BIN env vars
+# (not hardcoded-only) so the same script still works if ported to another
+# agent/machine with different install locations — set-and-forget default,
+# not a portability dead end.
+CODEX_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
+AGY_BIN="${AGY_BIN:-/Users/edge_ai/.local/bin/agy}"
+
+truncate_output() {
+  printf '%s' "$1" | head -c 2000
+}
+
 case "$TOOL" in
   codex)
-    RAW_OUTPUT="$(/opt/homebrew/bin/codex exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1)"
+    if [ ! -x "$CODEX_BIN" ]; then
+      FAILURE_ENVELOPE "codex 실행파일을 찾을 수 없음: $CODEX_BIN (CODEX_BIN 환경변수로 경로를 override할 수 있음)"
+      exit 0
+    fi
+    RAW_OUTPUT="$("$CODEX_BIN" exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1)"
+    EXIT_CODE=$?
     ;;
   agy)
-    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat "$PROMPT_FILE")" 2>&1)"
+    if [ ! -x "$AGY_BIN" ]; then
+      FAILURE_ENVELOPE "agy 실행파일을 찾을 수 없음: $AGY_BIN (AGY_BIN 환경변수로 경로를 override할 수 있음)"
+      exit 0
+    fi
+    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$AGY_BIN" -p "$(cat "$PROMPT_FILE")" 2>&1)"
+    EXIT_CODE=$?
     ;;
   *)
     FAILURE_ENVELOPE "알 수 없는 도구: $TOOL (codex 또는 agy만 지원)"
@@ -121,36 +142,93 @@ case "$TOOL" in
     ;;
 esac
 
+# Exit-status gate (fixed 2026-07-29 per grader feedback): a non-zero exit is
+# always treated as a dispatch failure, full stop — we deliberately do NOT
+# fall through to JSON extraction on the raw output even if it happens to
+# contain something that parses as JSON. Rationale: on a crash/timeout/OOM/
+# "argument list too long" (E2BIG on an oversized prompt) the captured
+# stdout+stderr can easily contain an unrelated JSON-shaped fragment (a
+# partial echo of the prompt itself, a JSON error body from the underlying
+# API, etc.) that would otherwise be picked up by the extractor below and
+# reported as a legitimate score — silently converting a real tool failure
+# into a fabricated-looking success. Checking the exit code first closes
+# that hole structurally, the same way argv-passing closes the injection
+# hole: it doesn't rely on the extractor "happening" to reject the fragment.
+if [ "$EXIT_CODE" -ne 0 ]; then
+  FAILURE_ENVELOPE "도구가 비정상 종료(exit ${EXIT_CODE})함. 원본 출력(앞 2000자): $(truncate_output "$RAW_OUTPUT")"
+  exit 0
+fi
+
 EXTRACTED="$(printf '%s' "$RAW_OUTPUT" | python3 -c '
 import sys, json
 
 def find_last_valid_json(text):
     # Tool CLIs (codex/agy) print banner/reasoning noise around the answer,
     # sometimes wrapped in markdown code fences, sometimes pretty-printed
-    # across multiple lines. Brace-match every "{" to find balanced
-    # candidates, validate each with json.loads, and keep the last (i.e.
-    # rightmost / final) one that actually parses. This is robust to both
-    # single-line and pretty-printed JSON, and ignores fence characters
-    # since they are just non-brace text to the matcher.
+    # across multiple lines. Brace-match to find balanced candidates,
+    # validate each with json.loads, and keep the last (i.e. rightmost /
+    # final) one that actually parses.
+    #
+    # Bug fixed here (found 2026-07-29 via two independent verify-task
+    # graders returning bare {"scores":{...}} with no total/dealbreaker/
+    # feedback wrapper): the previous version scanned EVERY "{" as a
+    # candidate start, including ones nested inside an already-matched
+    # outer object. For an envelope like {"scores": {...}, "total": 0,
+    # "dealbreaker": ..., "feedback": "..."} the outer object starts at
+    # position 0, but the nested "scores" sub-object necessarily starts at
+    # a LARGER position. Both are valid, independently-parseable JSON, so
+    # both landed in `candidates` — and since candidates were appended in
+    # start-position order, candidates[-1] was actually the *inner*
+    # sub-object, not the outer envelope we meant by "last/final". A tool
+    # that answered correctly with the full envelope would still have its
+    # wrapper fields silently stripped by this extractor.
+    #
+    # Fix: only ever consider top-level (non-nested) balanced-brace spans
+    # as candidates. Once a matched closing brace is found, resume
+    # scanning immediately after it, so nothing inside that span is ever
+    # examined as a start position. This also makes the matcher
+    # string-aware (braces inside quoted JSON string values, e.g. inside a
+    # "feedback" string, no longer perturb the depth count).
     candidates = []
     n = len(text)
-    for start in range(n):
+    start = 0
+    while start < n:
         if text[start] != "{":
+            start += 1
             continue
         depth = 0
+        in_string = False
+        escape = False
+        end_found = None
         for end in range(start, n):
-            if text[end] == "{":
+            ch = text[end]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == "\"":
+                    in_string = False
+                continue
+            if ch == "\"":
+                in_string = True
+            elif ch == "{":
                 depth += 1
-            elif text[end] == "}":
+            elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:end + 1]
-                    try:
-                        json.loads(candidate)
-                        candidates.append(candidate)
-                    except Exception:
-                        pass
+                    end_found = end
                     break
+        if end_found is not None:
+            candidate = text[start:end_found + 1]
+            try:
+                json.loads(candidate)
+                candidates.append(candidate)
+            except Exception:
+                pass
+            start = end_found + 1
+        else:
+            start += 1
     return candidates[-1] if candidates else None
 
 result = find_last_valid_json(sys.stdin.read())
@@ -163,6 +241,5 @@ else:
 if [ -n "$EXTRACTED" ]; then
   printf '%s\n' "$EXTRACTED"
 else
-  TRUNCATED="$(printf '%s' "$RAW_OUTPUT" | head -c 2000)"
-  FAILURE_ENVELOPE "도구 출력에서 유효한 JSON을 찾지 못함. 원본 출력(앞 2000자): ${TRUNCATED}"
+  FAILURE_ENVELOPE "도구 출력에서 유효한 JSON을 찾지 못함. 원본 출력(앞 2000자): $(truncate_output "$RAW_OUTPUT")"
 fi

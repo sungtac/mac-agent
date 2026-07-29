@@ -48,9 +48,22 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
 fi
 
-EDIT_WRITE_COUNT="$(grep -o '"name":"\(Edit\|Write\)"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
-RISKY_BASH_COUNT="$(grep -oE '"command":"[^"]*(git commit|git push|brew install|npm install|pip install|pip3 install|plugin install|marketplace add|rm -rf|chmod \+x)[^"]*"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
-HAS_PLAN_MODE="$(grep -c '"name":"ExitPlanMode"' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+# Parsed with jq (already a hard dependency here), same reasoning as
+# HAS_VERIFY_TASK below: raw-JSON key grepping breaks silently if the
+# transcript serializer's whitespace/key-ordering ever shifts — that's
+# exactly the failure mode that defeated HAS_VERIFY_TASK before its own fix.
+EDIT_WRITE_COUNT="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name=="Edit" or .name=="Write") | .name
+' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
+RISKY_BASH_COUNT="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name=="Bash") | (.input.command // "")
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -cE 'git commit|git push|brew install|npm install|pip install|pip3 install|plugin install|marketplace add|rm -rf|chmod \+x')"
+HAS_PLAN_MODE="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name=="ExitPlanMode") | .name
+' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 # Fixed 2026-07-29: the old pattern (bare `grep -c 'verify-task'`) matches
 # the literal word "verify-task" anywhere in the transcript — including
 # boilerplate that has nothing to do with actually running it (every

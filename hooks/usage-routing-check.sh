@@ -38,7 +38,13 @@ if [ -z "$TRANSCRIPT_PATH" ] || [ ! -f "$TRANSCRIPT_PATH" ]; then
   exit 0
 fi
 
-EDIT_WRITE_COUNT="$(grep -o '"name":"\(Edit\|Write\)"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
+# Parsed with jq (already a hard dependency here), same reasoning as
+# HAS_VERIFY_SKILL below: raw-JSON key grepping breaks silently if the
+# transcript serializer's whitespace/key-ordering ever shifts.
+EDIT_WRITE_COUNT="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name=="Edit" or .name=="Write") | .name
+' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 [ "${EDIT_WRITE_COUNT:-0}" -lt 3 ] && exit 0
 
 # Only fires if Claude's own usage was actually constrained this session —
@@ -80,7 +86,10 @@ HAS_VERIFY_SKILL="$(jq -r '
   elif .name == "Skill" then (.input.skill // .input.name // "")
   else empty end
 ' "$TRANSCRIPT_PATH" 2>/dev/null | grep -c 'verify-task\|independent-critique-loop')"
-HAS_BROWSER_TOOL="$(grep -c '"name":"mcp__claude-in-chrome__' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+HAS_BROWSER_TOOL="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name | startswith("mcp__claude-in-chrome__")) | .name
+' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 if [ "${HAS_VERIFY_SKILL:-0}" -gt 0 ] || [ "${HAS_BROWSER_TOOL:-0}" -gt 0 ]; then
   touch "$NAG_MARKER"
   exit 0

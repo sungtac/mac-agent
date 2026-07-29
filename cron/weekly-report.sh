@@ -164,6 +164,7 @@ SUCCESS=0
 for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   DEBUG_LOGFILE="$STATE_DIR/${TODAY}-attempt${ATTEMPT}-debug.log"
   echo "--- attempt ${ATTEMPT}/${MAX_ATTEMPTS} ---" >> "$LOGFILE"
+  OFFSET_BEFORE=$(wc -c < "$LOGFILE" 2>/dev/null || echo 0)
   WORK_LOG_DISPATCHED=1 "$CLAUDE_BIN" -p "$PROMPT" --output-format text \
     --debug-file "$DEBUG_LOGFILE" </dev/null >> "$LOGFILE" 2>&1 &
   CLAUDE_PID=$!
@@ -197,10 +198,30 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   wait "$CLAUDE_PID"
   EXIT_CODE=$?
   echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=${EXIT_CODE}" >> "$LOGFILE"
+  ATTEMPT_OUTPUT="$(tail -c +"$((OFFSET_BEFORE + 1))" "$LOGFILE" 2>/dev/null)"
+
+  # Calendar MCP 미인증은 `claude -p` 턴 자체는 정상 종료(exit 0)하고 캘린더
+  # 작업만 조용히 실패하는 경우가 있어 EXIT_CODE 체크로는 못 잡는다 — exit
+  # code와 무관하게 먼저 확인. 재시도로는 OAuth 토큰을 고칠 수 없으므로
+  # fail-fast하고 재인증 방법을 안내한다.
+  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'calendar.*(not authenticated|requires?.*auth|unauthorized|needs?.*(re)?auth)|(not authenticated|unauthorized).*calendar'; then
+    echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Calendar MCP 미인증 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
+    bash "$HOME/mac-agent/bin/discord-notify.sh" "🔑 주간보고서 생성 실패 — Google Calendar MCP 미인증으로 보입니다. /mcp 명령으로 재인증 후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
+    exit 1
+  fi
+
   if [ "$EXIT_CODE" -eq 0 ]; then
     SUCCESS=1
     rm -f "$DEBUG_LOGFILE"
     break
+  fi
+
+  # 계정 사용 한도 초과도 재시도로 해결 불가(한도 리셋 전까지는 몇 번을
+  # 더 돌려도 동일하게 실패) — 나머지 시도를 낭비하지 않고 바로 알린다.
+  if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'hit your (session|usage) limit|rate_limit_error'; then
+    echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: 사용 한도 초과 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
+    bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 주간보고서 생성 실패 — 계정 사용 한도 초과. 한도 리셋 이후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
+    exit 1
   fi
 done
 
