@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
+from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -1083,7 +1083,7 @@ async def on_message(message: discord.Message):
         await handle_free_chat_reset(message)
     elif content == "!중지":
         await handle_free_chat_stop(message)
-    elif content.startswith(CODEX_CHAT_WAKE_WORDS) or content.startswith("!코덱스"):
+    elif is_codex_wake_word(content) or content.startswith("!코덱스"):
         # 2026-07-29, widened 2026-07-30 (실측 감사로 발견): a message meant
         # for Codex must NOT also get answered here — codex-bot.py handles
         # it instead. Both bots sit in the same channel and see every
@@ -1100,6 +1100,9 @@ async def on_message(message: discord.Message):
         # reply, since free-chat has no `CODEX_REPO_ALIASES` write-scope
         # guard the way codex-bot.py's dispatch does. `"!코덱스"` covers all
         # three command forms since they share that prefix.
+        # Widened again 2026-07-30 (실측 버그): startswith alone missed wake
+        # words that aren't the first token (e.g. "안녕 콕스") — see
+        # is_codex_wake_word()'s docstring in discord_bot_common.py.
         pass
     elif FREE_CHAT_USER_ID and str(message.author.id) == FREE_CHAT_USER_ID:
         # Phase 3: anything else from the one authorized user is free chat.

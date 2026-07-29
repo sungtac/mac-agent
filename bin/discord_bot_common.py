@@ -45,6 +45,47 @@ QUOTA_LIMIT_PATTERN = re.compile(
 # bots (or by neither).
 CODEX_CHAT_WAKE_WORDS = ("코덱스", "콕스")
 
+# 2026-07-30, 실측 버그 리포트로 발견: "안녕 콕스"(wake word가 문장 맨 앞이
+# 아님)는 startswith(CODEX_CHAT_WAKE_WORDS)에 걸리지 않아 codex-bot.py의
+# wake 핸들러로 아예 안 들어갔고, 동시에 discord-bot.py의 배제 조건에도
+# 안 걸려서 맥의 자유채팅 쪽으로 잘못 흘러들어갔다(마침 그 시점에 다른
+# free-chat 요청 처리 중이라 락 충돌 메시지까지 떴다). 두 증상이 사실
+# 하나의 원인 — "맨 앞에서만" 감지하는 게 너무 좁다.
+_WAKE_PARTICLE_SUFFIXES = ("야", "아", "씨", "님")
+_WAKE_TRAILING_PUNCT = "!?~.,-… "
+
+
+def _strip_wake_particle(token: str) -> str:
+    for particle in _WAKE_PARTICLE_SUFFIXES:
+        if token.endswith(particle) and token != particle:
+            return token[: -len(particle)]
+    return token
+
+
+def is_codex_wake_word(content: str) -> bool:
+    """True if `content` addresses Codex by name — at the start ("콕스야
+    ...", "코덱스 ...") or as the trailing word ("안녕 콕스", "이거 어때
+    코덱스야?"). Only the first and last whitespace-delimited tokens are
+    checked (with trailing punctuation and common vocative particles
+    야/아/씨/님 stripped before comparing) — deliberately NOT a bare
+    substring check, which would also fire on a message merely mentioning
+    Codex mid-sentence ("어제 콕스가 이상했어") and misroute a statement
+    about the bot as an address to it.
+
+    Lives here, not in either bot file, because discord-bot.py's free-chat
+    catch-all must exclude exactly the same messages codex-bot.py's wake
+    handler accepts — both bots sit in the same channel and see every
+    message, so if this logic ever drifted between the two files, a
+    wake-worded message could get answered by BOTH bots (or by neither).
+    """
+    tokens = content.strip().split()
+    if not tokens:
+        return False
+    first = _strip_wake_particle(tokens[0].rstrip(_WAKE_TRAILING_PUNCT))
+    last = _strip_wake_particle(tokens[-1].rstrip(_WAKE_TRAILING_PUNCT))
+    return first in CODEX_CHAT_WAKE_WORDS or last in CODEX_CHAT_WAKE_WORDS
+
+
 # 2026-07-30, 사용자 명시적 요청: 두 봇 다 지금까지 자기 자신이 누구인지,
 # 옆에 누가 있는지에 대한 시스템 레벨 인지가 전혀 없었다 — 실측으로 확인된
 # 실제 사고: 사용자가 "콕스야"라고 불렀는데, 맥(discord-bot.py, Discord

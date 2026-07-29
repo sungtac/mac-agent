@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -645,9 +645,10 @@ CODEX_CHAT_DEFAULT_ALIAS = "mac-agent"  # natural chat has no room to specify an
 
 
 async def handle_codex_chat_wake(message: discord.Message):
-    """Natural, prefix-less chat: any message starting with a
-    CODEX_CHAT_WAKE_WORDS token (e.g. "코덱스야 ...", "콕스 ...") is treated
-    as a !코덱스대화 turn against CODEX_CHAT_DEFAULT_ALIAS, no command syntax
+    """Natural, prefix-less chat: any message addressing Codex by name (see
+    is_codex_wake_word() in discord_bot_common.py — leading or trailing
+    token, e.g. "코덱스야 ...", "콕스 ...", or "안녕 콕스") is treated as a
+    !코덱스대화 turn against CODEX_CHAT_DEFAULT_ALIAS, no command syntax
     required (2026-07-29, user's explicit request — "ChatGPT처럼" addressing
     Codex by name in ongoing chat rather than typing `!코덱스대화 <alias>`
     every time). The FULL original message (including the wake word itself,
@@ -655,9 +656,9 @@ async def handle_codex_chat_wake(message: discord.Message):
     Codex is a language model, not a parser, so there's no need to strip the
     vocative prefix out first.
 
-    discord-bot.py's own free-chat catch-all excludes messages starting with
-    these same wake words (see its on_message) so only one of the two bots
-    answers a given wake-worded message, not both.
+    discord-bot.py's own free-chat catch-all excludes messages matching the
+    same is_codex_wake_word() check (see its on_message) so only one of the
+    two bots answers a given wake-worded message, not both.
     """
     if str(message.author.id) != FREE_CHAT_USER_ID:
         return  # silently ignore — same posture as discord-bot.py's free-chat fallthrough for anyone else in the channel
@@ -994,7 +995,7 @@ async def on_message(message: discord.Message):
         await handle_codex_chat(message)
     elif content.startswith("!코덱스"):
         await handle_codex_dispatch(message)
-    elif content.startswith(CODEX_CHAT_WAKE_WORDS):
+    elif is_codex_wake_word(content):
         await handle_codex_chat_wake(message)
 
 
