@@ -51,7 +51,25 @@ fi
 EDIT_WRITE_COUNT="$(grep -o '"name":"\(Edit\|Write\)"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 RISKY_BASH_COUNT="$(grep -oE '"command":"[^"]*(git commit|git push|brew install|npm install|pip install|pip3 install|plugin install|marketplace add|rm -rf|chmod \+x)[^"]*"' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
 HAS_PLAN_MODE="$(grep -c '"name":"ExitPlanMode"' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
-HAS_VERIFY_TASK="$(grep -c 'verify-task' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+# Fixed 2026-07-29: the old pattern (bare `grep -c 'verify-task'`) matches
+# the literal word "verify-task" anywhere in the transcript — including
+# boilerplate that has nothing to do with actually running it (every
+# session's system-reminder skill_listing describes verify-task/
+# verify-task-v2 in its one-line skill catalog, and any doc path or prose
+# mentioning the name matches too). A real-world audit of every session log
+# for this project found this pattern matching constantly on boilerplate
+# while a real `Workflow({scriptPath: "workflows/verify-task.js", ...})`
+# tool_use call — the actual invocation, per docs/verify-task.md — never
+# appeared even once. That means this MANDATORY tier's "no escape valve"
+# guarantee was silently defeated almost every session: the exemption fired
+# on the boilerplate mention alone, so MANDATORY_HITS below was never
+# reached. Parsed with jq (already a hard dependency here) so it walks the
+# real message.content[].{type,name,input} structure instead of guessing at
+# raw-JSON key ordering/whitespace.
+HAS_VERIFY_TASK="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  select(.name == "Workflow") | (.input.scriptPath // "")
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -c 'verify-task')"
 
 [ "${HAS_VERIFY_TASK:-0}" -gt 0 ] && exit 0
 
@@ -59,7 +77,7 @@ MANDATORY_HITS=()
 [ "${EDIT_WRITE_COUNT:-0}" -ge 3 ] && MANDATORY_HITS+=("코딩(Edit/Write ${EDIT_WRITE_COUNT}회)")
 [ "${HAS_PLAN_MODE:-0}" -gt 0 ] && MANDATORY_HITS+=("아이디어 회의(ExitPlanMode 사용)")
 
-if [ "${#MANDATORY_HITS[@]:-0}" -gt 0 ]; then
+if [ "${#MANDATORY_HITS[@]}" -gt 0 ]; then
   touch "$NAG_MARKER"
   HITS_STR="$(IFS=', '; echo "${MANDATORY_HITS[*]}")"
   jq -n --arg hits "$HITS_STR" '{

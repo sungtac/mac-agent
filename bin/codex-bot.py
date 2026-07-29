@@ -98,7 +98,27 @@ async def _git_output(cwd: Path, *args: str) -> str:
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     out, _ = await proc.communicate()
-    return out.decode(errors="replace").strip()
+    text = out.decode(errors="replace").strip()
+    if proc.returncode != 0:
+        # 2026-07-29 fix: this used to return stderr text mixed into `out`
+        # as if it were legitimate diff/status output, with no returncode
+        # check at all. _dirty_snapshot()'s line-parsing only recognizes
+        # lines starting with "diff --git " or "?? " — a git failure (e.g.
+        # `.git/index.lock` held by a concurrent process, not a repo, a
+        # permissions error) produces neither, so the error text was
+        # silently dropped and the snapshot came back as an empty `{}` —
+        # indistinguishable from "genuinely no changes". That's the one
+        # thing this whole module exists to prevent: handle_codex_dispatch's
+        # own docstring says Codex's self-report is "never trusted... this
+        # function independently diffs the repo" — but a swallowed git
+        # failure meant that independent check could silently report "실제
+        # 파일 변경 없음" when the truth was "git itself failed, unknown
+        # state". Raising here lets it propagate to the existing outer
+        # `except Exception as e` in handle_codex_dispatch/_codex_chat_turn,
+        # which already reports failures to the user — no new handling
+        # needed at the call sites.
+        raise RuntimeError(f"git {' '.join(args)} failed (exit={proc.returncode}): {text[:500]}")
+    return text
 
 
 def _hash_file_content(path: Path) -> str:

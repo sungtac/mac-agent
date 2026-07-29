@@ -60,7 +60,26 @@ esac
 
 # Rule A objective exceptions — if either is present, this session is
 # exempt from routing by design; skip the nag entirely.
-HAS_VERIFY_SKILL="$(grep -c '"skill":"\(verify-task\|verify-task-v2\|independent-critique-loop\)"' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
+#
+# HAS_VERIFY_SKILL fixed 2026-07-29: the old pattern grepped for the literal
+# key `"skill":"verify-task"`, which is not how a real invocation is ever
+# recorded — a real-world audit of every session log for this project found
+# that key appearing zero times, while the bare word "verify-task" appears
+# constantly as boilerplate (skill_listing descriptions, docs paths) that
+# has nothing to do with the skill actually running. Per docs/verify-task.md
+# ("Usage: `Workflow({scriptPath: "workflows/verify-task.js", ...})`"),
+# verify-task/verify-task-v2 run as a `Workflow` tool_use with a `scriptPath`
+# input; independent-critique-loop is a real Skill and would show as a
+# `Skill` tool_use with that name in its input. Parsed with jq (already a
+# hard dependency here) instead of raw grep, since jq walks the actual
+# message.content[].{type,name,input} structure rather than guessing at key
+# ordering/whitespace in the serialized JSON.
+HAS_VERIFY_SKILL="$(jq -r '
+  select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
+  if .name == "Workflow" then (.input.scriptPath // "")
+  elif .name == "Skill" then (.input.skill // .input.name // "")
+  else empty end
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -c 'verify-task\|independent-critique-loop')"
 HAS_BROWSER_TOOL="$(grep -c '"name":"mcp__claude-in-chrome__' "$TRANSCRIPT_PATH" 2>/dev/null | tr -d ' ')"
 if [ "${HAS_VERIFY_SKILL:-0}" -gt 0 ] || [ "${HAS_BROWSER_TOOL:-0}" -gt 0 ]; then
   touch "$NAG_MARKER"

@@ -656,6 +656,26 @@ if (tier === 'full' && !finalVerdict) {
       () => dispatchWithRetry((isRetry) => antigravityCritiquePlan(task, context, codexPlan, isRetry), '안티그래비티 비평'),
     ])
 
+    // 2026-07-29 수정: 아래 3단계(codexReconcile)로 넘어가는 buildReconcilePrompt는
+    // `claudeCritique?.issues || []` / `antigravityCritique?.issues || []`로 조용히
+    // 빈 배열 폴백한다 — agent()가 실패해 null을 반환하면(세션 한도 초과 등 일시적
+    // 오류) 코덱스는 "클로드/안티그래비티 둘 다 이슈를 못 찾았다"고 오인하고 자기
+    // 계획을 검증 없이 그대로 밀어붙이게 된다. 정확히 같은 버그 클래스가 아래 FullReview
+    // 라운드 루프(claudeReview/antigravityReview)에서는 2026-07-28 실측 후 이미 고쳐져
+    // 있었는데, 이 앞단(Critique)에는 그 수정이 전이되지 않았었다 — 여기서도 동일하게
+    // null을 "이슈 없음"이 아니라 "비평 자체가 실패함"으로 명시 처리한다.
+    if (!claudeCritique || !antigravityCritique) {
+      const whichFailed = [!claudeCritique && 'claude', !antigravityCritique && 'antigravity'].filter(Boolean).join(', ')
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'critique_failed',
+        reason: `클로드/안티그래비티 블라인드 비평 단계(${whichFailed})가 실패함(세션 한도 초과 등 일시적 오류일 가능성 높음) — 비평이 실제로 수행되지 못한 상태이니 코덱스가 "이슈 없음"으로 오인하고 계획을 그대로 진행하면 안 됨. 같은 task로 워크플로우를 재시도할 것.`,
+      }
+      log('[전체] 2단계: 블라인드 비평 실패 — 재시도 필요')
+      return await finalizeAndReturn()
+    }
+
     log('[전체] 3단계: 코덱스 취합+판단+계획 개선...')
     const reconciled = await dispatchWithRetry(
       (isRetry) => codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, HARNESS_FILE, isRetry),

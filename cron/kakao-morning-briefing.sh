@@ -150,6 +150,26 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   cat "$ATTEMPT_OUTFILE" >> "$LOGFILE"
   if [ "$TIMED_OUT" -eq 1 ]; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: TIMEOUT after ${TIMEOUT_SECONDS}s — killed. Debug log: ${DEBUG_LOGFILE}." >> "$LOGFILE"
+    # Idempotency guard (2026-07-29): unlike weekly-report.sh's Calendar
+    # event (dedup'd via search_events-before-create) or work-log-stop-check.sh's
+    # archive copy (idempotent, same source -> same dest overwrite), a
+    # KakaoTalk "나에게 보내기" send is a one-way fire with no way to query
+    # "was this already sent". Blindly retrying on ANY timeout risks a
+    # duplicate: if the send tool call (step 5, KakaotalkChat-MemoChat) had
+    # already succeeded before the watchdog killed this attempt (e.g. it
+    # hung afterward during step 6's own text generation), attempt 2 would
+    # resend the whole briefing from scratch. Grep the just-killed attempt's
+    # own debug log for evidence the send tool was actually invoked before
+    # the kill — if so, the outcome is ambiguous (may have sent, may have
+    # failed inside kakao-playmcp) and resending guarantees a duplicate if it
+    # did succeed, so don't retry; escalate instead. Same "under-logging
+    # beats spamming" posture already used by work-log-stop-check.sh for its
+    # own ambiguous-classification case.
+    if [ -f "$DEBUG_LOGFILE" ] && grep -q 'KakaotalkChat-MemoChat' "$DEBUG_LOGFILE" 2>/dev/null; then
+      echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: 타임아웃 직전 카톡 발송 도구 호출 흔적이 debug 로그에 있음 — 이미 보냈을 수 있어 재시도(중복발송 위험) 대신 여기서 중단." >> "$LOGFILE"
+      bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 카톡 모닝 브리핑 — ${ATTEMPT}번째 시도가 타임아웃됐는데, 발송 직전까지 진행된 흔적이 있어 재시도하지 않았습니다(중복발송 방지). 실제로 도착했는지 확인해주세요. 로그: ${LOGFILE}" || true
+      exit 3
+    fi
     rm -f "$ATTEMPT_OUTFILE"
     sleep 5
     continue
