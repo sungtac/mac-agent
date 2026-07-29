@@ -731,6 +731,12 @@ FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 
 # 패턴 — 완전 중앙화는 안 함).
 CODEX_BIN = Path("/opt/homebrew/bin/codex")
 CODEX_FALLBACK_TIMEOUT_SECONDS = 30 * 60  # 다른 provider 호출들과 동일 예산
+# 2026-07-30, 사용자 확정("짧은 Claude 재시도 후 코덱스 폴백") — 실측 근거:
+# 실제 한도초과 거부(15:04:35)와 같은 계정의 바로 다음 정상 요청(15:04:44)
+# 사이 간격이 9초였다. 10초면 그 순단을 넘기기에 충분하면서도 사용자를
+# 오래 기다리게 하지 않는 값 — 정확한 과학적 근거보다는 실측 사례 하나에
+# 여유를 조금 더한 값이라는 점은 명시해둔다.
+CLAUDE_QUOTA_RETRY_DELAY_SECONDS = 10
 
 # Concurrency guard (2026-07-29, found in review before ever hit live):
 # handle_free_chat() reads the session id at the START and only writes it
@@ -921,15 +927,22 @@ async def handle_free_chat(message: discord.Message):
         args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
 
         global FREE_CHAT_CURRENT_PROC
-        try:
-            # start_new_session=True (2026-07-29, found in review): makes
-            # this process its own group leader, so _kill_process_group()
-            # (used by both the timeout below and handle_free_chat_stop's
-            # !중지) can clean up anything IT spawns too — full tool access
-            # means a Bash call here can easily start a long-running child
-            # that a plain proc.kill() would just orphan (confirmed via a
-            # local repro before this fix: proc.kill() left a backgrounded
-            # grandchild alive; start_new_session + os.killpg left nothing).
+
+        async def _run_once():
+            """스폰+통신 1회. 성공/실패 상관없이 (returncode, out_text)를
+            반환하고, 타임아웃이면 직접 메시지를 보낸 뒤 None을 반환한다
+            (호출자는 그 자리에서 끝내야 함) — 재시도 로직이 이 스폰
+            시퀀스를 두 번 호출해야 해서 함수로 뽑음.
+
+            start_new_session=True (2026-07-29, found in review): makes
+            this process its own group leader, so _kill_process_group()
+            (used by both the timeout below and handle_free_chat_stop's
+            !중지) can clean up anything IT spawns too — full tool access
+            means a Bash call here can easily start a long-running child
+            that a plain proc.kill() would just orphan (confirmed via a
+            local repro before this fix: proc.kill() left a backgrounded
+            grandchild alive; start_new_session + os.killpg left nothing).
+            """
             proc = await asyncio.create_subprocess_exec(
                 *args, cwd=str(FREE_CHAT_CWD), env=env,
                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -942,9 +955,32 @@ async def handle_free_chat(message: discord.Message):
                 # graceful kill (2026-07-30 fix, same rationale as above).
                 await _kill_process_group_graceful(proc)
                 await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
+                return None
+            return proc.returncode, (stdout or b"").decode(errors="replace").strip()
+
+        try:
+            result = await _run_once()
+            if result is None:
                 return
-            out_text = (stdout or b"").decode(errors="replace").strip()
-            if proc.returncode != 0:
+            returncode, out_text = result
+
+            if returncode != 0 and QUOTA_LIMIT_PATTERN.search(out_text):
+                # 2026-07-30, 사용자 확정: 실측으로 확인된 실제 사례 —
+                # 같은 계정이 15:04:35에 이 한도초과로 거부됐는데, 같은
+                # 계정의 바로 다음 요청은 단 9초 뒤(15:04:44)에 캐시적중률
+                # 100%로 정상 통과했다(트랜스크립트 usage 필드 직접 대조로
+                # 확인). 즉 계정이 진짜로 소진된 게 아니라 순간적인 순단인
+                # 경우가 실제로 있다 — 코덱스로 넘기기 전에 같은 Claude로
+                # 한 번 더 짧게 재시도해서, 그런 순단은 여기서 조용히
+                # 흡수한다. 그래도 안 되면(진짜 7일창 소진 등) 아래에서
+                # 코덱스 폴백으로 넘어간다.
+                await asyncio.sleep(CLAUDE_QUOTA_RETRY_DELAY_SECONDS)
+                retry_result = await _run_once()
+                if retry_result is None:
+                    return
+                returncode, out_text = retry_result
+
+            if returncode != 0:
                 # 2026-07-30, 사용자 명시적 요청("맥은 실제 계정을 따라가지
                 # 않고, 멀티에이전트를 따라가야 하는데"): 계정 한도 초과를
                 # 그냥 "기다리세요"로 끝내는 건 시스템 전체가 죽은 것처럼
@@ -956,10 +992,10 @@ async def handle_free_chat(message: discord.Message):
                 # 그 호출), 감싸는 이 파이썬 코드가 같은 메시지를 코덱스로
                 # 자동 재시도한다.
                 if QUOTA_LIMIT_PATTERN.search(out_text):
-                    await message.channel.send(f"⏳ 맥(Claude)이 계정 사용 한도로 응답하지 못했습니다 — 코덱스로 자동 전환합니다.\n```\n{out_text[-300:]}\n```")
+                    await message.channel.send(f"⏳ 맥(Claude)이 계정 사용 한도로 응답하지 못했습니다(짧은 재시도도 실패) — 코덱스로 자동 전환합니다.\n```\n{out_text[-300:]}\n```")
                     await _fallback_to_codex(message, text)
                 else:
-                    await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
+                    await message.channel.send(f"❌ 실패 (exit={returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
                 return
             # Only persist the session id AFTER a successful run — an id from a
             # run that errored out (e.g. Claude Code couldn't start at all)
