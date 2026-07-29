@@ -885,6 +885,31 @@ False, 문장 중간 언급 계속 False) 전부 기대값과 일치 확인. 두
 stderr.log에서 정상 `Shard ID None has connected to Gateway` 로그로 재연결 확인(import/문법
 오류 없음).
 
+### "각자 자기소개 해줘" — 이름을 안 불러도 단체방처럼 콕스도 같이 응답하게
+
+wake word 버그를 고친 직후, 사용자가 실제로 "각자 자기소개 해줘"를 보냈다. 맥은 응답했지만
+콕스는 반응이 없었고, 맥 스스로도 "콕스는 별도 봇이라 '콕스야'로 따로 불러야 한다"고
+안내했다. 사용자 피드백: "각자"라는 말을 그냥 일반 단체방처럼 콕스도 이해하고 같이 말하면
+되지 않아? — 매번 이름을 불러야 하는 게 아니라, 여러 참가자를 동시에 지칭하는 표현이면
+콕스도 (맥과 별개로) 알아서 같이 응답해야 한다는 것.
+
+**설계**: `is_codex_wake_word()`와는 별개 함수(`is_group_address()`)로 구현 — wake word는
+"콕스 하나를 이름으로 지목"이라 첫/끝 토큰만 보지만, 그룹 지칭은 "여러 명을 한꺼번에
+지칭"이라 문장 어디에 있어도 신호가 된다(단순 substring 체크). 감지 방식은
+AskUserQuestion으로 확정: 좁은 목록(각자/둘 다/둘다/다같이/같이/모두 다)과 넓은 목록(+모두/
+전부) 중 사용자가 넓은 쪽을 선택 — "모두 감사합니다"처럼 콕스와 무관한 문장에도 콕스가
+응답할 오탐 가능성을 사용자가 명시적으로 감수하기로 확정.
+
+**구현**: `discord_bot_common.py`에 `GROUP_ADDRESS_WORDS`/`is_group_address()` 추가.
+`codex-bot.py`의 `on_message`에 `elif is_group_address(content): await
+handle_codex_chat_wake(message)` 한 줄만 추가 — `discord-bot.py`의 배제 조건은 건드리지
+않음(그룹 지칭 단어는 `is_codex_wake_word`에 안 걸리므로 맥은 원래대로 계속 응답, 결과적으로
+단체방처럼 둘 다 답하게 됨).
+
+**검증**: venv 파이썬으로 `is_group_address` 8개 케이스 직접 실행 — 목록에 있는 6개 단어
+전부 True(오탐 케이스 3개 포함, 의도된 동작), wake-word 단독 케이스는 False로 확인. 두 봇
+프로세스 재기동 후 정상 재연결 로그 확인.
+
 ## 알려진 제약
 
 - launchd로 상시 구동되는 프로세스라 PATH가 `/usr/bin:/bin:/usr/sbin:/sbin` 기본값으로 축소돼 있음 — `discord-bot.py`가 `weekly-report.sh`를 서브프로세스로 띄울 때 `SUBPROCESS_ENV`로 `/opt/homebrew/bin`, `~/.local/bin`을 명시적으로 앞에 붙여서 넘김. 이 PATH 문제는 이 레포 전체에서 반복 발생한 것(tmux/coach/claude/ffmpeg/whisper-cli/codex와 동일 원인) — 새 서브프로세스 스폰 지점을 추가할 때마다 재확인할 것.

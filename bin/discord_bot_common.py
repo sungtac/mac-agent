@@ -86,6 +86,31 @@ def is_codex_wake_word(content: str) -> bool:
     return first in CODEX_CHAT_WAKE_WORDS or last in CODEX_CHAT_WAKE_WORDS
 
 
+# 2026-07-30, 사용자 실제 테스트로 발견: "각자 자기소개 해줘"를 보냈더니 맥만
+# 응답하고, 맥이 스스로 "콕스는 별도 봇이라 콕스야로 따로 불러야 한다"고
+# 안내했다. 사용자 피드백: "각자"라는 말을 그냥 일반 단체방처럼 콕스도
+# 이해하고 같이 말하면 되지 않냐 — 매번 이름을 따로 불러야 하는 게 아니라,
+# 여러 참가자를 동시에 지칭하는 표현이면 콕스도 (맥과 별개로) 알아서 같이
+# 응답해야 한다는 것. is_codex_wake_word()와 별개 함수인 이유: 이건 "이름으로
+# 콕스 하나를 지목"이 아니라 "여러 명을 한꺼번에 지칭"이므로 첫/끝 토큰
+# 제한이 아니라 문장 어디에 있어도 신호가 된다 — 사용자가 명시적으로 더 넓은
+# 단어 목록(모두/전부 포함)을 선택, 오탐 가능성("모두 감사합니다"에도 콕스가
+# 응답)은 감수하기로 확정.
+GROUP_ADDRESS_WORDS = (
+    "각자", "둘 다", "둘다", "다같이", "같이", "모두 다", "모두", "전부",
+)
+
+
+def is_group_address(content: str) -> bool:
+    """True if `content` refers to multiple/all participants at once
+    ("각자 자기소개 해줘", "둘 다 어떻게 생각해?") rather than naming Codex
+    specifically. Used by codex-bot.py to also answer such messages even
+    without an explicit "콕스야" — see GROUP_ADDRESS_WORDS comment above for
+    why this is a bare substring check (unlike is_codex_wake_word) and the
+    false-positive tradeoff that implies."""
+    return any(word in content for word in GROUP_ADDRESS_WORDS)
+
+
 # 2026-07-30, 사용자 명시적 요청: 두 봇 다 지금까지 자기 자신이 누구인지,
 # 옆에 누가 있는지에 대한 시스템 레벨 인지가 전혀 없었다 — 실측으로 확인된
 # 실제 사고: 사용자가 "콕스야"라고 불렀는데, 맥(discord-bot.py, Discord

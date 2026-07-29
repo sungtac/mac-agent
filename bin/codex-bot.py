@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, is_group_address, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -996,6 +996,13 @@ async def on_message(message: discord.Message):
     elif content.startswith("!코덱스"):
         await handle_codex_dispatch(message)
     elif is_codex_wake_word(content):
+        await handle_codex_chat_wake(message)
+    elif is_group_address(content):
+        # 2026-07-30, 사용자 실제 테스트("각자 자기소개 해줘") 발견: 콕스를
+        # 이름으로 지목하지 않아도 여러 참가자를 한꺼번에 지칭하는 표현이면
+        # 맥과 별개로 콕스도 응답한다 — discord-bot.py는 이 단어들을 배제
+        # 조건에 안 넣으므로(맥도 여전히 응답) 결과적으로 단체방처럼 둘 다
+        # 답하게 된다.
         await handle_codex_chat_wake(message)
 
 
