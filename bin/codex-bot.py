@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -738,7 +738,16 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             if dirty_note:
                 await message.channel.send(dirty_note.lstrip("\n"))
         else:
-            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", prompt_text]
+            # 2026-07-30, 사용자 명시적 요청: 정체성(CODEX_BOT_PERSONA)은
+            # 새 스레드 시작 시점에만 넣는다 — 코덱스엔 claude -p의
+            # --append-system-prompt 같은 "대화 밖에서 매턴 재주입되는"
+            # 시스템프롬프트 전용 플래그가 없어서, 이 텍스트는 실제로
+            # prompt_text의 일부로 코덱스 자신의 스레드 히스토리에 그대로
+            # 남는다 — 매턴 반복하면 resume될 때마다 같은 자기소개가 계속
+            # 쌓여서 노이즈가 된다. 새 스레드 첫 턴에만 넣고, 그 뒤로는
+            # exec resume이 이어받는 스레드 자체 기억에 맡긴다.
+            new_thread_prompt_text = f"{CODEX_BOT_PERSONA}\n\n{prompt_text}"
+            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", new_thread_prompt_text]
             await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
 
         proc = await asyncio.create_subprocess_exec(

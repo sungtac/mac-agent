@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -891,7 +891,15 @@ async def handle_free_chat(message: discord.Message):
             prompt_text = text
 
         env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
-        args = [str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text"]
+        # --append-system-prompt는 매 턴(resume 포함) 넣는다 — Claude
+        # 쪽엔 이 페르소나를 스레드 상태처럼 한 번만 넣고 재사용할 방법이
+        # 없고(-p는 매번 새 프로세스, resume은 대화 기록만 이어받지 CLI
+        # 플래그를 기억하진 않음), 매번 같은 텍스트라 프롬프트 캐시
+        # 관점에서도 손해가 없다(codex-bot.py의 CODEX_BOT_PERSONA는 반대로
+        # 새 스레드 때만 넣음 — 코덱스는 이게 시스템프롬프트가 아니라
+        # 대화 본문 자체라 매턴 반복하면 노이즈로 쌓이기 때문, 그 차이는
+        # discord_bot_common.py의 두 상수 주석 참고).
+        args = [str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text", "--append-system-prompt", MAC_BOT_PERSONA]
         args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
 
         global FREE_CHAT_CURRENT_PROC

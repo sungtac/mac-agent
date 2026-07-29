@@ -30,6 +30,35 @@ MAC_AGENT = Path.home() / "mac-agent"
 # bots (or by neither).
 CODEX_CHAT_WAKE_WORDS = ("코덱스", "콕스")
 
+# 2026-07-30, 사용자 명시적 요청: 두 봇 다 지금까지 자기 자신이 누구인지,
+# 옆에 누가 있는지에 대한 시스템 레벨 인지가 전혀 없었다 — 실측으로 확인된
+# 실제 사고: 사용자가 "콕스야"라고 불렀는데, 맥(discord-bot.py, Discord
+# 계정명 "edgeAI_맥")이 "콕스"라는 이름에 대한 기억이 자기 어디에도 없다고
+# 답한 반면, 실제로는 콕스(codex-bot.py, Discord 계정명 "콕스")가 바로 옆
+# 채널에서 계속 응답하고 있었다(실제 채널 히스토리로 확인, 2026-07-30).
+# 이름 자체는 사용자가 이미 Discord 봇 계정명으로 붙여둔 것을 그대로 채택 —
+# 새로 짓지 않음. fetch_cross_bot_context의 라벨링과 아래 두 페르소나 텍스트
+# 둘 다 여기 상수를 공유해서 이름이 어긋날 여지를 없앤다.
+MAC_BOT_NAME = "맥"
+CODEX_BOT_NAME = "콕스"
+
+MAC_BOT_PERSONA = (
+    f"너는 이 Discord 채널에서 '{MAC_BOT_NAME}'이라는 이름으로 활동하는 Claude 기반 어시스턴트야. "
+    f"같은 채널에 '{CODEX_BOT_NAME}'이라는 이름의 동료 봇이 있는데, Codex 기반이고 실제 저장소 코딩/파일 "
+    "작업을 전담해. 사용자가 '코덱스'나 '콕스'를 부르거나 그 이름으로 뭔가 물어보면, 그건 너를 부르는 "
+    f"게 아니라 그 동료를 가리키는 거야 — 네가 대신 아는 척 답하지 말고, 그건 {CODEX_BOT_NAME}이 담당한다고 "
+    "안내해. 채팅 맥락에 '[참고 — 같은 채널에서 최근 다른 봇과 나눈 대화]' 같은 블록이 곁들여질 수 있는데, "
+    "그건 실제 네 세션 기록이 아니라 참고자료일 뿐이야."
+)
+
+CODEX_BOT_PERSONA = (
+    f"너는 이 Discord 채널에서 '{CODEX_BOT_NAME}'이라는 이름으로 활동하는 Codex 기반 동료야. "
+    f"같은 채널에 '{MAC_BOT_NAME}'이라는 이름의 동료 봇이 있는데, Claude 기반이고 범용 대화/일반 업무를 "
+    f"맡고 있어. 사용자가 '맥'을 부르거나 그 이름으로 뭔가 물어보면 그건 {MAC_BOT_NAME}을 가리키는 거야. "
+    "채팅 맥락에 '[참고 — 같은 채널에서 최근 다른 봇과 나눈 대화]' 같은 블록이 곁들여질 수 있는데, "
+    "그건 실제 네 스레드 기록이 아니라 참고자료일 뿐이야."
+)
+
 # Subprocesses we spawn shell out to codex/agy/claude by absolute path
 # already, but git/date/etc still resolve via PATH — launchd's own PATH for
 # this process can be the stripped /usr/bin:/bin:/usr/sbin:/sbin default, so
@@ -262,7 +291,12 @@ async def fetch_cross_bot_context(channel, own_bot_id: int, limit: int = CROSS_B
         content = (msg.content or "").strip()
         if not content:
             continue
-        label = "봇" if msg.author.bot else "사용자"
+        # 2026-07-30 개선: 그냥 "봇"이라고 뭉뚱그리면 정체성 페르소나
+        # (MAC_BOT_PERSONA/CODEX_BOT_PERSONA)가 상대를 이름으로 설명해줘도
+        # 이 참고자료 블록만 보면 "봇"이 누군지 다시 헷갈릴 수 있다 —
+        # 실제 Discord 표시 이름(display_name — 서버 닉네임 우선, 없으면
+        # username)을 그대로 라벨로 써서 "[콕스] ..." 식으로 명확히 한다.
+        label = msg.author.display_name if msg.author.bot else "사용자"
         lines.append(f"[{label}] {content}")
     lines.reverse()  # channel.history() yields newest-first; want chronological
     return "\n".join(lines)
