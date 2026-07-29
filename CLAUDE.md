@@ -6,6 +6,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Source of truth for Claude Code assets (skills, workflows) shared across a fleet of agents. Each agent pulls this repo in (symlink into `~/.claude/` for personal use, or via a plugin marketplace manifest for shared use — marketplace setup is still pending).
 
+## 세션 운영 규율
+
+- **세션 중간에 CLAUDE.md를 고치거나 모델을 바꾸지 말 것.** 둘 다 프롬프트 캐시 프리픽스를
+  바꿔서 그 시점 이후 전체가 캐시 미스로 재계산된다(캐시 TTL 5분 — 프리픽스가 달라지면
+  이전 캐시는 재사용 불가). 수정·전환은 항상 세션 경계(새 세션 시작 시)에서만.
+  (출처: 실밸개발자 Claude Code 강의 2편, 2026-07-29 검토·반영)
+
 ## Structure
 
 This is an index only — each entry is a one/two-line pointer. Full rationale, known bugs, and porting notes live in `docs/*.md`. Read the linked doc before touching that script; don't assume the one-liner here is the whole story.
