@@ -241,6 +241,51 @@ async def _dirty_snapshot(cwd: Path) -> dict:
     return snapshot
 
 
+async def _diff_summary(cwd: Path, before: dict, after: dict) -> str:
+    """Renders the file-level diff between two _dirty_snapshot() results as
+    a display string (git diff --stat for tracked changes + notes for
+    untracked adds/deletes/edits). Pulled out of handle_codex_dispatch's and
+    _codex_chat_turn's success paths (2026-07-29) — both had this exact block
+    duplicated verbatim, and neither used it on a timeout kill, so a forced
+    termination reported only "직접 확인해주세요" with zero information about
+    what had actually changed before the kill. Sharing this lets both the
+    success path AND the timeout path show the same real diff.
+    """
+    # Union of before/after keys, not just after's: a file that was
+    # UNTRACKED in `before` and no longer appears in `after` at all
+    # (deleted) would otherwise be silently invisible. A tracked file
+    # reverted to exactly its committed state has the same shape and
+    # is correctly caught by this same union-based comparison.
+    all_files = set(before) | set(after)
+    changed = sorted(f for f in all_files if before.get(f) != after.get(f))
+
+    def _is_untracked_marker(v) -> bool:
+        return isinstance(v, str) and v.startswith("UNTRACKED:")
+
+    changed_tracked = [
+        f for f in changed
+        if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
+    ]
+    untracked_notes = []
+    for f in changed:
+        if f in changed_tracked:
+            continue
+        if f not in before:
+            untracked_notes.append(f"신규 파일: {f}")
+        elif f not in after:
+            untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
+        else:
+            untracked_notes.append(f"내용 변경(미추적 파일): {f}")
+
+    diff_stat = ""
+    if changed_tracked:
+        diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+    if untracked_notes:
+        notes_block = "\n".join(untracked_notes)
+        diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
+    return diff_stat
+
+
 async def handle_codex_dispatch(message: discord.Message):
     """`!코덱스 <저장소별칭> <작업 지시>` — dispatch a real, write-capable
     Codex run via workflows/lib/codex-execute-dispatch.sh (reused as-is; see
@@ -332,7 +377,19 @@ async def handle_codex_dispatch(message: discord.Message):
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
                 await _kill_process_group_graceful(proc)
-                await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+                # 2026-07-29 fix: show the partial diff up to the kill point
+                # instead of only "직접 확인해주세요" with zero information —
+                # `before` was already captured above, so this is the same
+                # before/after comparison the success path below does, just
+                # triggered by a forced kill instead of a clean finish.
+                after = await _dirty_snapshot(cwd)
+                diff_stat = await _diff_summary(cwd, before, after)
+                timeout_msg = f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
+                if diff_stat:
+                    timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
+                else:
+                    timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
+                await message.channel.send(timeout_msg[:1900])
                 return
 
             raw = (stdout or b"").decode(errors="replace")
@@ -350,38 +407,7 @@ async def handle_codex_dispatch(message: discord.Message):
 
             # Never trust Codex's own report — confirm with a real before/after diff.
             after = await _dirty_snapshot(cwd)
-            # Union of before/after keys, not just after's: a file that was
-            # UNTRACKED in `before` and no longer appears in `after` at all
-            # (deleted) would otherwise be silently invisible. A tracked file
-            # reverted to exactly its committed state has the same shape and
-            # is correctly caught by this same union-based comparison.
-            all_files = set(before) | set(after)
-            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
-
-            def _is_untracked_marker(v) -> bool:
-                return isinstance(v, str) and v.startswith("UNTRACKED:")
-
-            changed_tracked = [
-                f for f in changed
-                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
-            ]
-            untracked_notes = []
-            for f in changed:
-                if f in changed_tracked:
-                    continue
-                if f not in before:
-                    untracked_notes.append(f"신규 파일: {f}")
-                elif f not in after:
-                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
-                else:
-                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
-
-            diff_stat = ""
-            if changed_tracked:
-                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-            if untracked_notes:
-                notes_block = "\n".join(untracked_notes)
-                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
+            diff_stat = await _diff_summary(cwd, before, after)
 
             lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
             if diff_stat:
@@ -647,7 +673,19 @@ async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> N
                 # broken resume just fails the same way forever without this
                 # hint.
                 reset_hint = _codex_chat_reset_hint(alias, existing_thread_id)
-                await message.channel.send(f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.{reset_hint}")
+                # 2026-07-29 fix: show the partial diff up to the kill point
+                # instead of only "직접 확인해주세요" with zero information —
+                # `before` was already captured above, same as !코덱스's
+                # handle_codex_dispatch (which got this same fix).
+                after = await _dirty_snapshot(cwd)
+                diff_stat = await _diff_summary(cwd, before, after)
+                timeout_msg = f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다."
+                if diff_stat:
+                    timeout_msg += f" 강제종료 직전까지 실제 변경된 파일(중간에 끊긴 상태일 수 있음):\n```\n{diff_stat}\n```"
+                else:
+                    timeout_msg += f" 강제종료 시점까지 감지된 파일 변경은 없습니다 — {alias} 저장소를 직접 확인해주세요."
+                timeout_msg += reset_hint
+                await message.channel.send(timeout_msg[:1900])
                 return
 
             raw = (stdout or b"").decode(errors="replace")
@@ -666,33 +704,7 @@ async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> N
             # Never trust Codex's own conversational reply as proof of what
             # changed — same before/after diff verification as !코덱스.
             after = await _dirty_snapshot(cwd)
-            all_files = set(before) | set(after)
-            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
-
-            def _is_untracked_marker(v) -> bool:
-                return isinstance(v, str) and v.startswith("UNTRACKED:")
-
-            changed_tracked = [
-                f for f in changed
-                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
-            ]
-            untracked_notes = []
-            for f in changed:
-                if f in changed_tracked:
-                    continue
-                if f not in before:
-                    untracked_notes.append(f"신규 파일: {f}")
-                elif f not in after:
-                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
-                else:
-                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
-
-            diff_stat = ""
-            if changed_tracked:
-                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-            if untracked_notes:
-                notes_block = "\n".join(untracked_notes)
-                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
+            diff_stat = await _diff_summary(cwd, before, after)
 
             lines = [reply_text or "(응답 없음)"]
             if diff_stat:

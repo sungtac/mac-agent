@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Discord bot — Phase 1 (on-demand automation triggers) + Phase 2 v1
 (reply-triggered retry for weekly-report.sh) + Phase 2.5 (reply-triggered
-retry for work-log-stop-check.sh; see handle_pending_reply).
+retry for work-log-stop-check.sh AND verify-task-v2.js's needs_clarification/
+needsUserDecision escalations — see handle_pending_reply,
+handle_verify_task_v2_retry, handle_verify_task_v2_decision_retry) + Phase 3
+(free-form chat relay to `claude -p`, own session continuity via `--resume`
+— see handle_free_chat and FREE_CHAT_* below).
 Runs as a persistent process under launchd (KeepAlive) since it holds a
 Gateway WebSocket connection — this is NOT a periodic cron job like
 weekly-report.sh.
@@ -15,14 +19,16 @@ messages) is ignored — this is the whole trust boundary, since the channel
 is invite-only and everyone in it is treated as fully trusted (the user's
 own explicit decision, not a default to weaken later without re-deciding).
 Reply-triggered retries inherit this same boundary (checked before dispatch).
+Phase 3 free chat additionally gates on FREE_CHAT_USER_ID (channel trust
+alone isn't enough for unrestricted full-tool-access `claude -p` relay).
 
-Phase 1 scope: two deterministic commands only. No free-form chat relay to
-`claude -p` (that's still unimplemented, "Phase 3") — a bare "!command"
-prefix keeps the surface small and auditable. Phase 2 v1 (weekly-report.sh)
-and Phase 2.5 (work-log-stop-check.sh) both handle retries; verify-task-v2
-clarification retry remains unimplemented (see docs/discord-bot.md) since it
-needs a resume mechanism that doesn't exist yet, unlike the other two which
-are just re-running a self-contained script.
+Fixed 2026-07-29: this docstring previously claimed both "no free-form chat
+relay (Phase 3 unimplemented)" and "verify-task-v2 clarification retry
+remains unimplemented" — both were stale by the time they were read; the
+code they described (FREE_CHAT_*, handle_verify_task_v2_retry) was already
+built and working. See handle_verify_task_v2_retry's own docstring for how
+that retry actually works without a resume/checkpoint mechanism (re-invokes
+the whole workflow from scratch with the reply appended to the task text).
 
 Codex-related commands (`!코덱스`, `!코덱스대화`, `!코덱스대화초기화`) lived
 here through 2026-07-29, then moved to their own process, `bin/codex-bot.py`
