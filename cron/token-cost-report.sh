@@ -26,20 +26,42 @@ LOGFILE="$STATE_DIR/${TODAY}.log"
 OUT_DIR="$OUT_ROOT/${TODAY}"
 mkdir -p "$OUT_DIR"
 
-# Same repo set as discord-bot.py's CODEX_REPO_ALIASES (!코덱스 command) —
-# the set of repos already established as the ones worth tracking. Add a
-# line here (after confirming with the user) to track another repo.
-REPOS=(
-  "mac-agent:$HOME/mac-agent"
-  "hwpx-skill:$HOME/document-writing-project/hwpx-skill"
-  "pptx-skill:$HOME/document-writing-project/pptx-skill"
-)
+# ANALYZE_SCRIPT가 존재하지 않으면(잘못된 배포, skill-catalog 재설치 실패 등) 아래
+# 루프의 `python3 "$ANALYZE_SCRIPT" ...`가 실행될 때 인터프리터 자체의 "파일을 열 수
+# 없음" exit code가 2 — 이게 analyze_sessions.py가 의도적으로 쓰는 "세션 없음(정상
+# 스킵)" exit code 2와 정확히 겹친다(2026-07-29 N5 검증 중 실측 확인). 아래 루프에
+# 맡겨두면 스크립트 자체가 사라진 진짜 장애가 "오늘은 세션 없네" 취급으로 조용히
+# 묻혀서 디스코드 알림이 영영 안 온다 — 그래서 루프 진입 전에 파일 존재만 별도로,
+# 먼저 확인한다.
+if [ ! -f "$ANALYZE_SCRIPT" ]; then
+  echo "--- run $(date) ---" >> "$LOGFILE"
+  echo "치명적 오류: analyze_sessions.py를 찾을 수 없음 (${ANALYZE_SCRIPT})" >> "$LOGFILE"
+  bash "$HOME/mac-agent/bin/discord-notify.sh" "🚨 토큰비용 일일 리포트 전체 실패 — analyze_sessions.py 스크립트가 없음 (${ANALYZE_SCRIPT}). skill-catalog 재설치가 필요할 수 있습니다." || true
+  exit 1
+fi
+
+# Repo set now lives in one place: config/tracked-repos.json (2026-07-29 —
+# was a hardcoded array here that duplicated discord-bot.py's
+# CODEX_REPO_ALIASES, a real drift risk since that file is edited elsewhere
+# concurrently). discord-bot.py itself doesn't read this yet (deliberately
+# out of scope this round — it's mid-edit elsewhere); this script is the
+# first reader. Add a repo by editing the JSON (after confirming with the
+# user), not by editing this script.
+REPOS_JSON="$HOME/mac-agent/config/tracked-repos.json"
+REPOS_LIST="$(python3 -c "
+import json, os, sys
+with open(sys.argv[1], encoding='utf-8') as f:
+    data = json.load(f)
+for name, path in data.items():
+    if name.startswith('_'):
+        continue
+    print(f'{name}\t{os.path.expandvars(path)}')
+" "$REPOS_JSON")"
 
 echo "--- run $(date) ---" >> "$LOGFILE"
 FAILED_REPOS=()
-for entry in "${REPOS[@]}"; do
-  name="${entry%%:*}"
-  path="${entry#*:}"
+while IFS=$'\t' read -r name path; do
+  [ -z "$name" ] && continue
   if [ ! -d "$path" ]; then
     echo "skip ${name}: 경로 없음 (${path})" >> "$LOGFILE"
     continue
@@ -54,7 +76,7 @@ for entry in "${REPOS[@]}"; do
     echo "${name}: 실패 (exit=${code})" >> "$LOGFILE"
     FAILED_REPOS+=("$name")
   fi
-done
+done <<< "$REPOS_LIST"
 
 if [ "${#FAILED_REPOS[@]}" -gt 0 ]; then
   FAILED_STR="$(IFS=', '; echo "${FAILED_REPOS[*]}")"
