@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Codex-dedicated Discord bot (2026-07-29) — split out of discord-bot.py
+(the "맥" bot) at the user's explicit request so Codex-related commands live
+under their own bot identity, separate from Claude-side commands
+(주간보고서/상태/자유채팅), which stay on discord-bot.py.
+
+Runs as its own persistent process under launchd (KeepAlive), same shape as
+discord-bot.py — holds its own Discord Gateway WebSocket connection with its
+own bot token. Shares discord_bot_common.py (SUBPROCESS_ENV, usage_gate_check,
+_kill_process_group_graceful) with discord-bot.py rather than duplicating
+those, so a fix to either lands for both bots.
+
+Config: ~/.claude/discord-bot/codex-bot-config.json —
+{"token": "...", "channel_id": "...", "free_chat_user_id": "..."}
+Deliberately a SEPARATE file from discord-bot.py's config.json (own token,
+independently rotatable) even though channel_id/free_chat_user_id are
+expected to hold the same values in practice (same channel, same authorized
+person) — duplicated on purpose so each bot script stays fully
+self-contained and independently runnable, matching discord-bot.py's own
+single-file-per-bot convention. Not committed to this (public) repo.
+
+Commands (moved here verbatim from discord-bot.py, both restricted to
+FREE_CHAT_USER_ID — this is real workspace-write access, not read-only chat):
+- `!코덱스 <repo-alias> <task>` — one-shot dispatch, see handle_codex_dispatch.
+- `!코덱스대화 <repo-alias> <message>` — ongoing ChatGPT/`codex` CLI-style
+  conversation via Codex's native `exec resume`, see handle_codex_chat.
+- `!코덱스대화초기화 <repo-alias>` — reset that alias's conversation.
+"""
+import asyncio
+import datetime
+import hashlib
+import json
+import sys
+import tempfile
+from pathlib import Path
+
+import discord
+
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful
+
+CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
+CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
+CODEX_BIN = Path("/opt/homebrew/bin/codex")  # absolute, not bare `codex` — same PATH-under-launchd gotcha as every other subprocess binary in this repo
+
+# !코덱스 target allowlist — never let a Discord message pick an arbitrary
+# absolute path for `codex exec -s workspace-write`, which really writes
+# files. Add a line here (after confirming with the user) to expose another
+# repo; do not accept a free-typed path from the message itself.
+CODEX_REPO_ALIASES = {
+    "mac-agent": MAC_AGENT,
+    "hwpx-skill": Path.home() / "document-writing-project" / "hwpx-skill",
+    "pptx-skill": Path.home() / "document-writing-project" / "pptx-skill",
+}
+CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a report generation
+
+# Concurrency guard: two overlapping `!코덱스`/`!코덱스대화` runs against the
+# SAME repo would both get workspace-write access at once, and
+# _dirty_snapshot()'s own before/after diff already admits it can't fully
+# attribute changes made by another process editing DURING its window — this
+# bot itself could be that other process. Keyed per resolved cwd (not the
+# alias string, not one global lock) since two DIFFERENT repos genuinely
+# don't share any state and running them concurrently is fine. Shared between
+# handle_codex_dispatch and handle_codex_chat/handle_codex_chat_reset so a
+# one-shot dispatch and a chat turn against the same repo can't race either.
+CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def load_config():
+    if not CONFIG_PATH.exists():
+        print(f"FATAL: config not found at {CONFIG_PATH}", file=sys.stderr)
+        sys.exit(1)
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text())
+    except Exception as e:
+        print(f"FATAL: config at {CONFIG_PATH} is not valid JSON: {e}", file=sys.stderr)
+        sys.exit(1)
+    if not cfg.get("token") or not cfg.get("channel_id"):
+        print(f"FATAL: config at {CONFIG_PATH} missing token or channel_id", file=sys.stderr)
+        sys.exit(1)
+    return cfg
+
+
+CONFIG = load_config()
+AUTHORIZED_CHANNEL_ID = str(CONFIG["channel_id"])
+# Channel trust alone is not enough for commands that let a channel member
+# cause arbitrary code execution (workspace-write) — same posture as
+# discord-bot.py's !코덱스. Empty/missing = fail closed (nobody passes).
+FREE_CHAT_USER_ID = str(CONFIG.get("free_chat_user_id") or "")
+
+intents = discord.Intents.default()
+intents.message_content = True
+client = discord.Client(intents=intents)
+
+
+async def _git_output(cwd: Path, *args: str) -> str:
+    proc = await asyncio.create_subprocess_exec(
+        "/usr/bin/git", "-C", str(cwd), *args,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    out, _ = await proc.communicate()
+    return out.decode(errors="replace").strip()
+
+
+def _hash_file_content(path: Path) -> str:
+    """Sync on purpose — callers must `await asyncio.to_thread(...)` this: it
+    runs inside `_dirty_snapshot`, an async function with no `await` around
+    the hashing itself, so a large untracked file (e.g. a stray big binary)
+    would block the bot's entire event loop — no other message gets
+    processed until the hash finishes. Kept sync + plain here so it stays
+    trivially testable; the thread offload lives at the call site instead.
+    """
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except Exception:
+        # Unreadable (permissions, vanished between listing and reading,
+        # etc.) — a fixed marker still lets before/after comparison detect
+        # a CHANGE (unreadable -> readable or vice versa), just not what
+        # changed. Never raise out of a snapshot helper.
+        return "UNREADABLE"
+
+
+# Cap for the untracked-directory walk below: a repo where a heavy directory
+# (build output, a dependency tree) was left untracked with no .gitignore
+# entry would otherwise get every one of its files read + hashed on every
+# single dispatch/chat turn. None of today's CODEX_REPO_ALIASES currently has
+# an untracked directory at all (checked live), so this is a latent risk
+# rather than an observed one — the cap exists so a future misconfigured
+# repo degrades to a cheap approximation instead of an unbounded full-content
+# hash of everything inside.
+UNTRACKED_DIR_HASH_FILE_CAP = 2000
+
+
+def _list_files_under(dir_path: Path) -> list:
+    """Sync — same to_thread-at-call-site rule as _hash_file_content; walking
+    a directory tree is real (if usually fast) filesystem I/O and belongs off
+    the event loop for the same reason hashing does."""
+    return sorted(p for p in dir_path.rglob("*") if p.is_file())
+
+
+def _stat_signature(cwd: Path, files: list) -> str:
+    """Cheap stand-in for per-file content hashing when an untracked
+    directory has more than UNTRACKED_DIR_HASH_FILE_CAP files: aggregates
+    (relative path, size, mtime) instead of reading every file's actual
+    bytes. Still catches adds/removes/renames and almost all real edits (a
+    changed file's mtime moves), just not a content edit that somehow
+    preserves both size and mtime — an acceptable trade for not doing
+    unbounded I/O on every dispatch against a repo with one huge untracked
+    directory."""
+    agg = hashlib.sha256()
+    for sub in files:
+        try:
+            st = sub.stat()
+            agg.update(f"{sub.relative_to(cwd).as_posix()}:{st.st_size}:{st.st_mtime_ns}\n".encode())
+        except OSError:
+            agg.update(b"STATERR\n")
+    return agg.hexdigest()
+
+
+async def _dirty_snapshot(cwd: Path) -> dict:
+    """filename -> its current unified-diff text for a tracked change, or
+    "UNTRACKED:<sha256 of file content>" for an untracked file, for every
+    file the working tree currently shows as changed OR that exists
+    untracked. Used to compute a before/after delta around a Codex run
+    instead of trusting a single post-run `git diff --stat` — a repo can
+    have other uncommitted work in flight (another terminal, a concurrent
+    session) that has nothing to do with this specific dispatch, and a bare
+    post-run diff cannot tell the two apart.
+
+    Untracked entries carry a content hash, not a bare "UNTRACKED" marker: a
+    flat marker only tells you a path IS untracked, not what's in it, which
+    would hide (1) Codex modifying the CONTENT of an already-untracked file
+    without `git add`ing it, and (2) Codex DELETING a previously-untracked
+    file (it vanishes from both `git diff` and `git status --porcelain`
+    entirely). Hashing the actual bytes makes both cases produce a real
+    before/after difference like any tracked change would.
+    """
+    diff_text = await _git_output(cwd, "diff", "--")
+    status_text = await _git_output(cwd, "status", "--porcelain")
+    snapshot: dict = {}
+    current_file = None
+    buf: list = []
+    for line in diff_text.splitlines():
+        if line.startswith("diff --git "):
+            if current_file is not None:
+                snapshot[current_file] = "\n".join(buf)
+            current_file = line.rsplit(" b/", 1)[-1]
+            buf = [line]
+        else:
+            buf.append(line)
+    if current_file is not None:
+        snapshot[current_file] = "\n".join(buf)
+    for line in status_text.splitlines():
+        if line.startswith("?? "):
+            path = line[3:]
+            full = cwd / path
+            if path.endswith("/"):
+                # git collapses an entirely-untracked directory into a single
+                # "?? dir/" line rather than listing its files individually —
+                # _hash_file_content(full) would call read_bytes() on a
+                # directory, hit IsADirectoryError, and fall back to the
+                # fixed "UNREADABLE" marker every time, so before/after both
+                # said "UNTRACKED:UNREADABLE" regardless of what changed
+                # inside. Walk it and hash each file individually, keyed by
+                # its path relative to cwd — same shape as a top-level
+                # untracked file, so the generic changed/changed_tracked/
+                # untracked_notes logic below needs no changes to pick these
+                # up per-file. Above UNTRACKED_DIR_HASH_FILE_CAP files, fall
+                # back to one cheap aggregate stat-based signature instead
+                # (see that constant's comment) — the "UNTRACKED:" prefix is
+                # kept so _is_untracked_marker() below still recognizes it.
+                sub_files = await asyncio.to_thread(_list_files_under, full)
+                if len(sub_files) > UNTRACKED_DIR_HASH_FILE_CAP:
+                    sig = await asyncio.to_thread(_stat_signature, cwd, sub_files)
+                    snapshot[path] = f"UNTRACKED:dircap({len(sub_files)}):{sig}"
+                else:
+                    for sub in sub_files:
+                        rel = sub.relative_to(cwd).as_posix()
+                        snapshot[rel] = f"UNTRACKED:{await asyncio.to_thread(_hash_file_content, sub)}"
+            else:
+                snapshot[path] = f"UNTRACKED:{await asyncio.to_thread(_hash_file_content, full)}"
+    return snapshot
+
+
+async def handle_codex_dispatch(message: discord.Message):
+    """`!코덱스 <저장소별칭> <작업 지시>` — dispatch a real, write-capable
+    Codex run via workflows/lib/codex-execute-dispatch.sh (reused as-is; see
+    that script's own header for why it's the write-capable sibling of
+    score-dispatch.sh). Restricted to CODEX_REPO_ALIASES (never accept a
+    free-typed path — workspace-write really writes files) and to
+    FREE_CHAT_USER_ID (channel trust alone is not enough for this).
+
+    Per codex-execute-dispatch.sh's own documented design, Codex's self-report
+    is never trusted as a verification signal — this function independently
+    diffs the repo and reports THAT, not just Codex's claim, and calls out
+    the mismatch explicitly if Codex claims success but nothing actually
+    changed. Never commits/pushes — that stays a separate, explicit,
+    human-reviewed step.
+
+    Takes a `_dirty_snapshot()` before AND after the run and reports only the
+    files that differ between the two snapshots — NOT a plain post-run
+    `git diff --stat`, since another process editing the same working tree
+    concurrently would otherwise get misattributed to this run.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        await message.channel.send("이 명령어는 본인만 사용 가능합니다.")
+        return
+
+    parts = message.content.strip().split(maxsplit=2)
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    if len(parts) < 3:
+        await message.channel.send(f"사용법: `!코덱스 <저장소별칭> <작업 지시>`\n사용 가능한 별칭: {aliases}")
+        return
+
+    _, alias, task = parts
+    cwd = CODEX_REPO_ALIASES.get(alias)
+    if cwd is None:
+        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    # Keyed by resolved path, not the alias string: CODEX_REPO_ALIASES has no
+    # distinct-paths invariant enforced anywhere — if two aliases ever
+    # pointed at the same actual directory, locking per-alias-name would let
+    # runs against them race each other. Resolving symlinks/`..` first means
+    # two aliases for the same real repo always collide on the same lock
+    # object regardless of which name was used to reach it.
+    lock_key = str(cwd.resolve())
+    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
+    if lock.locked():
+        await message.channel.send(f"`{alias}`에 대한 다른 `!코덱스` 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
+        return
+
+    async with lock:
+        # No pending-job/requeue here — !코덱스 is a one-shot manual command,
+        # not a reply-triggered retry chain, so there's nothing to requeue:
+        # the user just re-sends !코덱스 later.
+        skip_reason = await usage_gate_check("codex")
+        if skip_reason:
+            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
+            return
+
+        # `before` inside the try (not before it): an exception here (e.g. a
+        # git subprocess failure) must not propagate out of this handler
+        # uncaught — on_message has no wrapping try/except of its own, so the
+        # user would get total silence, not even the "코덱스에게
+        # 지시했습니다" starting message, let alone an error.
+        prompt_file = None
+        try:
+            before = await _dirty_snapshot(cwd)
+            dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
+
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
+                f.write(task)
+                prompt_file = Path(f.name)
+
+            await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
+
+            # start_new_session=True + _kill_process_group_graceful():
+            # codex-execute-dispatch.sh runs the real `codex exec` as
+            # `RAW_OUTPUT="$(codex exec ...)"` — a command substitution, so
+            # codex is a CHILD of this bash process, not the process itself.
+            # A plain proc.kill() here only kills the bash wrapper, leaving
+            # the actual codex process (full workspace-write access) running
+            # undetected in the background.
+            proc = await asyncio.create_subprocess_exec(
+                "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
+                env=SUBPROCESS_ENV,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await _kill_process_group_graceful(proc)
+                await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+                return
+
+            raw = (stdout or b"").decode(errors="replace")
+            try:
+                result = json.loads(raw)
+                ok = bool(result.get("ok"))
+                # tail, not head: codex-execute-dispatch.sh already returns
+                # its message tail-truncated so it ends at Codex's actual
+                # failure reason — cutting the FIRST 1000 chars here instead
+                # would re-discard the ending it just preserved.
+                codex_message = str(result.get("message", ""))[-1000:]
+            except Exception:
+                ok = False
+                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[-1000:]}"
+
+            # Never trust Codex's own report — confirm with a real before/after diff.
+            after = await _dirty_snapshot(cwd)
+            # Union of before/after keys, not just after's: a file that was
+            # UNTRACKED in `before` and no longer appears in `after` at all
+            # (deleted) would otherwise be silently invisible. A tracked file
+            # reverted to exactly its committed state has the same shape and
+            # is correctly caught by this same union-based comparison.
+            all_files = set(before) | set(after)
+            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
+
+            def _is_untracked_marker(v) -> bool:
+                return isinstance(v, str) and v.startswith("UNTRACKED:")
+
+            changed_tracked = [
+                f for f in changed
+                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
+            ]
+            untracked_notes = []
+            for f in changed:
+                if f in changed_tracked:
+                    continue
+                if f not in before:
+                    untracked_notes.append(f"신규 파일: {f}")
+                elif f not in after:
+                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
+                else:
+                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
+
+            diff_stat = ""
+            if changed_tracked:
+                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+            if untracked_notes:
+                notes_block = "\n".join(untracked_notes)
+                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
+
+            lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
+            if diff_stat:
+                lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
+            elif ok:
+                lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
+            else:
+                lines.append("실제 파일 변경 없음.")
+            lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
+            lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
+            await message.channel.send("\n".join(lines)[:1900])
+        except Exception as e:
+            await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
+        finally:
+            if prompt_file is not None:
+                prompt_file.unlink(missing_ok=True)
+
+
+# `!코덱스대화` — a ChatGPT/`codex` CLI-style ongoing conversation, distinct
+# from !코덱스's one-shot "dispatch one task, report, done". Codex itself
+# supports this natively — `codex exec --json` prints a
+# `{"type":"thread.started","thread_id":...}` event as its first line, and
+# `codex exec resume <thread_id> --json <prompt>` continues that same
+# conversation (verified live: a fact given in one message was correctly
+# recalled in the next). Session state is kept PER ALIAS (not one global
+# session) since a Codex thread is tied to the cwd it started in — switching
+# aliases mid-conversation should start a distinct thread for that other
+# repo, not try to resume one rooted somewhere else.
+CODEX_CHAT_SESSION_DIR = Path.home() / ".claude" / "discord-bot" / "codex-chat-sessions"
+CODEX_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스 — a chat turn can still be a real coding task
+
+
+def _codex_chat_session_path(alias: str) -> Path:
+    return CODEX_CHAT_SESSION_DIR / f"{alias}.json"
+
+
+def _load_codex_chat_thread_id(alias: str) -> str | None:
+    try:
+        return json.loads(_codex_chat_session_path(alias).read_text()).get("thread_id")
+    except Exception:
+        return None
+
+
+def _save_codex_chat_thread_id(alias: str, thread_id: str) -> None:
+    CODEX_CHAT_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+    _codex_chat_session_path(alias).write_text(json.dumps({
+        "thread_id": thread_id,
+        "last_used_at": datetime.datetime.now().isoformat(),
+    }))
+
+
+def _parse_codex_json_events(raw: str) -> tuple[str | None, str]:
+    """Parse `codex exec --json`/`codex exec resume --json` stdout (one JSON
+    object per line) into (thread_id, reply_text).
+
+    reply_text joins EVERY `item.completed` event with `item.type ==
+    "agent_message"` in order, not just the last one — confirmed live that a
+    single turn with a file write emits an intro agent_message ("파일을
+    만들겠습니다"), then a `file_change` item, then a closing agent_message
+    ("만들었습니다") — taking only the last would silently drop the intro.
+    thread_id comes from the `thread.started` event, present on both a fresh
+    run and a resumed one (confirmed live) with the SAME id on resume, so the
+    caller can always just re-save whatever id this returns.
+
+    Malformed/non-JSON lines are skipped rather than raising — `codex exec`
+    can print a "Reading additional input from stdin..." notice before the
+    JSON stream starts (observed live), and a caller here must never crash a
+    chat turn just because output had a stray non-JSON line.
+    """
+    thread_id = None
+    texts = []
+    for line in raw.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        etype = event.get("type")
+        if etype == "thread.started":
+            thread_id = event.get("thread_id")
+        elif etype == "item.completed":
+            item = event.get("item") or {}
+            if item.get("type") == "agent_message" and item.get("text"):
+                texts.append(item["text"])
+    return thread_id, "\n\n".join(texts)
+
+
+async def handle_codex_chat_reset(message: discord.Message):
+    """!코덱스대화초기화 <저장소별칭> — deletes that alias's saved thread id
+    so the next !코덱스대화 for it starts a brand-new Codex conversation,
+    same shape as discord-bot.py's handle_free_chat_reset (!새대화)."""
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        await message.channel.send("이 명령어는 본인만 사용 가능합니다.")
+        return
+
+    parts = message.content.strip().split(maxsplit=1)
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    if len(parts) < 2:
+        await message.channel.send(f"사용법: `!코덱스대화초기화 <저장소별칭>`\n사용 가능한 별칭: {aliases}")
+        return
+
+    alias = parts[1].strip()
+    if alias not in CODEX_REPO_ALIASES:
+        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    # Block while a turn for this alias is in flight, so that turn's own
+    # eventual _save_codex_chat_thread_id() call can't land after this
+    # delete and silently undo the reset.
+    lock_key = str(CODEX_REPO_ALIASES[alias].resolve())
+    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
+    if lock.locked():
+        await message.channel.send(f"`{alias}`에 대한 실행이 진행 중이라 초기화할 수 없습니다 — 끝난 뒤 다시 시도해주세요.")
+        return
+
+    _codex_chat_session_path(alias).unlink(missing_ok=True)
+    await message.channel.send(f"`{alias}` 코덱스 대화를 초기화했습니다 — 다음 메시지부터 새 대화로 시작합니다.")
+
+
+async def handle_codex_chat(message: discord.Message):
+    """`!코덱스대화 <저장소별칭> <메시지>` — an ongoing, write-capable Codex
+    conversation (ChatGPT/`codex` CLI style), distinct from !코덱스's
+    one-shot "dispatch one task, report, done". See the module comment above
+    _parse_codex_json_events for how Codex's own native thread resume makes
+    this possible. Restricted to CODEX_REPO_ALIASES and FREE_CHAT_USER_ID —
+    same trust boundary as !코덱스, since this is real workspace-write
+    access, not a read-only chat.
+
+    Parses `<저장소별칭> <메시지>` and delegates to _codex_chat_turn — kept
+    separate from handle_codex_chat_wake (2026-07-29) so the two entry
+    points (explicit command vs. natural wake-word chat, see that function)
+    share the exact same execution path and can't silently drift.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        await message.channel.send("이 명령어는 본인만 사용 가능합니다.")
+        return
+
+    parts = message.content.strip().split(maxsplit=2)
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    if len(parts) < 3:
+        await message.channel.send(f"사용법: `!코덱스대화 <저장소별칭> <메시지>`\n사용 가능한 별칭: {aliases}")
+        return
+
+    _, alias, text = parts
+    await _codex_chat_turn(message, alias, text)
+
+
+CODEX_CHAT_DEFAULT_ALIAS = "mac-agent"  # natural chat has no room to specify an alias each turn; use !코덱스대화 <다른 별칭> explicitly to target hwpx-skill/pptx-skill instead
+
+
+async def handle_codex_chat_wake(message: discord.Message):
+    """Natural, prefix-less chat: any message starting with a
+    CODEX_CHAT_WAKE_WORDS token (e.g. "코덱스야 ...", "콕스 ...") is treated
+    as a !코덱스대화 turn against CODEX_CHAT_DEFAULT_ALIAS, no command syntax
+    required (2026-07-29, user's explicit request — "ChatGPT처럼" addressing
+    Codex by name in ongoing chat rather than typing `!코덱스대화 <alias>`
+    every time). The FULL original message (including the wake word itself,
+    e.g. "코덱스야, 마크다운 파일 하나 만들어줘") is sent to Codex as-is —
+    Codex is a language model, not a parser, so there's no need to strip the
+    vocative prefix out first.
+
+    discord-bot.py's own free-chat catch-all excludes messages starting with
+    these same wake words (see its on_message) so only one of the two bots
+    answers a given wake-worded message, not both.
+    """
+    if str(message.author.id) != FREE_CHAT_USER_ID:
+        return  # silently ignore — same posture as discord-bot.py's free-chat fallthrough for anyone else in the channel
+    text = message.content.strip()
+    if not text:
+        return
+    await _codex_chat_turn(message, CODEX_CHAT_DEFAULT_ALIAS, text)
+
+
+async def _codex_chat_turn(message: discord.Message, alias: str, text: str) -> None:
+    """Shared body for both handle_codex_chat (explicit `!코덱스대화 <별칭>`)
+    and handle_codex_chat_wake (natural "코덱스야 ..." chat) — everything
+    from alias validation through Codex execution and diff reporting is
+    identical between the two entry points; only how (alias, text) got
+    determined differs.
+
+    Shares CODEX_DISPATCH_LOCKS with handle_codex_dispatch, keyed the same
+    way (resolved cwd) — a !코덱스 one-shot and a chat turn against the SAME
+    repo must never run concurrently. Also reuses _dirty_snapshot
+    before/after verification and _kill_process_group_graceful for timeouts —
+    Codex's own self-report is never trusted here either.
+
+    No -s/-C on resume (verified live): `codex exec resume` doesn't accept
+    either flag — a resumed thread keeps the sandbox/cwd it was created with,
+    so those only get passed on the FIRST turn of a new thread.
+    """
+    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
+    cwd = CODEX_REPO_ALIASES.get(alias)
+    if cwd is None:
+        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
+        return
+
+    lock_key = str(cwd.resolve())
+    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
+    if lock.locked():
+        await message.channel.send(f"`{alias}`에 대한 다른 코덱스 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
+        return
+
+    async with lock:
+        skip_reason = await usage_gate_check("codex")
+        if skip_reason:
+            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 다시 시도해주세요.")
+            return
+
+        try:
+            before = await _dirty_snapshot(cwd)
+            dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 턴만 골라 보여드릴게요." if before else ""
+
+            existing_thread_id = _load_codex_chat_thread_id(alias)
+            if existing_thread_id:
+                args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", text]
+            else:
+                args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), text]
+                await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
+
+            proc = await asyncio.create_subprocess_exec(
+                *args, env=SUBPROCESS_ENV,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_CHAT_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await _kill_process_group_graceful(proc)
+                await message.channel.send(f"⚠️ 응답이 {CODEX_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
+                return
+
+            raw = (stdout or b"").decode(errors="replace")
+            thread_id, reply_text = _parse_codex_json_events(raw)
+
+            if proc.returncode != 0 or thread_id is None:
+                await message.channel.send(f"❌ 코덱스 실행 실패 (exit={proc.returncode}).\n```\n{raw[-1500:]}\n```"[:1900])
+                return
+
+            # Only persist AFTER a successful run: an id from a run that
+            # failed to even start properly shouldn't become what the next
+            # message tries to resume.
+            _save_codex_chat_thread_id(alias, thread_id)
+
+            # Never trust Codex's own conversational reply as proof of what
+            # changed — same before/after diff verification as !코덱스.
+            after = await _dirty_snapshot(cwd)
+            all_files = set(before) | set(after)
+            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
+
+            def _is_untracked_marker(v) -> bool:
+                return isinstance(v, str) and v.startswith("UNTRACKED:")
+
+            changed_tracked = [
+                f for f in changed
+                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
+            ]
+            untracked_notes = []
+            for f in changed:
+                if f in changed_tracked:
+                    continue
+                if f not in before:
+                    untracked_notes.append(f"신규 파일: {f}")
+                elif f not in after:
+                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
+                else:
+                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
+
+            diff_stat = ""
+            if changed_tracked:
+                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+            if untracked_notes:
+                notes_block = "\n".join(untracked_notes)
+                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
+
+            lines = [reply_text or "(응답 없음)"]
+            if diff_stat:
+                lines.append(f"\n변경된 파일:\n```\n{diff_stat}\n```")
+            await message.channel.send("\n".join(lines)[:1900])
+        except Exception as e:
+            await message.channel.send(f"❌ 코덱스대화 실행 중 예외: {e}")
+
+
+@client.event
+async def on_ready():
+    print(f"logged in as {client.user} (id={client.user.id})")
+
+
+@client.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if str(message.channel.id) != AUTHORIZED_CHANNEL_ID:
+        return
+
+    content = message.content.strip()
+    # "!코덱스대화초기화" must be checked before the plainer
+    # "!코덱스대화"/"!코덱스" prefixes below — all three share the "!코덱스"
+    # prefix, and Python's elif chain takes the first match, so ordering here
+    # is load-bearing (same gotcha discord-bot.py hit when this same routing
+    # first shipped there).
+    if content.startswith("!코덱스대화초기화"):
+        await handle_codex_chat_reset(message)
+    elif content.startswith("!코덱스대화"):
+        await handle_codex_chat(message)
+    elif content.startswith("!코덱스"):
+        await handle_codex_dispatch(message)
+    elif content.startswith(CODEX_CHAT_WAKE_WORDS):
+        await handle_codex_chat_wake(message)
+
+
+if __name__ == "__main__":
+    client.run(CONFIG["token"])

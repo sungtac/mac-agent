@@ -24,57 +24,33 @@ clarification retry remains unimplemented (see docs/discord-bot.md) since it
 needs a resume mechanism that doesn't exist yet, unlike the other two which
 are just re-running a self-contained script.
 
-`!코덱스 <repo-alias> <task>` (2026-07-28): dispatches a real, write-capable
-Codex run via workflows/lib/codex-execute-dispatch.sh, restricted to
-CODEX_REPO_ALIASES and gated by FREE_CHAT_USER_ID — this is NOT covered by
-the channel-wide trust boundary above (see handle_codex_dispatch).
+Codex-related commands (`!코덱스`, `!코덱스대화`, `!코덱스대화초기화`) lived
+here through 2026-07-29, then moved to their own process, `bin/codex-bot.py`
+— a separate bot identity/token, per the user's explicit request, so Codex
+commands aren't answered by the same bot as Claude-side commands. This file
+and codex-bot.py share `discord_bot_common.py` (SUBPROCESS_ENV,
+usage_gate_check, _kill_process_group) rather than duplicating those.
 """
 import asyncio
 import datetime
-import hashlib
 import json
-import os
-import signal
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 
 import discord
 
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group
+
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
-CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
 VERIFY_TASK_V2_JS = MAC_AGENT / "workflows" / "verify-task-v2.js"
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
-VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # full-track verify-task-v2 round-trips codex/antigravity several times, same budget as !코덱스
+VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # full-track verify-task-v2 round-trips codex/antigravity several times
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
 WORK_LOG_DISPATCHED_MARKER_DIR = STATE_DIR / "work-log"
-
-# !코덱스 target allowlist — never let a Discord message pick an arbitrary
-# absolute path for `codex exec -s workspace-write`, which really writes
-# files. Add a line here (after confirming with the user) to expose another
-# repo; do not accept a free-typed path from the message itself.
-CODEX_REPO_ALIASES = {
-    "mac-agent": MAC_AGENT,
-    "hwpx-skill": Path.home() / "document-writing-project" / "hwpx-skill",
-    "pptx-skill": Path.home() / "document-writing-project" / "pptx-skill",
-}
-CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a report generation
-
-# Concurrency guard (2026-07-29, same bug class as FREE_CHAT_LOCK, found in
-# the same review pass before either was ever hit live): two overlapping
-# `!코덱스` runs against the SAME repo would both get workspace-write
-# access at once, and _dirty_snapshot()'s own before/after diff already
-# admits it can't fully attribute changes made by another process editing
-# DURING its window — this bot itself could be that other process. Keyed
-# per resolved cwd (not the alias string, not one global lock — see
-# handle_codex_dispatch's lock_key comment for why the alias name isn't
-# used) since two DIFFERENT repos genuinely don't share any state and
-# running them concurrently is fine.
-CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
 
 # Phase 2: pending-job store for reply-triggered retries. Written by scripts
 # that escalate via discord-notify.sh (keyed by that call's returned message
@@ -84,16 +60,6 @@ CODEX_DISPATCH_LOCKS: dict[str, asyncio.Lock] = {}
 # so this store can grow without breaking older/newer bot code.
 PENDING_DIR = Path.home() / ".claude" / "discord-bot" / "pending"
 PENDING_MAX_AGE_HOURS = 48
-
-# Subprocesses we spawn (weekly-report.sh etc.) shell out to codex/agy/claude
-# by absolute path already (fixed 2026-07-26), but git/date/etc still resolve
-# via PATH — launchd's own PATH for this process can be the stripped
-# /usr/bin:/bin:/usr/sbin:/sbin default, so give spawned children a real one
-# explicitly rather than rediscovering this gotcha yet again.
-SUBPROCESS_ENV = {
-    **os.environ,
-    "PATH": f"/opt/homebrew/bin:{Path.home()}/.local/bin:" + os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
-}
 
 WEEKLY_REPORT_TIMEOUT_SECONDS = 20 * 60  # generous margin above the script's own ~13min worst case (3 attempts x 240s + pauses)
 
@@ -495,57 +461,6 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
         await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
 
 
-USAGE_PREFLIGHT_GATE_SH = MAC_AGENT / "workflows" / "lib" / "usage-preflight-gate.sh"
-USAGE_GATE_TIMEOUT_SECONDS = 15  # should return in well under a second normally; bounds a `coach` hang instead of wedging the caller's lock forever
-
-
-async def usage_gate_check(actor: str) -> str | None:
-    """Runs usage-preflight-gate.sh <actor> and returns the human-readable
-    skip reason (SKIP:'s text with that prefix stripped) if usage is too low
-    to safely start, or None if it's fine to proceed.
-
-    Unlike the bash-script call sites (weekly-report.sh, kakao-morning-
-    briefing.sh, work-log-stop-check.sh — see docs/discord-bot.md's "사용량
-    사전 게이트" notes), these three Discord-triggered handlers are already
-    live replies to a real message.channel, so on SKIP they just tell the
-    user directly and return — no pending-job/auto-retry needed here, the
-    user can just re-send the command once usage recovers.
-
-    Fails open (returns None, i.e. "proceed") on any subprocess error OR
-    timeout — a broken gate must not become a new way for these commands to
-    stop working, same posture as every bash call site's
-    `|| echo "PROCEED..."`.
-
-    15s timeout (2026-07-29, found in review before ever hit live): this is
-    called from INSIDE FREE_CHAT_LOCK / CODEX_DISPATCH_LOCKS[resolved cwd]
-    (see those callers), so an unbounded hang here doesn't just delay one
-    message — it permanently wedges that lock, since nothing else in this
-    function can ever un-block it. `coach` (the underlying data source,
-    via usage-preflight-gate.sh) has been observed mid-session to report a
-    query-timeout condition for one of its own provider checks
-    ("조회 시간초과(hang?)"), confirming it can genuinely stall — this
-    script had no timeout of its own to guard against that propagating
-    upward into an unrecoverable lock.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "/bin/bash", str(USAGE_PREFLIGHT_GATE_SH), actor,
-            env=SUBPROCESS_ENV,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        try:
-            out, _ = await asyncio.wait_for(proc.communicate(), timeout=USAGE_GATE_TIMEOUT_SECONDS)
-        except asyncio.TimeoutError:
-            proc.kill()
-            return None
-        text = out.decode(errors="replace").strip()
-    except Exception:
-        return None
-    if text.startswith("SKIP:"):
-        return text[len("SKIP:"):].strip()
-    return None
-
-
 async def send_and_requeue(message: discord.Message, text: str, job_type: str, params: dict) -> None:
     """Send `text` and register a FRESH pending-job (same type/params) keyed
     to the message we just sent, so a reply to it re-triggers the same
@@ -562,271 +477,6 @@ async def send_and_requeue(message: discord.Message, text: str, job_type: str, p
     PENDING_DIR.mkdir(parents=True, exist_ok=True)
     job = {"type": job_type, "created_at": datetime.datetime.now().isoformat(), "params": params}
     (PENDING_DIR / f"{sent.id}.json").write_text(json.dumps(job, ensure_ascii=False))
-
-
-def _kill_process_group(proc) -> None:
-    """`proc.kill()` only SIGKILLs that one direct child — if it spawned its
-    own children (e.g. `claude -p` running a Bash tool call), those become
-    orphans that keep running after "kill" (confirmed: a `sleep 60 & wait`
-    child under a plain `create_subprocess_exec`d bash survived `proc.kill()`
-    with the sleep still alive; the same repro under
-    `start_new_session=True` + `os.killpg` left nothing behind). Requires the
-    process to have been spawned with `start_new_session=True` so it's its
-    own process-group leader — falls back to a plain `proc.kill()` if the
-    group lookup fails (process already gone, or wasn't a group leader).
-    """
-    try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
-        proc.kill()
-
-
-async def _git_output(cwd: Path, *args: str) -> str:
-    proc = await asyncio.create_subprocess_exec(
-        "/usr/bin/git", "-C", str(cwd), *args,
-        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-    )
-    out, _ = await proc.communicate()
-    return out.decode(errors="replace").strip()
-
-
-def _hash_file_content(path: Path) -> str:
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except Exception:
-        # Unreadable (permissions, vanished between listing and reading,
-        # etc.) — a fixed marker still lets before/after comparison detect
-        # a CHANGE (unreadable -> readable or vice versa), just not what
-        # changed. Never raise out of a snapshot helper.
-        return "UNREADABLE"
-
-
-async def _dirty_snapshot(cwd: Path) -> dict:
-    """filename -> its current unified-diff text for a tracked change, or
-    "UNTRACKED:<sha256 of file content>" for an untracked file, for every
-    file the working tree currently shows as changed OR that exists
-    untracked. Used to compute a before/after delta around a Codex run
-    instead of trusting a single post-run `git diff --stat` — this repo can
-    have other uncommitted work in flight (another terminal, a concurrent
-    session) that has nothing to do with this specific dispatch, and a bare
-    post-run diff cannot tell the two apart. Caught live (2026-07-28): a
-    `!코덱스` run to add one README line reported 3 unrelated files as
-    "changed" that were actually pre-existing/concurrent edits from another
-    terminal — this snapshot-delta approach is the fix.
-
-    Untracked entries carry a content hash, not a bare "UNTRACKED" marker
-    (2026-07-29, found in review before ever hit live): a flat marker only
-    tells you a path IS untracked, not what's in it, so two DIFFERENT
-    pieces of real Codex work were invisible to the caller's before/after
-    comparison — (1) Codex modifying the CONTENT of an already-untracked
-    file without `git add`ing it (before/after both just said "UNTRACKED",
-    identical, so no change registered at all, confirmed via local repro),
-    and (2) Codex DELETING a previously-untracked file (it vanishes from
-    both `git diff` and `git status --porcelain` entirely, so it silently
-    drops out of the snapshot with no trace, also confirmed via local
-    repro). Both meant `handle_codex_dispatch` could tell the user "실제
-    파일 변경 없음"/no changes even though Codex had genuinely done
-    something. Hashing the actual bytes makes both cases produce a real
-    before/after difference like any tracked change would.
-    """
-    diff_text = await _git_output(cwd, "diff", "--")
-    status_text = await _git_output(cwd, "status", "--porcelain")
-    snapshot: dict = {}
-    current_file = None
-    buf: list = []
-    for line in diff_text.splitlines():
-        if line.startswith("diff --git "):
-            if current_file is not None:
-                snapshot[current_file] = "\n".join(buf)
-            current_file = line.rsplit(" b/", 1)[-1]
-            buf = [line]
-        else:
-            buf.append(line)
-    if current_file is not None:
-        snapshot[current_file] = "\n".join(buf)
-    for line in status_text.splitlines():
-        if line.startswith("?? "):
-            path = line[3:]
-            snapshot[path] = f"UNTRACKED:{_hash_file_content(cwd / path)}"
-    return snapshot
-
-
-async def handle_codex_dispatch(message: discord.Message):
-    """`!코덱스 <저장소별칭> <작업 지시>` — dispatch a real, write-capable
-    Codex run via workflows/lib/codex-execute-dispatch.sh (reused as-is; see
-    that script's own header for why it's the write-capable sibling of
-    score-dispatch.sh). Restricted to CODEX_REPO_ALIASES (never accept a
-    free-typed path — workspace-write really writes files) and to
-    FREE_CHAT_USER_ID (channel trust alone is not enough for this).
-
-    Per codex-execute-dispatch.sh's own documented design, Codex's self-report
-    is never trusted as a verification signal — this function independently
-    diffs the repo and reports THAT, not just Codex's claim, and calls out
-    the mismatch explicitly if Codex claims success but nothing actually
-    changed. Never commits/pushes — that stays a separate, explicit,
-    human-reviewed step.
-
-    Takes a `_dirty_snapshot()` before AND after the run and reports only the
-    files that differ between the two snapshots — NOT a plain post-run
-    `git diff --stat`. Live test (2026-07-28) caught this the hard way: a
-    request to add one README line reported 3 unrelated files as "changed"
-    that were pre-existing/concurrent edits from another terminal working in
-    the same repo. The before/after delta fixes the common case (dirt that
-    already existed when the run started) but cannot fully solve a file
-    another process edits DURING this run's window — that's a real residual
-    limitation of sharing a working tree with a concurrent editor, not
-    something a diff-based check alone can close.
-    """
-    if str(message.author.id) != FREE_CHAT_USER_ID:
-        await message.channel.send("이 명령어는 본인만 사용 가능합니다.")
-        return
-
-    parts = message.content.strip().split(maxsplit=2)
-    aliases = ", ".join(sorted(CODEX_REPO_ALIASES))
-    if len(parts) < 3:
-        await message.channel.send(f"사용법: `!코덱스 <저장소별칭> <작업 지시>`\n사용 가능한 별칭: {aliases}")
-        return
-
-    _, alias, task = parts
-    cwd = CODEX_REPO_ALIASES.get(alias)
-    if cwd is None:
-        await message.channel.send(f"알 수 없는 저장소 별칭: `{alias}`\n사용 가능한 별칭: {aliases}")
-        return
-
-    # Keyed by resolved path, not the alias string (2026-07-29, found in
-    # review): CODEX_REPO_ALIASES has no distinct-paths invariant enforced
-    # anywhere — if two aliases ever pointed at the same actual directory,
-    # locking per-alias-name would let !코덱스 runs against them race each
-    # other exactly like before this lock existed. Resolving symlinks/`..`
-    # first means two aliases for the same real repo always collide on the
-    # same lock object regardless of which name was used to reach it.
-    lock_key = str(cwd.resolve())
-    lock = CODEX_DISPATCH_LOCKS.setdefault(lock_key, asyncio.Lock())
-    if lock.locked():
-        await message.channel.send(f"`{alias}`에 대한 다른 `!코덱스` 실행이 이미 진행 중입니다 — 끝나면 다시 시도해주세요.")
-        return
-
-    async with lock:
-        # No pending-job/requeue here (unlike the two verify-task-v2 handlers) —
-        # !코덱스 is a one-shot manual command, not a reply-triggered retry chain,
-        # so there's nothing to requeue: the user just re-sends !코덱스 later.
-        skip_reason = await usage_gate_check("codex")
-        if skip_reason:
-            await message.channel.send(f"⏳ 지금 실행을 건너뜁니다 — 계정 사용량 부족.\n{skip_reason}\n사용량 회복 후 `!코덱스` 명령을 다시 보내주세요.")
-            return
-
-        before = await _dirty_snapshot(cwd)
-        dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 실행분만 골라 보여드릴게요." if before else ""
-
-        prompt_file = None
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False, encoding="utf-8") as f:
-                f.write(task)
-                prompt_file = Path(f.name)
-
-            await message.channel.send(f"코덱스에게 지시했습니다 ({alias}, 최대 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분 정도 걸릴 수 있어요) — 끝나면 알려드릴게요.{dirty_note}")
-
-            # start_new_session=True + _kill_process_group() (2026-07-29,
-            # found in review before ever hit live): codex-execute-dispatch.sh
-            # runs the real `codex exec` as `RAW_OUTPUT="$(codex exec ...)"` —
-            # a command substitution, so codex is a CHILD of this bash
-            # process, not the process itself. A plain proc.kill() here
-            # only killed the bash wrapper; the actual codex process (full
-            # workspace-write access) kept running in the background,
-            # completely undetected, while the user was told it had been
-            # "강제 종료" — confirmed via a local repro mirroring this exact
-            # structure (a bash script backgrounding a long command via
-            # command substitution survived plain proc.kill() with its
-            # child still alive). Same fix already applied to free chat's
-            # subprocess; this closes the same gap here.
-            proc = await asyncio.create_subprocess_exec(
-                "/bin/bash", str(CODEX_EXECUTE_DISPATCH_SH), str(cwd), str(prompt_file),
-                env=SUBPROCESS_ENV,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                start_new_session=True,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CODEX_DISPATCH_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                _kill_process_group(proc)
-                await message.channel.send(f"⚠️ 코덱스 실행이 {CODEX_DISPATCH_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — {alias} 저장소를 직접 확인해주세요.")
-                return
-
-            raw = (stdout or b"").decode(errors="replace")
-            try:
-                result = json.loads(raw)
-                ok = bool(result.get("ok"))
-                # tail, not head (2026-07-29, found in review — this had
-                # quietly undone the prior tail-truncation fix made to
-                # codex-execute-dispatch.sh itself): that script already
-                # returns its message tail-truncated so it ends at Codex's
-                # actual failure reason, but this second `[:1000]` cut was
-                # taking the FIRST 1000 chars of that already-tail-cut
-                # text — re-discarding the ending it just preserved.
-                # Confirmed via simulation: a realistic failure message
-                # survived the bash script's fix but lost the error text
-                # again at this exact line.
-                codex_message = str(result.get("message", ""))[-1000:]
-            except Exception:
-                ok = False
-                codex_message = f"(codex-execute-dispatch.sh 출력이 JSON이 아님) {raw[-1000:]}"
-
-            # Never trust Codex's own report — confirm with a real before/after diff.
-            after = await _dirty_snapshot(cwd)
-            # Union of before/after keys, not just after's (2026-07-29,
-            # found in review before ever hit live): iterating only
-            # `after` means a file that was UNTRACKED in `before` and no
-            # longer appears in `after` at all (deleted) was silently
-            # invisible — confirmed via local repro that deleting a
-            # pre-existing untracked file produced an empty `changed` list.
-            # A tracked file reverted to exactly its committed state has
-            # the same shape (present in before's diff, absent from
-            # after's, since a clean file has no diff line) and is
-            # correctly caught by this same union-based comparison.
-            all_files = set(before) | set(after)
-            changed = sorted(f for f in all_files if before.get(f) != after.get(f))
-
-            def _is_untracked_marker(v) -> bool:
-                return isinstance(v, str) and v.startswith("UNTRACKED:")
-
-            changed_tracked = [
-                f for f in changed
-                if not _is_untracked_marker(before.get(f)) and not _is_untracked_marker(after.get(f))
-            ]
-            untracked_notes = []
-            for f in changed:
-                if f in changed_tracked:
-                    continue
-                if f not in before:
-                    untracked_notes.append(f"신규 파일: {f}")
-                elif f not in after:
-                    untracked_notes.append(f"삭제됨(기존 미추적 파일): {f}")
-                else:
-                    untracked_notes.append(f"내용 변경(미추적 파일): {f}")
-
-            diff_stat = ""
-            if changed_tracked:
-                diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-            if untracked_notes:
-                notes_block = "\n".join(untracked_notes)
-                diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
-
-            lines = [f"{'✅' if ok else '❌'} 코덱스 작업 {'완료' if ok else '실패'} ({alias})."]
-            if diff_stat:
-                lines.append(f"이번 실행으로 실제 변경된 파일:\n```\n{diff_stat}\n```")
-            elif ok:
-                lines.append("⚠️ 코덱스는 완료라고 보고했지만 실제 파일 변경은 없습니다 — 자기 보고를 그대로 믿지 마세요.")
-            else:
-                lines.append("실제 파일 변경 없음.")
-            lines.append(f"코덱스 보고:\n```\n{codex_message}\n```")
-            lines.append("커밋·푸시는 하지 않았습니다 — 확인 후 필요하면 직접 요청해주세요.")
-            await message.channel.send("\n".join(lines)[:1900])
-        except Exception as e:
-            await message.channel.send(f"❌ 코덱스 실행 중 예외: {e}")
-        finally:
-            if prompt_file is not None:
-                prompt_file.unlink(missing_ok=True)
 
 
 async def handle_pending_reply(message: discord.Message) -> bool:
@@ -1092,12 +742,18 @@ async def on_message(message: discord.Message):
         await handle_weekly_report(message)
     elif content == "!상태":
         await handle_status(message)
-    elif content.startswith("!코덱스"):
-        await handle_codex_dispatch(message)
     elif content == "!새대화":
         await handle_free_chat_reset(message)
     elif content == "!중지":
         await handle_free_chat_stop(message)
+    elif content.startswith(CODEX_CHAT_WAKE_WORDS):
+        # 2026-07-29: a message addressed to Codex by name ("코덱스야 ...",
+        # "콕스 ...") must NOT also get answered here — codex-bot.py's
+        # handle_codex_chat_wake handles it instead. Both bots sit in the
+        # same channel and see every message, so without this exclusion a
+        # wake-worded message would get TWO replies (this bot's free-chat
+        # catch-all below has no content filter of its own).
+        pass
     elif FREE_CHAT_USER_ID and str(message.author.id) == FREE_CHAT_USER_ID:
         # Phase 3: anything else from the one authorized user is free chat.
         # Everyone else's non-command messages are still silently ignored —

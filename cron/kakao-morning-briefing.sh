@@ -29,6 +29,19 @@ CALENDAR_ID="sungtac@gmail.com"
 STATE_DIR="$HOME/.claude/hooks-state/kakao-morning-briefing"
 mkdir -p "$STATE_DIR"
 
+# mcporter has a `#!/usr/bin/env node` shebang, and the kakao-playmcp MCP
+# server registration (`claude mcp add`, see ~/.claude.json) spawns it with no
+# env override — so it relies on PATH to find `node`. launchd strips PATH to
+# /usr/bin:/bin:/usr/sbin:/sbin for this whole process tree (the same
+# recurring gotcha as codex/agy/ffmpeg/whisper-cli/tmux/coach elsewhere in
+# this repo, see docs/discord-bot.md's SUBPROCESS_ENV) — without this export,
+# `mcporter daemon start` below fails with "env: node: No such file or
+# directory", and the `claude -p` call further down spawns kakao-playmcp the
+# same broken way, so its MCP tools never connect and every step past
+# Calendar silently has nothing to call. Confirmed live 2026-07-29: exactly
+# this failure in that morning's run.
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
 TODAY="$(date +%Y-%m-%d)"
 LOGFILE="$STATE_DIR/${TODAY}.log"
 
@@ -97,6 +110,17 @@ PROMPT_EOF
 # attempt's own output (captured per-attempt, not grepped from the
 # cross-attempt LOGFILE, so a later attempt can't accidentally match on an
 # earlier attempt's success/failure text).
+#
+# Exact-match, not substring (fixed 2026-07-29 after a live false positive):
+# a plain `grep -qF` for the marker matched even when the model's own FAILURE
+# explanation happened to quote the phrase, e.g. "**카카오톡 발송 완료** —
+# 하지 못했습니다." — the substring is present even though the sentence
+# negates it. That false positive is what let a genuinely failed attempt 2
+# end the retry loop early (skipping attempt 3 and the all-attempts-failed
+# Discord notification) with the KakaoTalk message never actually sent. The
+# prompt's step 6 already asks for the marker ALONE as the final line on
+# success ("...라고만 한 줄 출력"), so requiring the last non-blank line to
+# match exactly closes this without weakening the success bar.
 CONFIRM_MARKER="카카오톡 발송 완료"
 TIMEOUT_SECONDS=240
 MAX_ATTEMPTS=3
@@ -133,13 +157,14 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   wait "$CLAUDE_PID"
   EXIT_CODE=$?
   echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=${EXIT_CODE}" >> "$LOGFILE"
-  if [ "$EXIT_CODE" -eq 0 ] && grep -qF "$CONFIRM_MARKER" "$ATTEMPT_OUTFILE"; then
+  LAST_LINE="$(grep -v '^[[:space:]]*$' "$ATTEMPT_OUTFILE" | tail -1 | tr -d '\r')"
+  if [ "$EXIT_CODE" -eq 0 ] && [ "$LAST_LINE" = "$CONFIRM_MARKER" ]; then
     SUCCESS=1
     rm -f "$DEBUG_LOGFILE" "$ATTEMPT_OUTFILE"
     break
   fi
   if [ "$EXIT_CODE" -eq 0 ]; then
-    echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=0 but confirmation string \"${CONFIRM_MARKER}\" not found in output — treating as failed attempt." >> "$LOGFILE"
+    echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: exit=0 but last line \"${LAST_LINE}\" does not exactly match confirmation string \"${CONFIRM_MARKER}\" — treating as failed attempt." >> "$LOGFILE"
   fi
   rm -f "$ATTEMPT_OUTFILE"
 done
