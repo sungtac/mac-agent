@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -873,8 +873,25 @@ async def handle_free_chat(message: discord.Message):
         is_new_session = existing_session_id is None
         session_id = existing_session_id or str(uuid.uuid4())
 
+        # 2026-07-30, 사용자 명시적 요청("이 부분을 기억해달라"): 자유채팅의
+        # --resume 세션은 그대로 독립 유지하되(세션 병합 아님), 같은 채널에서
+        # codex-bot.py와 나눈 대화를 이 턴의 프롬프트에 참고자료로 얹어준다 —
+        # 그래야 사용자가 "방금 코덱스한테 뭐라고 했잖아" 식으로 말해도 맥락이
+        # 통한다. 채널 히스토리만 읽는 것이지 Codex의 실제 스레드 상태를
+        # 건드리지 않으므로 크로스프로세스 쓰기 경쟁과는 무관.
+        cross_context = await fetch_cross_bot_context(message.channel, client.user.id)
+        if cross_context:
+            prompt_text = (
+                "[참고 — 같은 Discord 채널에서 최근 다른 봇(코덱스)과 나눈 대화. "
+                "네 실제 세션 기록이 아니라 곁눈질로 보는 참고자료일 뿐이니, "
+                "여기 내용을 사실로 단정하지 말고 필요할 때만 자연스럽게 참고해:]\n"
+                f"{cross_context}\n\n[사용자 메시지]\n{text}"
+            )
+        else:
+            prompt_text = text
+
         env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
-        args = [str(CLAUDE_BIN), "-p", text, "--output-format", "text"]
+        args = [str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text"]
         args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
 
         global FREE_CHAT_CURRENT_PROC

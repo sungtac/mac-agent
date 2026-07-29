@@ -219,3 +219,50 @@ def try_acquire_repo_lock(resolved_path: str):
             fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+
+
+CROSS_BOT_CONTEXT_LIMIT = 20
+
+
+async def fetch_cross_bot_context(channel, own_bot_id: int, limit: int = CROSS_BOT_CONTEXT_LIMIT) -> str:
+    """Cross-bot channel-context bridge (2026-07-30, user-requested,
+    explicit design intent — NOT a session merge).
+
+    discord-bot.py's Claude free-chat and codex-bot.py's Codex chat each
+    keep their own separate, native conversation continuity
+    (`claude -p --resume <session_id>` / `codex exec resume <thread_id>`)
+    — that stays untouched. What was missing: since both bots sit in the
+    SAME Discord channel and each only ever feeds ITS OWN resumed
+    session/thread as context, neither agent had any visibility into what
+    the user discussed with the *other* one, even though a human reading
+    the channel would see both halves of the conversation naturally.
+
+    This reads the channel's own recent message history (discord.py
+    already has this for free — no separate file bridge or config needed)
+    and returns everything NOT authored by the calling bot itself, oldest
+    first. That includes the sibling bot's own replies AND the user's
+    messages to it — deliberately not trying to classify "was this message
+    actually directed at the other bot," since that's a fuzzy judgment call
+    (wake words, replies, plain commands) that a bounded raw-history dump
+    sidesteps entirely. The caller's own bot messages are excluded because
+    they're already redundant with what `--resume`/`resume <thread_id>`
+    already carries.
+
+    Bounded by `limit` (Discord API messages, not tokens) so this stays
+    cheap and can't unboundedly grow a prompt regardless of how long the
+    channel's history gets. Returns "" if there's nothing to show (e.g. a
+    fresh channel, or a channel where only this bot has ever posted) — the
+    caller should skip injecting the block entirely in that case rather
+    than send an empty section header.
+    """
+    lines = []
+    async for msg in channel.history(limit=limit):
+        if msg.author.id == own_bot_id:
+            continue
+        content = (msg.content or "").strip()
+        if not content:
+            continue
+        label = "봇" if msg.author.bot else "사용자"
+        lines.append(f"[{label}] {content}")
+    lines.reverse()  # channel.history() yields newest-first; want chronological
+    return "\n".join(lines)

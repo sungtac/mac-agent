@@ -536,6 +536,29 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
   `CODEX_CURRENT_PROCS`(별칭/정규화된 cwd별 dict — discord-bot.py의 `FREE_CHAT_CURRENT_PROC`과
   달리 여러 별칭이 동시에 돌 수 있어 dict) + 기존 `CODEX_DISPATCH_LOCKS`를 함께 확인.
 
+## 크로스봇 채널 맥락 공유 (2026-07-30, 사용자 명시적 요청)
+
+**요구사항 (사용자 원문 취지)**: Claude 자유채팅↔Claude, Codex 대화↔Codex 각각의 고유 세션/스레드
+연속성(`--resume`/`exec resume`)은 그대로 분리 유지 — 세션을 합치자는 게 아니다. 다만 같은
+Discord 채널 안에 있으니, 사용자가 Claude와 나눈 대화를 Codex도 볼 수 있어야 하고 반대로도
+마찬가지여야 한다.
+
+**구현**: `discord_bot_common.py`의 `fetch_cross_bot_context(channel, own_bot_id, limit=20)` —
+`channel.history()`로 채널의 최근 메시지를 읽어 **자기 자신의 봇이 아닌** 메시지(상대 봇의
+응답 + 사용자가 상대 봇에게/일반적으로 보낸 메시지 전부, 어떤 게 "진짜 상대 봇을 향한
+메시지"였는지 굳이 판별하지 않음 — 판별 자체가 애매한 문제라 우회)를 시간순으로 정리해
+반환. 별도 파일 브릿지나 설정 없이 discord.py가 이미 갖고 있는 채널 히스토리만 활용.
+
+`handle_free_chat`(discord-bot.py)과 `_codex_chat_turn_locked`(codex-bot.py) 양쪽 다, 매 턴마다
+이걸 호출해서 비어있지 않으면 "[참고 — 같은 채널에서 최근 다른 봇과 나눈 대화, 네 실제
+세션/스레드 기록 아님, 사실로 단정하지 말고 참고만]" 문구와 함께 프롬프트 앞에 얹는다. 비어
+있으면(채널에 상대 봇 흔적이 아예 없는 경우) 원본 텍스트 그대로 보내 불필요한 섹션을 안 만든다.
+`!코덱스`(단발 디스패치)에는 적용 안 함 — "대화"라는 사용자의 원 표현에 맞춰 대화형 진입점
+(자유채팅, `!코덱스대화`, 코덱스 wake-word)에만 적용.
+
+`limit=20`(Discord 메시지 개수 기준, 토큰 기준 아님)으로 상한을 둬서 채널이 아무리 길어져도
+프롬프트가 무한정 커지지 않는다.
+
 ## 알려진 제약
 
 - launchd로 상시 구동되는 프로세스라 PATH가 `/usr/bin:/bin:/usr/sbin:/sbin` 기본값으로 축소돼 있음 — `discord-bot.py`가 `weekly-report.sh`를 서브프로세스로 띄울 때 `SUBPROCESS_ENV`로 `/opt/homebrew/bin`, `~/.local/bin`을 명시적으로 앞에 붙여서 넘김. 이 PATH 문제는 이 레포 전체에서 반복 발생한 것(tmux/coach/claude/ffmpeg/whisper-cli/codex와 동일 원인) — 새 서브프로세스 스폰 지점을 추가할 때마다 재확인할 것.

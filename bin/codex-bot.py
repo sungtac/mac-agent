@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -707,14 +707,29 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
         before = await _dirty_snapshot(cwd)
         dirty_note = "\n⚠️ 이 저장소에 이미 커밋 안 된 변경사항이 있습니다 — 최종 결과는 이번 턴만 골라 보여드릴게요." if before else ""
 
+        # 2026-07-30, 사용자 명시적 요청("이 부분을 기억해달라"): 코덱스 스레드
+        # (exec resume)는 그대로 독립 유지하되(세션 병합 아님), 같은 채널에서
+        # discord-bot.py(Claude 자유채팅)와 나눈 대화를 이 턴의 프롬프트에
+        # 참고자료로 얹어준다 — discord-bot.py의 handle_free_chat과 대칭.
+        cross_context = await fetch_cross_bot_context(message.channel, client.user.id)
+        if cross_context:
+            prompt_text = (
+                "[참고 — 같은 Discord 채널에서 최근 다른 봇(Claude)과 나눈 대화. "
+                "네 실제 스레드 기록이 아니라 곁눈질로 보는 참고자료일 뿐이니, "
+                "여기 내용을 사실로 단정하지 말고 필요할 때만 자연스럽게 참고해:]\n"
+                f"{cross_context}\n\n[사용자 메시지]\n{text}"
+            )
+        else:
+            prompt_text = text
+
         existing_thread_id = _load_codex_chat_thread_id(alias)
         if existing_thread_id:
-            # "--" stops codex's own flag parsing before `text` — without
-            # it, a message starting with "-" (e.g. a stray
+            # "--" stops codex's own flag parsing before `prompt_text` —
+            # without it, a message starting with "-" (e.g. a stray
             # "--dangerously-bypass-approvals-and-sandbox") would be
             # parsed as a codex CLI option instead of prompt text
             # (confirmed live).
-            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", text]
+            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--json", "--", prompt_text]
             # Previously only sent on a brand-new thread (else branch
             # below) — a resume turn computed dirty_note above but threw
             # it away, so the "uncommitted changes already present"
@@ -723,7 +738,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             if dirty_note:
                 await message.channel.send(dirty_note.lstrip("\n"))
         else:
-            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", text]
+            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", prompt_text]
             await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
 
         proc = await asyncio.create_subprocess_exec(
