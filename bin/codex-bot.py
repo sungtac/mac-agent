@@ -93,9 +93,17 @@ client = discord.Client(intents=intents)
 
 
 async def _git_output(cwd: Path, *args: str) -> str:
+    # env=SUBPROCESS_ENV added (2026-07-30, found in integration audit): the
+    # only subprocess spawn point in either bot file that omitted this —
+    # every other spawn call explicitly passes it. Works today since git is
+    # invoked by absolute path, but would silently diverge from the
+    # documented mandatory pattern the moment this repo's git config ever
+    # references a homebrew-installed pager/credential-helper/diff-tool by
+    # bare name (same PATH gotcha as codex/agy/tmux/coach elsewhere).
     proc = await asyncio.create_subprocess_exec(
         "/usr/bin/git", "-C", str(cwd), *args,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        env=SUBPROCESS_ENV,
     )
     out, _ = await proc.communicate()
     text = out.decode(errors="replace").strip()
@@ -277,13 +285,37 @@ async def _diff_summary(cwd: Path, before: dict, after: dict) -> str:
         else:
             untracked_notes.append(f"내용 변경(미추적 파일): {f}")
 
-    diff_stat = ""
+    tracked_stat = ""
     if changed_tracked:
-        diff_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
-    if untracked_notes:
-        notes_block = "\n".join(untracked_notes)
-        diff_stat = f"{diff_stat}\n{notes_block}" if diff_stat else notes_block
-    return diff_stat
+        tracked_stat = await _git_output(cwd, "diff", "--stat", "--", *changed_tracked)
+    notes_block = "\n".join(untracked_notes) if untracked_notes else ""
+    # Capped here, not left to the callers (2026-07-30 fix — found in
+    # integration audit): this return value has no length limit of its own,
+    # unlike every other field the two callers compose into their final
+    # message (e.g. codex_message is already tail-sliced to [-1000:]).
+    # Both callers join this into a "lines" list and only truncate the FULL
+    # joined string to [:1900] at the very end — since this field sits
+    # BEFORE the deliberately-preserved tail content in that list, an
+    # oversized diff_stat pushes the join past 1900 chars and the outer
+    # slice blind-truncates from the FRONT, silently eating into or
+    # dropping the carefully-preserved tail content after it. This is
+    # exactly the "second truncation layer undoing the prior tail-fix" bug
+    # class already fixed once in discord-bot.py (see git log).
+    #
+    # Bug fixed 2026-07-30 (found in an independent Codex code review, same
+    # day as the first cap): the first version of this cap took the FULL
+    # joined string (tracked stat + untracked notes) and tail-sliced it as
+    # one unit, on the assumption that `git diff --stat`'s one genuinely
+    # load-bearing line — "N files changed, M insertions..." — is always
+    # last. That's only true when there are no untracked_notes. Since notes
+    # are appended AFTER tracked_stat, a nontrivial untracked_notes block
+    # pushes the real summary line out of the tail-sliced window entirely
+    # (reproduced: 60 untracked-file notes alone exceed 600 chars, leaving
+    # zero room for the tracked summary). Fix: cap each part separately with
+    # its own budget, so neither can crowd the other out of existence.
+    tracked_stat_capped = tracked_stat[-400:]
+    notes_capped = notes_block[-200:]
+    return "\n".join(p for p in (tracked_stat_capped, notes_capped) if p)
 
 
 async def handle_codex_dispatch(message: discord.Message):

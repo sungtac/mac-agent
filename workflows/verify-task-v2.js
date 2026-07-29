@@ -108,11 +108,12 @@ const EXECUTE_ENVELOPE_SCHEMA = {
 const CONTEXT_SCHEMA = {
   type: 'object',
   properties: {
+    cwdExists: { type: 'boolean' },
     contextText: { type: 'string' },
     intendedFiles: { type: 'array', items: { type: 'string' } },
     sensitivePath: { type: 'boolean' },
   },
-  required: ['contextText', 'intendedFiles', 'sensitivePath'],
+  required: ['cwdExists', 'contextText', 'intendedFiles', 'sensitivePath'],
 }
 
 // 민감 경로 근사 규칙 — docs/verify-task-v2-design.md의 "설정/보안/
@@ -135,7 +136,7 @@ function isSensitivePath(path) {
 
 async function gatherContext(cwd, task) {
   const gathered = await agent(
-    `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n1. Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.`,
+    `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n0. 먼저 Bash로 \`[ -d ${JSON.stringify(cwd)} ] && echo EXISTS || echo MISSING\`을 실행해. "MISSING"이면 cwdExists=false로 하고, contextText에는 그 사실만 짧게 적고, intendedFiles는 빈 배열, sensitivePath는 false로 채워서 즉시 끝내 — 존재하지 않는 디렉토리에서 아래 1~7번을 시도하지 마(git 명령이 엉뚱한 디렉토리에서 실행되거나 에러 텍스트가 진짜 컨텍스트인 것처럼 섞여 들어감).\n1. cwdExists=true로 하고, Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.`,
     { phase: 'Context', label: 'gather-context', schema: CONTEXT_SCHEMA }
   )
   return gathered
@@ -519,6 +520,19 @@ if (!cwd) {
   }
 }
 
+// v1(verify-task.js)에서 실측 확인된 것과 같은 버그 클래스에 대한 대칭 방어:
+// Workflow({scriptPath, resumeFromRunId})로 재개할 때 args를 다시 안 넘기면
+// parsedArgs가 {}로 무너진다. v2는 cwd 필수라 위 가드가 대부분 이 경로를 우연히
+// 막아주지만, task만 비고 cwd는 어쩌다 남아있는 경로까지 커버하려면 별도 확인이
+// 필요하다 — task 없이 진행하면 코덱스 계획 작성 단계 프롬프트에 "undefined"가
+// 실제로 들어간 채 외부 호출이 나간다.
+if (!task) {
+  return {
+    finalVerdict: { passed: false, error: 'missing_task' },
+    reason: `task가 비어있음(cwd=${JSON.stringify(cwd)}) — args가 실제로 전달되지 않았을 가능성이 높음. Workflow({scriptPath, resumeFromRunId})로 재개하는 경우에도 args는 매번 다시 넘겨야 함.`,
+  }
+}
+
 log('사전 점검: Codex/Antigravity 로그인 상태 확인 중...')
 const preflight = await preflightCheck()
 if (!preflight || preflight.ok === false) {
@@ -532,6 +546,23 @@ log('컨텍스트 수집 중 (git status/diff, 관련 파일, 컨벤션, 테스�
 const context = await gatherContext(cwd, task)
 if (!context) {
   return { finalVerdict: { passed: false, error: 'context_gathering_failed' } }
+}
+// 실측 감사로 발견한 잠재 버그(2026-07-30, 아직 실제로는 안 터짐): cwd
+// 존재 여부를 한 번도 확인 안 했다 — 특히 Discord 답장 재시도 경로에서
+// pending-job에 저장된 cwd(예: /private/tmp/.../scratchpad/...)가 세션
+// 종료 후 정리돼서 사라진 채로 답장이 오면, cd가 조용히 실패하고 이후
+// 전부 빈 컨텍스트로 계속 진행돼서 "완료" 판정이 날 수 있었다. 이제
+// gatherContext 스스로 존재 여부를 확인해서 보고하므로, 여기서 즉시
+// 막는다.
+if (context.cwdExists === false) {
+  return {
+    finalVerdict: {
+      passed: false,
+      error: 'cwd_not_found',
+      reason: `cwd가 존재하지 않음: ${cwd}. Discord 답장 재시도라면 원본 pending-job이 가리키던 디렉토리(예: 임시 스크래치패드)가 이미 정리됐을 수 있음 — 유효한 cwd로 다시 시도할 것.`,
+    },
+    history: [],
+  }
 }
 
 let tier = decideTier(context)
@@ -800,6 +831,26 @@ if (tier === 'full' && !finalVerdict) {
 // "verify-task-v2-decision-retry"(2026-07-28 추가: 답장에서 재시도 의도
 // 키워드만 감지해 라운드를 늘려 같은 task로 재실행 — discord-bot.py 쪽에서
 // 판단). pendingJobParams가 없으면 기존 그대로 완전 일방향.
+// 실측 감사로 발견한 버그(2026-07-30): 이 pending-job 작성 경로는 weekly-report.sh/
+// work-log-stop-check.sh(둘 다 결정적 inline python3로 필드를 직접 씀)와 달리,
+// 서브에이전트에게 자연어로 지시만 하고 반환값을 전혀 확인하지 않았다(schema
+// 없이 호출, 결과 버림) — 서브에이전트가 지시를 잘못 따르거나, id 파싱을
+// 실수하거나, Write가 실패해도 이 함수도 호출자도 절대 알 방법이 없었다.
+// schema를 줘서 서브에이전트가 실제로 뭘 했는지(썼는지/안 썼는지/왜) 구조화된
+// 값으로 답하게 하고, 최소한 log()에 남겨서 워크플로우 진행 로그/journal에서는
+// 보이게 한다 — 이게 두 bash 생산자 수준의 신뢰성을 주진 않지만("여전히 LLM의
+// 지시 이행에 의존"이라는 근본 한계는 남음), 최소한 "완전히 조용한 블랙박스"는
+// 벗어난다.
+const NOTIFY_ESCALATION_SCHEMA = {
+  type: 'object',
+  properties: {
+    written: { type: 'boolean' },
+    messageId: { type: 'string' },
+    reason: { type: 'string' },
+  },
+  required: ['written'],
+}
+
 async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
   try {
     if (!pendingJobParams) {
@@ -810,10 +861,15 @@ async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
       return
     }
     const paramsJson = JSON.stringify(pendingJobParams)
-    await agent(
-      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 그냥 "no-id"라고만 답하고 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. 성공하면 "wrote pending-job for <id>"라고 답해.\n\n[원본 params JSON]\n${paramsJson}`,
-      { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
+    const result = await agent(
+      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 written=false, reason에 "no message id"라고 채워서 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. Write가 성공했으면 written=true, messageId에 그 id를 채워서 답해. Write가 실패했으면 written=false, reason에 무엇이 실패했는지 적어.\n\n[원본 params JSON]\n${paramsJson}`,
+      { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose', schema: NOTIFY_ESCALATION_SCHEMA }
     )
+    if (!result) {
+      log('디스코드 에스컬레이션 알림: 서브에이전트 호출 자체가 실패함(세션/사용 한도 등) — pending-job이 안 만들어졌을 수 있음')
+    } else if (!result.written) {
+      log(`디스코드 에스컬레이션 알림: pending-job 작성 안 됨 (${result.reason || '사유 미상'})`)
+    }
   } catch (e) {
     log(`디스코드 알림 실패(무시): ${e}`)
   }
@@ -822,8 +878,19 @@ async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
 async function finalizeAndReturn() {
   if (finalVerdict?.needsUserDecision || finalVerdict?.error === 'needs_clarification') {
     const shortTask = typeof task === 'string' ? task.slice(0, 200) : String(task)
-    const reason = finalVerdict?.reason || finalVerdict?.questions || '(사유 없음)'
     const isClarification = finalVerdict?.error === 'needs_clarification'
+    // 실측 감사로 발견한 버그(2026-07-30): needs_clarification일 때
+    // finalVerdict.reason은 항상 "Workflow 스크립트는 AskUserQuestion을
+    // 직접 못 부름..." 같은 고정 상투문구이고(항상 truthy), 실제 질문은
+    // finalVerdict.questions에 따로 담긴다. 예전 `reason || questions`
+    // 순서는 reason이 항상 이겨서, Discord 알림에 실제로 답해야 할 질문이
+    // 아니라 상투문구만 보여줬다 — 답장 재시도 메커니즘 자체는 그대로
+    // 작동했지만(사용자 답변을 그대로 이어붙임), "질문을 보고 답한다"는
+    // 이 흐름의 전제가 알림 시점에 깨져 있었다. needs_clarification일 때는
+    // questions를 우선하고, 비어 있을 때만 reason으로 폴백한다.
+    const reason = isClarification
+      ? (finalVerdict?.questions || finalVerdict?.reason || '(사유 없음)')
+      : (finalVerdict?.reason || '(사유 없음)')
     const jobType = isClarification ? 'verify-task-v2-retry' : 'verify-task-v2-decision-retry'
     const replyHint = isClarification
       ? '\n\n이 메시지에 답장하면 그 내용을 답변으로 붙여서 재시도합니다.'

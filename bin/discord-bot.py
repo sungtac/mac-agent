@@ -47,7 +47,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group
+from discord_bot_common import SUBPROCESS_ENV, CODEX_CHAT_WAKE_WORDS, usage_gate_check, _kill_process_group, _kill_process_group_graceful
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -150,7 +150,15 @@ async def handle_weekly_report(message: discord.Message):
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=WEEKLY_REPORT_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            _kill_process_group(proc)
+            # graceful (SIGTERM-first) kill, not a bare _kill_process_group
+            # (2026-07-30 fix): this wraps weekly-report.sh's own claude -p
+            # call, which writes a report file with real tool access — a
+            # bare SIGKILL mid-write risks a partially-written file exactly
+            # when the timeout path most needs a clean state. codex-bot.py
+            # already adopted this graceful variant for its own timeout
+            # kills; this file's four full-tool-access claude -p handlers
+            # had not been ported to it until now.
+            await _kill_process_group_graceful(proc)
             await message.channel.send(f"⚠️ 주간보고서 실행이 {WEEKLY_REPORT_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 스크립트 자체 watchdog도 못 잡은 이상 상황이라 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-10:])
@@ -234,18 +242,37 @@ async def handle_work_log_retry(message: discord.Message, params: dict):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
+            # start_new_session + _kill_process_group, not plain proc.kill()
+            # (2026-07-30 fix, matches handle_weekly_report's pattern above
+            # — this handler was the one spot in the file missing it):
+            # work-log-stop-check.sh spawns its own grandchild
+            # (usage-preflight-gate.sh -> coach) synchronously during the
+            # exact window this timeout is meant to catch. A bare kill()
+            # only kills this top-level bash wrapper and orphans that
+            # grandchild if it's the thing actually hanging.
+            start_new_session=True,
         )
         proc.stdin.write(stdin_json)
         await proc.stdin.drain()
         proc.stdin.close()
-        await asyncio.wait_for(proc.wait(), timeout=30)
+        await asyncio.wait_for(proc.wait(), timeout=45)
         if proc.returncode == 0:
             await message.channel.send(f"재시도 시작했습니다 (세션 {session_id}) — 완료되면 따로 알려드릴게요.")
+        elif proc.returncode == 4:
+            # work-log-stop-check.sh's own usage-preflight-gate.sh skip
+            # (2026-07-30 fix, mirrors handle_weekly_report's exit-4
+            # handling above): the script already sent its own
+            # discord-notify.sh message + re-queued a fresh pending-job for
+            # this case, so an ack here would be both a duplicate
+            # notification AND actively wrong (this retry did NOT start —
+            # it was skipped again). Stay quiet, same as weekly-report's
+            # exit 3/4 handling.
+            pass
         else:
             await message.channel.send(f"❌ work-log 재시도 디스패치 자체가 실패했습니다 (exit={proc.returncode}). 로그: ~/.claude/hooks-state/work-log/{session_id}.log")
     except asyncio.TimeoutError:
-        proc.kill()
-        await message.channel.send(f"⚠️ work-log 재시도 디스패치가 30초 안에 반환되지 않았습니다 — 정상이라면 거의 즉시 반환돼야 하는데 이상 상황입니다. 세션 {session_id} 직접 확인이 필요합니다.")
+        _kill_process_group(proc)
+        await message.channel.send(f"⚠️ work-log 재시도 디스패치가 45초 안에 반환되지 않았습니다 — 정상이라면 거의 즉시 반환돼야 하는데 이상 상황입니다. 세션 {session_id} 직접 확인이 필요합니다.")
     except Exception as e:
         await message.channel.send(f"❌ work-log 재시도 실행 중 예외: {e}")
 
@@ -359,7 +386,10 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            _kill_process_group(proc)
+            # graceful kill (2026-07-30 fix, same rationale as
+            # handle_weekly_report above): this claude -p run itself spawns
+            # codex/antigravity subprocess children doing real file writes.
+            await _kill_process_group_graceful(proc)
             await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
@@ -391,8 +421,16 @@ RETRY_INTENT_KEYWORDS = ("재시도", "retry", "다시")
 # 느슨하지는 않다. "하지마"류·"안 해도"류도 같은 이유로 정규식화했다. 영어
 # 부정어·"그만"/"말고"/"말자"처럼 조사 삽입 문제가 구조적으로 없는 것들은
 # 기존 문자열매칭 그대로 둔다.
+# 2026-07-30 fix (실측 감사로 발견): {0,2}는 "필요까지는 없"(4글자: "까지는
+# ") 같은 좀 더 긴 조사구를 놓쳤다 — 이 경우 실제로는 "재시도 필요 없음"을
+# 뜻하는데도 매치가 안 돼서 원치 않는 자동 재시도가 나갈 수 있었다. {0,6}으로
+# 넓혀서 이런 조사구까지 잡는다. 이 확장이 반대 방향 오탐(무관한 문장에서
+# "필요"...6글자 이내...."없"이 우연히 만나는 경우)을 늘릴 순 있지만, 이 파일의
+# fail-closed 설계(마커 매치=자동조치 안 함, 놓친 재시도<원치 않는 재시도)
+# 덕분에 그 오탐의 결과는 "재시도를 한 번 더 요청해야 함" 정도로 안전한
+# 방향이다 — 여전히 무한정 넓히지는 않음(문장 전체를 건너뛸 정도는 아님).
 RETRY_NEGATION_PATTERNS = (
-    re.compile(r"필요.{0,2}없"),
+    re.compile(r"필요.{0,6}없"),
     re.compile(r"하지.{0,1}(마|말)"),
     re.compile(r"안.{0,1}해도"),
 )
@@ -495,7 +533,10 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
         try:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
         except asyncio.TimeoutError:
-            _kill_process_group(proc)
+            # graceful kill (2026-07-30 fix, same rationale as
+            # handle_weekly_report above): this claude -p run itself spawns
+            # codex/antigravity subprocess children doing real file writes.
+            await _kill_process_group_graceful(proc)
             await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
             return
         tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
@@ -537,6 +578,19 @@ async def handle_pending_reply(message: discord.Message) -> bool:
     if not job_path.exists():
         return False
 
+    # 2026-07-30 fix (Codex 코드리뷰로 발견, 사용자 확정): 이전엔 인가된
+    # 채널의 누구나 pending-job 답장으로 재시도를 트리거할 수 있었다 —
+    # verify-task-v2-retry/decision-retry는 결과적으로 풀-툴-액세스
+    # claude -p 실행까지 이어지므로, 사실상 Phase 3 자유채팅과 동급 권한을
+    # 채널 신뢰만으로 열어주고 있었다. free_chat_user_id(본인)로 제한해서
+    # 자유채팅의 FREE_CHAT_USER_ID 게이트와 동일한 권한 레벨로 통일.
+    # job은 안 건드림(삭제도, 만료 처리도 안 함) — 진짜 소유자가 나중에
+    # 여전히 답장할 수 있어야 하고, 무단 답장 한 번으로 소유자의 재시도
+    # 기회를 날려선 안 된다.
+    if not FREE_CHAT_USER_ID or str(message.author.id) != FREE_CHAT_USER_ID:
+        await message.channel.send("이 요청에는 답장할 권한이 없습니다.")
+        return True
+
     try:
         job = json.loads(job_path.read_text())
         created = datetime.datetime.fromisoformat(job["created_at"])
@@ -551,7 +605,35 @@ async def handle_pending_reply(message: discord.Message) -> bool:
         return True
 
     job_type = job.get("type")
-    job_path.unlink(missing_ok=True)  # delete first so a second reply can't double-trigger
+    params = job.get("params", {})
+    # 2026-07-30 fix (found in an independent Codex code review): the
+    # original code unconditionally unlinked the file BEFORE dispatching,
+    # regardless of whether job_type/params were actually usable. An
+    # unrecognized type or a non-dict params (corrupted file, or a producer
+    # bug — verify-task-v2.js's own pending-job write is LLM-instruction-
+    # mediated, not code-verified, see notifyDiscordEscalation) would let a
+    # handler's own `params.get(...)` throw AFTER the file was already gone,
+    # losing the retry state permanently with no user-visible feedback. The
+    # "delete before dispatching" idempotency guard (so a second reply can't
+    # double-trigger the same job) is still correct — it just needs to only
+    # apply once the job is confirmed valid, not before.
+    KNOWN_JOB_TYPES = {
+        "weekly-report-retry", "work-log-retry",
+        "verify-task-v2-retry", "verify-task-v2-decision-retry",
+    }
+    if job_type not in KNOWN_JOB_TYPES or not isinstance(params, dict):
+        print(
+            f"pending job {ref.message_id}: invalid (type={job_type!r}, "
+            f"params type={type(params).__name__}) — keeping file, not dispatching",
+            file=sys.stderr,
+        )
+        await message.channel.send(
+            f"⚠️ 이 요청의 저장된 정보가 손상됐거나 인식할 수 없는 형식입니다 (type={job_type!r}) "
+            "— 자동 재시도를 진행하지 않았습니다. 직접 확인이 필요합니다."
+        )
+        return True
+
+    job_path.unlink(missing_ok=True)  # delete first so a second reply can't double-trigger — safe now that the job is confirmed valid
 
     if job_type == "weekly-report-retry":
         # The ack is a courtesy, not load-bearing — if sending it hiccups
@@ -567,26 +649,57 @@ async def handle_pending_reply(message: discord.Message) -> bool:
         return True
 
     if job_type == "work-log-retry":
-        await handle_work_log_retry(message, job.get("params", {}))
+        await handle_work_log_retry(message, params)
         return True
 
     if job_type == "verify-task-v2-retry":
-        await handle_verify_task_v2_retry(message, job.get("params", {}))
+        await handle_verify_task_v2_retry(message, params)
         return True
 
     if job_type == "verify-task-v2-decision-retry":
-        await handle_verify_task_v2_decision_retry(message, job.get("params", {}))
+        await handle_verify_task_v2_decision_retry(message, params)
         return True
 
-    # Unhandled type (a future source) — log and ignore rather than silently
-    # pretending we did something.
-    print(f"pending job {ref.message_id}: unhandled type {job_type!r}", file=sys.stderr)
-    return True
+
+def _sweep_expired_pending_jobs() -> int:
+    """Startup sweep for pending-job files past PENDING_MAX_AGE_HOURS that
+    nobody ever replied to. handle_pending_reply()'s own 48h check (above)
+    only fires reactively when a reply arrives referencing that specific
+    message — an escalation the user simply ignores (as opposed to
+    explicitly declining) never triggers it, so it sat on disk forever.
+    Found in integration audit (2026-07-30): one real orphan already
+    existed, referencing a scratchpad `cwd` from a different, long-ended
+    session. Runs once at startup, not a periodic loop — PENDING_DIR only
+    grows between restarts and this bot is launchd KeepAlive'd (restarts
+    often enough in practice that a startup-only sweep is sufficient; a
+    long-uninterrupted run could still accumulate up to 48h+ of jobs before
+    the next natural restart, which is an acceptable tradeoff over adding a
+    background timer loop for what's currently a low-volume directory).
+    """
+    if not PENDING_DIR.exists():
+        return 0
+    removed = 0
+    now = datetime.datetime.now()
+    for job_path in PENDING_DIR.glob("*.json"):
+        try:
+            job = json.loads(job_path.read_text())
+            created = datetime.datetime.fromisoformat(job["created_at"])
+        except Exception:
+            job_path.unlink(missing_ok=True)
+            removed += 1
+            continue
+        if (now - created).total_seconds() > PENDING_MAX_AGE_HOURS * 3600:
+            job_path.unlink(missing_ok=True)
+            removed += 1
+    return removed
 
 
 @client.event
 async def on_ready():
     print(f"logged in as {client.user} (id={client.user.id})")
+    removed = _sweep_expired_pending_jobs()
+    if removed:
+        print(f"swept {removed} expired pending-job file(s)", file=sys.stderr)
 
 
 FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-session.json"
@@ -647,7 +760,12 @@ async def handle_free_chat_stop(message: discord.Message):
         return
     try:
         if FREE_CHAT_CURRENT_PROC is not None:
-            _kill_process_group(FREE_CHAT_CURRENT_PROC)
+            # graceful kill (2026-07-30 fix, same rationale as the timeout
+            # paths above): a user-initiated stop carries the exact same
+            # mid-write SIGKILL corruption risk as a timeout-triggered one —
+            # this is a full-tool-access claude -p run either way. Adds up
+            # to ~2s before the process is confirmed dead; worth it.
+            await _kill_process_group_graceful(FREE_CHAT_CURRENT_PROC)
             await message.channel.send("중단 요청을 보냈습니다.")
         elif FREE_CHAT_LOCK.locked():
             await message.channel.send("응답을 준비 중입니다 — 아직 중단할 프로세스가 없습니다, 잠시 후 다시 시도해주세요.")
@@ -764,7 +882,8 @@ async def handle_free_chat(message: discord.Message):
             try:
                 stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=FREE_CHAT_TIMEOUT_SECONDS)
             except asyncio.TimeoutError:
-                _kill_process_group(proc)
+                # graceful kill (2026-07-30 fix, same rationale as above).
+                await _kill_process_group_graceful(proc)
                 await message.channel.send(f"⚠️ 응답이 {FREE_CHAT_TIMEOUT_SECONDS // 60}분을 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
                 return
             out_text = (stdout or b"").decode(errors="replace").strip()
@@ -802,13 +921,23 @@ async def on_message(message: discord.Message):
         await handle_free_chat_reset(message)
     elif content == "!중지":
         await handle_free_chat_stop(message)
-    elif content.startswith(CODEX_CHAT_WAKE_WORDS):
-        # 2026-07-29: a message addressed to Codex by name ("코덱스야 ...",
-        # "콕스 ...") must NOT also get answered here — codex-bot.py's
-        # handle_codex_chat_wake handles it instead. Both bots sit in the
-        # same channel and see every message, so without this exclusion a
-        # wake-worded message would get TWO replies (this bot's free-chat
-        # catch-all below has no content filter of its own).
+    elif content.startswith(CODEX_CHAT_WAKE_WORDS) or content.startswith("!코덱스"):
+        # 2026-07-29, widened 2026-07-30 (실측 감사로 발견): a message meant
+        # for Codex must NOT also get answered here — codex-bot.py handles
+        # it instead. Both bots sit in the same channel and see every
+        # message, so without this exclusion it gets TWO replies (this bot's
+        # free-chat catch-all below has no content filter of its own).
+        # Originally this only excluded the bare wake-word form ("코덱스야
+        # ...", "콕스 ..."). That missed every "!"-prefixed command form
+        # ("!코덱스", "!코덱스대화", "!코덱스대화초기화") — those all start
+        # with "!", not with the bare word, so `startswith(CODEX_CHAT_WAKE_WORDS)`
+        # was False and every single use of any of the three codex-bot.py
+        # commands fell straight through to the free-chat branch below,
+        # firing a SECOND, uncoordinated, unrestricted-full-tool-access
+        # `claude -p` relay on the same text — worse than a cosmetic double
+        # reply, since free-chat has no `CODEX_REPO_ALIASES` write-scope
+        # guard the way codex-bot.py's dispatch does. `"!코덱스"` covers all
+        # three command forms since they share that prefix.
         pass
     elif FREE_CHAT_USER_ID and str(message.author.id) == FREE_CHAT_USER_ID:
         # Phase 3: anything else from the one authorized user is free chat.

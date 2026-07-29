@@ -100,21 +100,56 @@ def _kill_process_group(proc) -> None:
         proc.kill()
 
 
+def _force_kill_pgid(pgid: int) -> None:
+    """SIGKILL a process group by an already-captured pgid (not re-derived
+    from a proc that may have already exited — `os.getpgid(proc.pid)` raises
+    ProcessLookupError once that specific pid is gone, even if other members
+    of its former group are still alive under the same pgid number)."""
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+
+
 async def _kill_process_group_graceful(proc, grace_seconds: float = 2.0) -> None:
-    """SIGTERM first, escalate to _kill_process_group's SIGKILL only if the
-    process group hasn't exited within `grace_seconds`. A bare SIGKILL
-    mid-write (e.g. `codex exec -s workspace-write` or `claude -p` with full
-    tool access, both mid-timeout-kill) risks leaving a partially-written
-    file behind right when the caller's own before/after diff most needs a
-    coherent post-kill state to compare against — same reasoning
-    weekly-report.sh already applies to its own claude -p timeouts.
+    """SIGTERM first, escalate to SIGKILL only if the process group hasn't
+    exited within `grace_seconds`. A bare SIGKILL mid-write (e.g. `codex exec
+    -s workspace-write` or `claude -p` with full tool access, both
+    mid-timeout-kill) risks leaving a partially-written file behind right
+    when the caller's own before/after diff most needs a coherent post-kill
+    state to compare against — same reasoning weekly-report.sh already
+    applies to its own claude -p timeouts.
+
+    Bug fixed 2026-07-30 (found in an independent Codex code review): the
+    original version only ever watched `proc.wait()` — i.e. whether the ONE
+    direct child (the group leader) exited — and treated that as "the group
+    is done." SIGTERM was sent to the whole group via `os.killpg`, but if the
+    leader (e.g. a `claude -p` wrapper) happened to exit quickly while a
+    grandchild it spawned (e.g. a `codex`/`agy` subprocess mid-write) was
+    still shutting down, `proc.wait()` returned with no TimeoutError, so the
+    SIGKILL escalation never ran — exactly the orphaned-mid-write scenario
+    this function's own docstring claims to prevent. Now: after the leader
+    exits (or times out), separately probe whether the ORIGINAL pgid (kept
+    from before the leader exited — `os.getpgid(proc.pid)` would raise once
+    that pid is gone) still has any live member via a signal-0 existence
+    check, and only declare success once the whole group is confirmed empty.
     """
     try:
-        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(pgid, signal.SIGTERM)
     except (ProcessLookupError, PermissionError, OSError):
         _kill_process_group(proc)
         return
     try:
         await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
     except asyncio.TimeoutError:
-        _kill_process_group(proc)
+        _force_kill_pgid(pgid)
+        return
+    try:
+        os.killpg(pgid, 0)  # existence probe only — signal 0 never actually kills
+    except (ProcessLookupError, PermissionError, OSError):
+        return  # group is confirmed empty (or we can't check further)
+    _force_kill_pgid(pgid)

@@ -176,6 +176,25 @@ let result = parsedArgs.result
 const history = []
 let finalVerdict = null
 
+// 실측 버그 (2026-07-29, 세션 925808ac): Workflow({scriptPath, resumeFromRunId})로
+// 재개할 때 args를 다시 안 넘기면(문서에 명시 안 된 함정 — resume이 이전 run의
+// args를 자동으로 이어받지 않음) 이 스크립트가 매 실행 top-level에서 args를 새로
+// 읽으므로 parsedArgs가 조용히 {}로 무너진다. 그 상태로도 여기까지는 아무 에러
+// 없이 통과해서, task/result가 실제로 codex/gemini에게 보내는 채점 프롬프트에
+// 문자 그대로 "undefined"로 들어간 채 진짜 외부 호출을 몇 차례나 낭비한 사례를
+// 실제로 재현·확인함(agent-a94b8aa9...jsonl). preflight보다도 먼저, 외부 도구를
+// 한 번도 부르기 전에 여기서 즉시 막는다.
+if (!task || result === undefined) {
+  return {
+    finalVerdict: {
+      passed: false,
+      error: 'missing_task_or_result',
+      reason: `task/result가 비어있음(task=${JSON.stringify(task)}, result=${JSON.stringify(result)}) — args가 실제로 전달되지 않았을 가능성이 높음. Workflow({scriptPath, resumeFromRunId})로 재개하는 경우에도 args는 매번 다시 넘겨야 함(resume이 이전 run의 args를 자동으로 이어받지 않음).`,
+    },
+    history: [],
+  }
+}
+
 log('사전 점검: Codex/Antigravity 로그인 상태 확인 중...')
 const preflight = await preflightCheck()
 if (!preflight || preflight.ok === false) {
@@ -222,10 +241,23 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
   }
 
   log(`라운드 ${round}: 피드백 반영해서 수정 중...`)
-  result = await agent(
+  const revised = await agent(
     `아래는 작업 요청과 이전 결과물, 그리고 두 명의 독립 채점자의 피드백이야. 피드백을 반영해서 결과물을 개선해줘.\n${cwd ? `작업 디렉토리: ${cwd}\n` : ''}\n[요청받은 작업]\n${task}\n\n[이전 결과물]\n${result}\n\n[Codex 피드백] (총점 ${codexScore?.total ?? '?'}/100, 과락: ${codexScore?.dealbreaker})\n${codexScore?.feedback ?? '(응답 파싱 실패)'}\n\n[Gemini 피드백] (총점 ${geminiScore?.total ?? '?'}/100, 과락: ${geminiScore?.dealbreaker})\n${geminiScore?.feedback ?? '(응답 파싱 실패)'}\n\n개선된 최종 결과물만 출력해 (부가 설명 없이 결과물 자체만).`,
     { phase: 'Revise', label: `revise-round-${round}`, agentType: 'general-purpose' }
   )
+  // 실측 버그 (2026-07-29, 같은 세션): 이 revise 호출이 세션/사용 한도 등
+  // 일시적 오류로 죽으면 agent()는 null을 반환한다(Workflow 툴 자체 문서: "터미널
+  // API 오류로 죽으면 null"). 예전 코드는 `result = await agent(...)`로 이 null을
+  // 그대로 덮어써서, 멀쩡했던 result가 다음 라운드부터 계속 null로 채점자에게
+  // 전달됐다(실측: journal.jsonl에 이 라운드의 revise 호출이 started만 있고
+  // result가 없음, 이후 라운드 finalVerdict.result가 null). null이면 이전
+  // result를 그대로 유지해 다음 라운드에서 같은 채점을 다시 시도한다 — 조용히
+  // 덮어써서 데이터를 잃는 대신, 최소한 라운드 하나를 "공짜 재시도"로 쓴다.
+  if (revised === null) {
+    log(`라운드 ${round}: 수정 에이전트 호출이 실패함(세션/사용 한도 등 일시적 오류 가능성) — 결과물을 덮어쓰지 않고 이전 결과물 그대로 다음 라운드 재시도`)
+  } else {
+    result = revised
+  }
 }
 
 log('채점 히스토리 저장 중...')

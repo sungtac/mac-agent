@@ -2,9 +2,17 @@
 
 Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 답장 재시도 — 후자는 자유텍스트 3지선다를 그대로 해석하지 않고 재시도 의도 키워드(재시도/retry/다시)만 감지하는 방식으로 해결(사용자 확정, 2026-07-28). Phase 3(사용자 요청, 2026-07-29): 본인(free_chat_user_id) 전용 자유 채팅 — 접두어 없이 전부 릴레이, 전체 도구 허용, `--resume`로 세션 연속성 유지(`!새대화`로 초기화).
 
-## 구성
+## 구성 (2026-07-30 갱신 — 봇 프로세스가 둘로 분리됨)
 
-- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`.
+**2026-07-29에 `!코덱스` 계열 명령이 `discord-bot.py`에서 별도 프로세스 `codex-bot.py`로
+분리됐다** — 이 문서 원본(2026-07-29T01:13 마지막 수정) 작성 당시엔 아직 분리 전이라, 아래
+"`!코덱스`" 절은 옛 위치를 그대로 서술한 채 남아있었다(2026-07-30 통합 감사로 발견·정정).
+현재 정확한 구조:
+
+- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`. `!주간보고서`/`!상태`/`!새대화`/`!중지`, work-log/verify-task-v2 답장 재시도, Phase 3 자유채팅을 담당.
+- `bin/codex-bot.py` — **별도 프로세스, 별도 launchd 등록**(`com.macagent.codex-bot.plist`, 같은 `KeepAlive`/`RunAtLoad` 패턴, 재기동은 `launchctl kickstart -k gui/$(id -u)/com.macagent.codex-bot`), **별도 설정 파일**(`~/.claude/discord-bot/codex-bot-config.json` — `discord-bot.py`의 `config.json`과 의도적으로 분리, 자체 토큰). `!코덱스`(직접 디스패치), `!코덱스대화`(연속 대화, 세션 지속), `!코덱스대화초기화`(세션 리셋)를 담당 — 상세는 아래 "`!코덱스` 계열 명령" 절.
+- `bin/discord_bot_common.py` — 두 프로세스가 공유하는 헬퍼 모듈: 서브프로세스 env 빌더(`SUBPROCESS_ENV`), 사용량 게이트(`usage_gate_check`), 프로세스그룹 종료 헬퍼(`_kill_process_group`/`_kill_process_group_graceful`), 코덱스 wake-word 상수(`CODEX_CHAT_WAKE_WORDS`).
+- **두 프로세스가 같은 Discord 채널을 함께 본다**(`config.json`/`codex-bot-config.json`의 `channel_id`가 동일 — 의도된 설계, 둘 다 모든 메시지를 봐야 각자 자기 명령만 골라 응답할 수 있다). 그래서 라우팅 배제 로직이 정합적이어야 한다 — 한쪽이 처리할 메시지를 다른 쪽이 못 걸러내면 이중 응답이 난다(2026-07-30에 실제로 이 클래스 버그가 발견·수정됨, 아래 "2026-07-30 통합 감사" 절 참고).
 - `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨. Phase 2부터 성공 시 게시된 메시지의 Discord id를 stdout으로 반환(실패 시 빈 문자열) — 호출한 스크립트가 그 id로 pending-job을 기록해 나중에 답장을 매칭할 수 있게 함.
 - 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 Phase 1부터 미리 넣어둔 값이었고, `!코덱스`(2026-07-28)에서 처음 참조하기 시작했으며 Phase 3(2026-07-29, 자유 채팅)에서도 그대로 재사용한다 — "Claude/코덱스에게 임의 지시를 내릴 수 있는 사람"이라는 같은 권한 레벨을 의미.
 - `~/.claude/discord-bot/free-chat-session.json` — Phase 3 세션 상태(레포 밖, git 추적 안 함). `{"session_id": <uuid>, "last_used_at": ISO시각}` 하나만 담는다 — 채널당 자유 채팅 사용자가 한 명뿐이라 여러 대화를 구분할 필요가 없음. `!새대화`로 삭제하면 다음 메시지가 새 세션을 시작한다.
@@ -12,8 +20,9 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 ## 권한 경계 (사용자가 명시적으로 결정한 것, 재검토 없이 그냥 넓히지 말 것)
 
-- **인가된 채널만**: `config.json`의 `channel_id` 하나만 반응, 그 외 채널/DM/다른 서버/봇 자신의 메시지는 전부 무시. 이게 신뢰 경계 전부 — 그 채널은 초대받은 사람 전원이 완전히 신뢰된다는 사용자의 명시적 결정.
-- **자유 채팅(Claude Code에 임의 지시)은 본인만**: Phase 3(2026-07-29)에서 실제로 구현됨 — `free_chat_user_id`와 발신자 id가 일치할 때만, 채널 내 다른 사람에게는 안 엶(사용자가 Phase 1 때부터 이미 결정해둔 것 그대로). 온디맨드 트리거/에스컬레이션 응답과 분리된 별도 권한 레벨.
+- **인가된 채널만**: `config.json`의 `channel_id` 하나만 반응, 그 외 채널/DM/다른 서버/봇 자신의 메시지는 전부 무시.
+- **채널 신뢰의 실제 범위(2026-07-30 정정)**: 원래는 "그 채널은 초대받은 사람 전원이 완전히 신뢰된다"가 신뢰 경계 전부라고 서술돼 있었다. 그런데 Codex의 독립 코드리뷰(2026-07-30)가 `verify-task-v2-retry`/`decision-retry` 답장 재시도는 결과적으로 풀-툴-액세스 `claude -p` 실행까지 이어지므로, 실질적으로 자유 채팅과 동급 권한을 채널 전체에 열어주고 있었다는 점을 지적했다 — 원래 문서 서술과 실제 위험 수준이 안 맞았던 것. 사용자 확인 후, pending-job 답장(`handle_pending_reply`) 전체를 `free_chat_user_id`(본인)로 제한했다. 무단 답장은 job을 건드리지 않고(삭제·소비 안 함, 진짜 소유자가 나중에 여전히 답장 가능) 거부 메시지만 보낸다. 채널 전체 신뢰가 실제로 적용되는 범위는 이제 `!주간보고서`/`!상태` 같은 순수 온디맨드 조회성 명령뿐이다.
+- **자유 채팅(Claude Code에 임의 지시)과 pending-job 답장 재시도는 모두 본인만**: Phase 3(2026-07-29)에서 자유 채팅에 먼저 구현됐고(`free_chat_user_id`와 발신자 id 일치 시에만), 2026-07-30에 pending-job 답장 재시도도 동일 게이트로 통일됐다 — 둘 다 결과적으로 같은 수준의 실행 권한(풀-툴-액세스 relay 또는 그에 준하는 워크플로우 재실행)을 열어준다는 점에서 하나의 권한 레벨로 취급하는 게 맞다는 판단.
 
 ## Phase 1 명령어
 
@@ -209,7 +218,12 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
 `git status`로 무해함 확인함). SKIP 분기는 별도로 `usage_gate_check`를 몽키패치해 안전하게
 재검증(코덱스 서브프로세스가 실제로 안 뜨는지 assert까지 포함).
 
-## `!코덱스` — 코덱스 직접 디스패치 (본인 전용, 2026-07-28)
+## `!코덱스` 계열 명령 — 코덱스 직접 디스패치·대화 (본인 전용, 2026-07-28, 2026-07-29에 `codex-bot.py`로 이전)
+
+**아래 내용은 전부 `bin/codex-bot.py`(별도 프로세스)에서 실행된다** — 원래 `discord-bot.py`
+안에서 구현됐다가 2026-07-29 "Split Codex-related Discord commands into a dedicated bot
+process" 커밋으로 옮겨졌다. 메커니즘 서술(before/after 델타 검증, 락, 타임아웃 등)은
+이전 후에도 그대로 유효해서 아래 원문을 고치지 않고 남겨뒀다 — 파일 위치만 바뀐 것으로 이해할 것.
 
 ```
 !코덱스 <저장소별칭> <작업 지시>
@@ -309,6 +323,28 @@ to retry"처럼 키워드는 포함하지만 의미는 반대인 답장도 재�
    별칭 목록 표시.
 셋 다 통과. scratch 저장소는 테스트 후 삭제.
 
+### `!코덱스대화` / `!코덱스대화초기화` — 연속 대화 (본인 전용, `codex-bot.py` 분리와 함께 신설, 이전까지 이 문서에 전혀 기록 안 돼 있었음)
+
+```
+!코덱스대화 <저장소별칭> <메시지>
+!코덱스대화초기화 <저장소별칭>
+```
+
+`!코덱스`(단발 디스패치)와 별개로, 하나의 저장소 별칭에 대해 여러 턴에 걸친 대화를 이어갈 수
+있는 명령. 세션 상태는 `~/.claude/discord-bot/codex-chat-session-<alias>.json`류 파일에
+`thread_id`로 저장되고(`_codex_chat_session_path`/`_load_codex_chat_thread_id`/
+`_save_codex_chat_thread_id`), `CODEX_DISPATCH_LOCKS[resolved_cwd]`(위 `!코덱스`의 동시실행
+락과 동일한 락, alias가 아니라 정규화된 실제 경로로 키를 잡음)로 리셋 중 저장/저장 중 리셋
+경쟁을 막는다. `on_message` 라우팅은 `"!코덱스대화초기화"`를 `"!코덱스대화"`보다 먼저
+체크해야 한다(둘 다 `"!코덱스"` 접두어를 공유해서, 순서가 바뀌면 초기화 명령이 항상 일반
+대화로 잘못 라우팅됨 — `elif` 체인이라 순서가 로직 그 자체).
+
+이름 대신 자연어로 부르는 방식(`CODEX_CHAT_WAKE_WORDS = ("코덱스", "콕스")` — "코덱스야
+...", "콕스 ...")도 같은 대화 상태를 공유하며 지원된다(`handle_codex_chat_wake`) — 저장소
+별칭 지정 없이 대화 맥락에서 이어가는 짧은 형태.
+
+**타임아웃**: `CODEX_CHAT_TIMEOUT_SECONDS`(30분), `!코덱스`와 동일한 관대한 여유.
+
 ## Phase 3 — 자유 채팅 (본인 전용, 2026-07-29)
 
 `config.json`의 `free_chat_user_id`에 해당하는 사용자가 이 채널에 보내는, 인식된 명령어도
@@ -391,6 +427,83 @@ spawn 가드로 assert). PROCEED 경로는 `claude -p` 서브프로세스 자체
 - `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능).
 - `hooks/work-log-stop-check.sh` — 실패(타임아웃 포함) 시 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 성공 시에도(LOGGED일 때만) 알림.
 - `workflows/verify-task-v2.js` — `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 전자는 답장 전체를 답변으로 붙여 재실행, 후자는 답장에서 재시도 키워드(재시도/retry/다시)만 감지해 maxRounds를 늘려 재실행.
+
+## 2026-07-30 통합 감사 — 두 봇 사이 톱니바퀴 불일치 발견·수정
+
+4개 병렬 조사(discord-bot.py 자체, codex-bot.py와의 드리프트, 생산자 측 스키마 일치,
+launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가능한 버그부터 잠재적 결함까지
+발견·수정, 나노단위로 하나씩 수정 후 코드품질(문법검사)+연동 검증(스텁 하네스로 로직 재현)을
+거침. 이 문서 자체의 갱신(코덱스 봇 분리 반영)도 이 감사의 결과물이다.
+
+- **치명적, 실사용 중 재현 가능했음**: `!코덱스`/`!코덱스대화`/`!코덱스대화초기화` 모두
+  `discord-bot.py`의 자유채팅 wake-word 배제 로직(`content.startswith(CODEX_CHAT_WAKE_WORDS)`)에
+  안 걸려서(그 상수는 접두어 없는 자연어 형태만 커버, `"!"`로 시작하는 명령형은 놓침) 매번
+  이중 발동 — codex-bot.py가 스코프 제한된 `codex exec`로 처리하는 동시에, discord-bot.py의
+  무제한 풀-툴-액세스 `claude -p` 자유채팅이 같은 텍스트를 두 번째로 처리, 같은 저장소에
+  락 없이 동시쓰기가 실제로 일어날 수 있었다. `content.startswith("!코덱스")`도 함께
+  체크하도록 수정.
+- **높음**: `hooks/work-log-stop-check.sh`의 사용량-게이트-스킵 분기가 실제 성공 경로와
+  똑같이 `exit 0`을 반환해서, `discord-bot.py`의 재시도 답장 핸들러가 "게이트에 또 막힘"과
+  "진짜 시작됨"을 구분 못 하고 항상 거짓 성공 응답을 보냈다 — `weekly-report.sh`가 이미
+  풀어둔 문제(전용 `exit 4`)와 동일 케이스라 같은 관례로 통일.
+- **중간**: discord-bot.py의 풀-툴-액세스 `claude -p` 킬 사이트 5곳(주간보고서/verify-task-v2
+  재시도 2개/자유채팅 중지·타임아웃)이 `codex-bot.py`엔 이미 적용된 SIGTERM-먼저 방식
+  (`_kill_process_group_graceful`) 대신 여전히 하드 SIGKILL — mid-write 파일 손상 위험,
+  전부 graceful로 전환. `handle_work_log_retry`만 `start_new_session`/프로세스그룹kill 패턴
+  자체가 빠져 있던 것도 다른 4개 핸들러와 통일.
+- **중간**: `codex-bot.py`의 `diff_stat`(무제한 길이)이 메시지 조합 순서상 뒤쪽의
+  의도적으로 tail-슬라이스된 필드(코덱스 응답/디스클레이머)보다 앞에 와서, 1900자 최종
+  절단이 앞이 아니라 뒤를 잘라야 할 내용을 대신 잘라버리는 경우가 있었음(예전에
+  discord-bot.py에서 한 번 고친 것과 같은 버그 클래스가 codex-bot.py에서 재발) —
+  `diff_stat` 자체를 소스에서 600자로 캡.
+- **중간**: `verify-task-v2.js`의 에스컬레이션 메시지가 `needs_clarification`일 때 실제
+  질문 대신 "AskUserQuestion을 직접 못 부름..." 고정 문구를 보여줬다(`reason || questions`
+  순서에서 `reason`이 항상 이김) — Discord에 실제 질문이 노출되도록 수정.
+- **중간**: `verify-task-v2.js`의 pending-job 작성이 서브에이전트에 자연어로만 위임되고
+  반환값을 전혀 확인 안 해서, 실패해도 완전히 조용했음 — schema를 줘서 성공/실패/사유를
+  구조화된 값으로 받고, 실패 시 최소한 로그에 남기도록 수정(근본적으로 LLM 지시이행에
+  의존한다는 한계 자체는 남음, `docs/verify-task-v2-design.md` 참고 대상 후보).
+- **낮음**: `codex-bot.py`의 `_git_output()`이 유일하게 `env=SUBPROCESS_ENV`를 안 넘기던
+  subprocess 스폰 지점 — 통일. 재시도-부정 정규식(`필요.{0,2}없`)이 "필요까지는 없"류의
+  더 긴 조사구를 놓치던 사각지대를 `{0,6}`으로 확장. pending-job 디렉토리에 정리 메커니즘이
+  전혀 없어(48시간 지난 항목은 "답장이 왔을 때"만 검사) 무응답 에스컬레이션이 영구
+  누적되던 것을, 봇 시작 시(`on_ready`) 1회 정리하는 스윕으로 보완. `verify-task-v2.js`의
+  `gatherContext`가 `cwd` 존재 여부를 한 번도 확인 안 해서 정리된 스크래치패드를 가리키는
+  낡은 pending-job에 답장하면 조용히 빈 컨텍스트로 계속 진행될 수 있던 잠재 결함도, 존재
+  확인 후 즉시 실패하도록 수정.
+- **의도적으로 안 고치고 남겨둔 것** (설계 결정이 필요하거나 범위가 더 큰 항목):
+  - `CODEX_DISPATCH_LOCKS`가 프로세스 로컬이라 두 봇 프로세스 사이 진짜 크로스프로세스
+    동시쓰기를 막지는 못함 — 위 wake-word 수정으로 가장 흔한 재현 경로는 닫혔지만, 사용자가
+    거의 동시에 서로 다른 명령(예: `!코덱스` + verify-task-v2 답장 재시도)으로 같은 저장소를
+    건드리는 드문 경우는 여전히 이론상 가능. 파일 기반 크로스프로세스 락 같은 새 공유
+    프리미티브가 필요해 별도 설계 판단 대상.
+  - `codex-bot.py`엔 `discord-bot.py`의 `!중지`에 대응하는 중단 명령이 없음(기능 패리티
+    갭, 버그는 아님).
+
+**Codex 독립 코드리뷰 (2026-07-30, 위 수정 완료 후) — 추가로 발견·처리한 것:**
+- **[blocking → 수정됨] pending-job 답장 전체가 채널 멤버 전원에게 열려 있었음** — 위
+  "의도적으로 안 고치고 남겨둔 것" 목록에 있던 항목을 사용자에게 다시 확인한 뒤 확정:
+  `handle_pending_reply`를 `free_chat_user_id`(본인)로 제한. 자세한 내용은 위 "권한 경계"
+  절 2026-07-30 정정 참고.
+- **[high → 수정됨] pending-job이 검증 전에 삭제되던 문제** — `job_type`이 알려진 4종
+  중 하나이고 `params`가 실제 dict일 때만 삭제+디스패치하도록 변경. 손상되거나 인식 못 하는
+  job은 파일을 보존하고 채널에 거부/경고 메시지만 보낸다(전엔 무조건 먼저 삭제해서, 핸들러의
+  `params.get(...)`이 예외를 던지면 재시도 정보가 영구 소실될 수 있었음).
+- **[blocking → 수정됨] graceful kill이 손자 프로세스 생존을 못 막을 수 있었음** —
+  `_kill_process_group_graceful`이 직계 자식(`proc`)의 종료만 확인하고 끝났는데, SIGTERM을
+  받은 wrapper가 먼저 죽고 그 밑의 실제 write를 하던 손자(codex/agy 등)가 아직 살아있는
+  경우를 못 잡았음. SIGTERM 이후 원래 pgid로 그룹 전체 생존 여부를 한 번 더 확인(signal 0
+  존재 확인)하고, 남아있으면 그제서야 SIGKILL로 확실히 정리하도록 수정.
+- **[medium → 수정됨] `diff_stat` 캡이 untracked 파일 많을 때 진짜 요약줄을 밀어냄** —
+  같은 날 앞서 한 첫 번째 캡 수정(D1)이 놓쳤던 케이스. tracked 요약과 untracked 메모를
+  각각 별도 예산으로 캡하도록 재수정(재현 테스트로 확인: untracked 60개에서도 요약줄 보존).
+- **검증 안 하고 낮은 우선순위로 남긴 것**: `verify-task-stop-check.sh`/`usage-routing-check.sh`의
+  fail-open 판정(가짜 경로도 통과), `weekly-report.sh`의 Calendar/사용량 감지 정규식이 실제
+  에러 문구 변형(예: "OAuth expired", "429")을 다 못 잡을 가능성, `score-dispatch.sh`의
+  `CODEX_BIN`/`AGY_BIN` override가 있어도 `verify-task-v2.js`의 preflight가 여전히 절대경로를
+  하드코딩해서 완전한 portability는 아니라는 지적, `docs/discord-bot.md`(이 파일)에 분리 전
+  `discord-bot.py` 기준 서술이 일부 남아있다는 지적(`!코덱스` 절 상단에 이동 안내를 달아
+  완화했으나 본문 전체를 재작성하진 않음).
 
 ## 알려진 제약
 

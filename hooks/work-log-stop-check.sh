@@ -134,7 +134,13 @@ if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
   write_pending_job "⏳ work-log 세션 기록을 건너뛰었습니다 — 계정 사용량 부족. 세션 ${SESSION_ID}.
 ${GATE_OUTPUT#SKIP: }
 이 메시지에 답장하면 (사용량 회복 후) 다시 시도합니다." || true
-  exit 0
+  # 실측 감사로 발견(2026-07-30): 여기서 exit 0을 쓰면 discord-bot.py의
+  # handle_work_log_retry가 "진짜 dispatch 성공"과 "게이트에 또 막혀 재시도
+  # job만 다시 큐에 쌓임"을 구분 못 해서, 게이트 스킵 상황에서도 거짓
+  # "재시도 시작했습니다" 응답을 보낸다 — weekly-report.sh가 이미 exit
+  # 4(usage-preflight-gate.sh 스킵 전용, 0/1/3과 구분)로 정확히 풀어놓은
+  # 문제와 완전히 동일한 케이스라, 같은 관례를 그대로 따른다.
+  exit 4
 fi
 
 LOGFILE="$STATE_DIR/${SESSION_ID}.log"
