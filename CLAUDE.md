@@ -27,6 +27,7 @@ This is an index only — each entry is a one/two-line pointer. Full rationale, 
 - `hooks/idea-meeting-plan-mode.sh` — UserPromptSubmit hook: prompt containing "아이디어 회의" injects a nudge to call `EnterPlanMode`, so the mandatory category above has something to detect. → [docs/idea-meeting-plan-mode.md](docs/idea-meeting-plan-mode.md)
 - `workflows/lib/coach-headroom.sh` / `usage-advisor.sh` / `route-dispatch.sh` — usage-balancing routing per Rule A (objectified 2026-07-27: exempt only for 독립검사 실행 중 / 코덱스가 못 쓰는 도구 필요 — no more subjective "orchestrator judgment") / Rule B ("안티그래비티는 명시적 트리거 시만"): codex-capable work compares codex vs Claude headroom (advisor, not fully enforceable — "prefer claude" just means the session proceeds itself), simple work tries antigravity then falls back to codex (dispatch, fully enforced). Not used by verify-task(-v2)'s fixed author/grader role assignments. → [docs/usage-routing.md](docs/usage-routing.md)
 - `hooks/usage-routing-check.sh` — Stop hook that nags (once per session) if Claude did substantial direct work while Claude's own `coach` usage level was yellow/red with no sign of consulting the routing policy, unless a Rule A exception (독립검사 스킬 실행 / `mcp__claude-in-chrome__*` 사용) is present. → [docs/usage-routing.md](docs/usage-routing.md)
+- `hooks/session-cost-gate-stop-check.sh` — Stop hook that nags (once per session) when the most recent turn's context size crosses 180K tokens, suggesting a new session. → [docs/session-cost-gate.md](docs/session-cost-gate.md)
 
 ### 일정비서 (work/calendar secretary)
 
