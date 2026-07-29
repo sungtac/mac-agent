@@ -501,6 +501,19 @@ async def _handle_codex_dispatch_locked(message: discord.Message, alias: str, cw
 # repo, not try to resume one rooted somewhere else.
 CODEX_CHAT_SESSION_DIR = Path.home() / ".claude" / "discord-bot" / "codex-chat-sessions"
 CODEX_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스 — a chat turn can still be a real coding task
+# 2026-07-30, 사용자 확정("낮춤(medium으로) — 채팅/wake-word만"): 실측으로
+# 확인된 실제 문제 — "콕스야" -> "응, 콕스 여기 있어" 같은 한 줄짜리 인사에도
+# 19.5~19.8초가 걸렸다(Discord 메시지 타임스탬프 직접 대조로 확인). 원인은
+# ~/.codex/config.toml의 전역 `model_reasoning_effort = "high"` — 코딩
+# 작업엔 맞는 설정이지만 캐주얼한 채팅 응답에도 똑같이 적용되고 있었다.
+# `!코덱스`(handle_codex_dispatch, codex-execute-dispatch.sh 경유)와
+# verify-task-v2 위임은 전역 high 설정을 그대로 쓰도록 안 건드림 — 이
+# 오버라이드는 _codex_chat_turn_locked(대화형 채팅/wake-word 경로)에만
+# 적용. `-c 'model_reasoning_effort="medium"'`(TOML 문자열 값 명시적 인용
+# — 인용 없이 넘기면 CLI가 "TOML 파싱 실패 시 리터럴로 처리"하는 폴백
+# 경로에 기대게 되므로, 신뢰도를 위해 명시적으로 인용) 실측으로 실제
+# "reasoning effort: medium"이 반영되는 것 확인.
+CODEX_CHAT_REASONING_EFFORT_ARGS = ["-c", 'model_reasoning_effort="medium"']
 
 
 def _codex_chat_session_path(alias: str) -> Path:
@@ -750,7 +763,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             # 반복 기록돼 있었다(사용자가 매번 `!코덱스대화초기화`로 우회).
             # resume은 이미 확립된 스레드를 이어가는 것뿐이라 git 저장소
             # 경계를 새로 검증할 필요가 없다는 점에서 안전한 우회.
-            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--skip-git-repo-check", "--json", "--", prompt_text]
+            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--skip-git-repo-check", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "--", prompt_text]
             # Previously only sent on a brand-new thread (else branch
             # below) — a resume turn computed dirty_note above but threw
             # it away, so the "uncommitted changes already present"
@@ -768,7 +781,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             # 쌓여서 노이즈가 된다. 새 스레드 첫 턴에만 넣고, 그 뒤로는
             # exec resume이 이어받는 스레드 자체 기억에 맡긴다.
             new_thread_prompt_text = f"{CODEX_BOT_PERSONA}\n\n{prompt_text}"
-            args = [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "-C", str(cwd), "--", new_thread_prompt_text]
+            args = [str(CODEX_BIN), "exec", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "-s", "workspace-write", "-C", str(cwd), "--", new_thread_prompt_text]
             await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
 
         proc = await asyncio.create_subprocess_exec(
