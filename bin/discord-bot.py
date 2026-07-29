@@ -927,7 +927,19 @@ async def handle_free_chat(message: discord.Message):
                 return
             out_text = (stdout or b"").decode(errors="replace").strip()
             if proc.returncode != 0:
-                await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
+                # 2026-07-30 fix (실채널 테스트로 발견): 계정 사용 한도 초과는
+                # weekly-report.sh가 이미 fail-fast로 친절하게 안내하는데,
+                # 여기는 그 처리가 없어서 "You've hit your session limit..."
+                # 같은 원문을 그대로 exit=1 에러처럼 던지고 있었다 — 자유채팅
+                # 사용자 입장에선 코드가 고장난 것처럼 보이지만 실제로는 계정
+                # 5시간/7일 한도 소진일 뿐. weekly-report.sh와 동일한 패턴
+                # 매칭(hit your ... limit/rate limit/overloaded/429 등)으로
+                # 구분해서, 이 경우만 별도의 안내 메시지를 보낸다 — 코드 결함이
+                # 아니라는 걸 명확히 하고, 재시도 타이밍도 알려준다.
+                if re.search(r'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b', out_text, re.IGNORECASE):
+                    await message.channel.send(f"⏳ 계정 사용 한도로 지금은 응답할 수 없습니다.\n```\n{out_text[-500:]}\n```\n한도가 회복되면 다시 말씀해주세요(코드 결함이 아니라 계정 한도 문제입니다).")
+                else:
+                    await message.channel.send(f"❌ 실패 (exit={proc.returncode}).\n```\n{out_text[-1500:]}\n```"[:1900])
                 return
             # Only persist the session id AFTER a successful run — an id from a
             # run that errored out (e.g. Claude Code couldn't start at all)

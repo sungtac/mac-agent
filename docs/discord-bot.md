@@ -643,6 +643,49 @@ Bash로 직접 `claude -p`를 부름)은 실측으로 막혔다 — `codex exec 
 (2) "README.md에 한 줄 추가"(코딩 작업)에는 위임 마커 없이 직접 처리 — 판단 자체가 실측
 확인됨.
 
+### "100% 동일" 요청 — codex-execute-dispatch.sh만으론 부족했음
+
+사용자 후속 요청: "터미널의 너와 디스코드의 맥은 100% 동일해야해. 콕스의 역할도 마찬가지고."
+위 `MAC_BOT_PERSONA`는 코덱스 위임을 `codex-execute-dispatch.sh` 직접호출로만 안내했는데 —
+이건 이 저장소에서 실제 "코딩 위임"의 정식 엔진인 `verify-task-v2.js` Full track(스펙 고정→
+블라인드 비평→다단계 검증→하네스 규칙 누적, `verify-task-v2-design.md` 참고)을 완전히
+우회하는 얕은 버전이었다. 완전한 동일성이 아니었음.
+
+**필요한 인프라는 이미 다 있었다**(새로 만들 필요 없음, 확인만 하면 됐음):
+- `~/.claude/settings.json`의 Stop 훅(`verify-task-stop-check.sh` 등)은 유저 스코프라 별도
+  `--settings` override가 없는 `claude -p` 헤드리스 호출에도 그대로 적용된다 — 즉 맥이 3개
+  이상 파일을 직접 고치면 이미 인터랙티브 세션과 동일한 MANDATORY 검증 훅이 걸린다.
+- `handle_free_chat`의 env는 이미 `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`을 설정해서, 자기
+  턴 안에서 `Workflow` 호출이 끝날 때까지 제대로 블록한다(`handle_verify_task_v2_retry`가
+  이미 실측 검증한 것과 동일 메커니즘).
+- `FREE_CHAT_TIMEOUT_SECONDS`도 처음부터 "`!코덱스`/verify-task-v2와 동일 예산"으로 30분
+  잡혀 있었다(코드 주석에 이미 그렇게 적혀 있었음).
+
+빠진 건 인프라가 아니라 **페르소나가 이 능력을 안 알려줬다는 것뿐**이었다.
+
+**비용 트레이드오프 확인 후 사용자 확정**: Claude 계정이 이 시점 7일 창 60%로 빨간불이고
+직전에 실제 세션 한도초과까지 겪은 상태라, "모든 위임을 무조건 verify-task-v2로"는 위험
+크다고 판단해 사용자에게 확인 → **"작은 작업은 가볍게, 진짜 코딩 위임만
+verify-task-v2로"** 확정.
+
+**구현**: `MAC_BOT_PERSONA`를 3단 판단 기준으로 재작성 —
+1. **트리비얼**(오타, 한 줄 확인): 맥이 Read/Edit/Bash로 직접 처리.
+2. **소규모 위임**(파일 하나, 간단한 변경): 기존 `codex-execute-dispatch.sh` 직접호출 유지.
+3. **진짜 코딩 위임**(새 기능, 여러 파일, 로직 있는 작업): `Workflow({scriptPath:
+   "workflows/verify-task-v2.js", args: {task, cwd, persona}})`를 맥이 직접 호출 — 코덱스가
+   스스로 계획을 세우고, 클로드/안티그래비티가 블라인드 비평하고, 반영해서 실행하고, 다시
+   듀얼 코드리뷰까지 거치는 정식 파이프라인이 그대로 돈다. 파일수/민감경로 기준 경량/전체
+   자동 티어링은 verify-task-v2 스스로 하므로 맥은 그냥 불러주기만 하면 됨.
+
+`_delegate_to_claude`(콕스→맥 위임)는 별도 수정 없이 자동으로 이 개선을 물려받음 —
+`MAC_BOT_PERSONA`를 그대로 import해서 재사용하는 구조라, 상수 하나만 고치면 두 경로 다
+갱신된다.
+
+**검증(2026-07-30, 계정 빨간불이라 저비용 방식으로만)**: 전체 파이프라인을 실제로 돌리지
+않고, "실행하지 말고 방식만 한 단어로 답해" 프롬프트로 판단 로직만 확인 — 3개 요청("오타
+고쳐줘"/"README 섹션 추가"/"pending-job 정리 대시보드 새로 만들어줘, 파일 여러 개 걸쳐도
+됨")에 정확히 "직접 처리 / codex-execute-dispatch.sh / Workflow+verify-task-v2"로 분류됨.
+
 ### 실채널 테스트로 발견한 별개 버그 — `codex exec resume`의 신뢰 검사 실패
 
 사용자가 "맥아"/"콕스야"로 실제 채널에서 테스트하다가 "❌ 코덱스 실행 실패 (exit=1)... Not
