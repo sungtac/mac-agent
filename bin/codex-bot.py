@@ -36,7 +36,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, is_group_address, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
+from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, is_group_address, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, MAC_BOT_NAME, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
@@ -741,6 +741,21 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             )
         else:
             prompt_text = text
+
+        # 2026-07-30, 실측 버그: CODEX_BOT_PERSONA의 "상대를 대신 소개하지
+        # 마라" 지침은 새 스레드 첫 턴에만 들어간다(위 else 분기, 스레드
+        # 노이즈 방지 목적) — 그런데 사용자가 실제로 겪은 문제는 이미
+        # 진행 중이던 기존 스레드(resume)에서 발생했고, 거기엔 그 지침이
+        # 아예 없어서 재기동으로도 반영이 안 됐다. resume/새 스레드 여부와
+        # 무관하게, 이번 턴이 그룹 지칭이면 매번 짧게 재주입한다 — 스레드
+        # 히스토리에 계속 쌓이긴 하지만 그룹 지칭 요청 자체가 매번 발생하는
+        # 것이므로 노이즈보다 정확성이 우선.
+        if is_group_address(text):
+            prompt_text = (
+                f"[중요 — 이번 요청은 '둘 다'/'각자'/'모두'처럼 여러 참가자를 한꺼번에 지칭한다. "
+                f"{MAC_BOT_NAME}을 대신해서 소개하거나 답하지 마 — 네 얘기만 해. {MAC_BOT_NAME}은 "
+                "같은 요청에 별도로, 독립적으로 응답해.]\n" + prompt_text
+            )
 
         existing_thread_id = _load_codex_chat_thread_id(alias)
         if existing_thread_id:
