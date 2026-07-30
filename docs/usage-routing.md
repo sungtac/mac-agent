@@ -33,7 +33,18 @@
 - `workflows/lib/coach-headroom.sh` — `coach --json`에서 클로드 5시간창/코덱스 7일창 잔여율을 `"<claude_pct> <codex_pct>"` 한 줄로 뽑는 공용 헬퍼. `route-dispatch.sh`·`usage-advisor.sh` 둘 다 이걸 재사용(중복 제거). 안티그래비티는 여기서 안 다룸 — `coach`가 애초에 안티그래비티 사용량을 못 봄.
 - `workflows/lib/usage-advisor.sh` — Rule 1의 결정론적 비교. 동률이거나 클로드 값을 못 읽으면(0) 코덱스 우선 — 코덱스는 실제로 사용량이 보이고 대체로 여유(96%+ 관찰됨)라, 불확실한 클로드 쪽보다 안전한 기본값.
 - `workflows/lib/route-dispatch.sh` — Rule B 트리거 지점. 안티그래비티 우선 시도(`score-dispatch.sh` 위에 얹지 않고 독립 구현 — score-dispatch.sh는 JSON 채점용이라 일반 텍스트 응답을 "파싱 실패"로 오판해서 항상 코덱스로 폴백하는 버그가 실제로 났었음, 테스트 중 발견·수정), 실패/rate-limit 신호 시 코덱스 폴백.
+- `discord-bot.py` 자유채팅 폴백 — Claude가 quota로 막힐 때 Antigravity를 먼저 시도하고, 결과가 usable하지 않을 때만 Codex 7일창 게이트 후 실행한다. Antigravity는 `coach` 수치가 신뢰되지 않아 결과 기반으로만 판정한다. 공통 실행/분류 계약은 `discord_bot_common.py`의 `ProviderResult`/`run_provider_attempt`/`run_provider_fallback_chain`이다.
 - `hooks/usage-routing-check.sh` — Stop 훅. 위 "코드 강제화의 실제 한계" 참고.
+
+### Discord 자유채팅의 provider 순서
+
+`usage-advisor.sh`의 Claude↔Codex 비교는 라이브 오케스트레이터의 작업 배정 권고이고,
+Discord 자유채팅의 실패 폴백은 별도 자동 경로다. 자유채팅은 정상일 때 Claude의
+`--resume` 세션을 유지한다. Claude가 사전/사후 quota 실패를 보이면
+`Antigravity → Codex` 순으로 한 번씩 시도한다. Antigravity 사용량을 임의의 퍼센트로
+환산하지 않는 것이 중요하다. Codex는 실행 직전 기존 `usage-preflight-gate.sh codex`를
+통과해야 하며, 둘 다 실패하면 원인 요약을 사용자에게 돌려준다. 이 경로는
+`verify-task-v2`의 역할 고정(Claude/Antigravity 리뷰, Codex 실행)을 변경하지 않는다.
 
 ## `usage-preflight-gate.sh` — 예약/트리거 자동화용 사전 게이트 (2026-07-28)
 

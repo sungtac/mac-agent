@@ -11,12 +11,15 @@ and no side effects at import time, so either bot can import from it freely.
 """
 import asyncio
 import contextlib
+from dataclasses import dataclass
 import fcntl
 import hashlib
+import json
 import os
 import re
 import signal
 from pathlib import Path
+from typing import Awaitable, Callable
 
 MAC_AGENT = Path.home() / "mac-agent"
 
@@ -33,6 +36,133 @@ QUOTA_LIMIT_PATTERN = re.compile(
     r'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b',
     re.IGNORECASE,
 )
+
+
+@dataclass(frozen=True)
+class ProviderResult:
+    """Normalized result contract for a single external provider attempt.
+
+    The caller decides whether a generic error is retryable; this class only
+    answers the mechanical question "what did the process return?".  Keeping
+    this distinction in one place prevents the Discord fallback and the
+    route-dispatch fallback from growing subtly different quota heuristics.
+    """
+
+    provider: str
+    returncode: int | None
+    output: str
+
+    @property
+    def status(self) -> str:
+        text = (self.output or "").strip()
+        if self.returncode == 0 and text:
+            return "ok"
+        if not text:
+            return "empty"
+        # A short quota/error line is a depletion signal.  A long successful
+        # answer can legitimately discuss rate limits as its subject.
+        if (self.returncode != 0 or len(text) < 200) and QUOTA_LIMIT_PATTERN.search(text):
+            return "quota"
+        if self.returncode != 0:
+            return "error"
+        return "empty"
+
+    @property
+    def usable(self) -> bool:
+        return self.status == "ok"
+
+    def diagnostic(self, max_chars: int = 300) -> str:
+        text = (self.output or "").strip()
+        if len(text) > max_chars:
+            text = text[-max_chars:]
+        return text or f"exit={self.returncode}; 응답 없음"
+
+
+@dataclass(frozen=True)
+class ProviderFallbackResult:
+    """Outcome of the Antigravity -> Codex fallback chain."""
+
+    antigravity: ProviderResult
+    codex: ProviderResult | None
+    codex_skip_reason: str | None
+    stop_reason: str | None = None
+
+
+def format_provider_fallback_failure(result: ProviderFallbackResult, max_chars: int = 1900) -> str:
+    """Build a Discord-safe failure envelope without hiding provider labels."""
+    antigravity_detail = result.antigravity.diagnostic(450)
+    if result.codex_skip_reason:
+        codex_detail = f"사전 게이트 차단: {result.codex_skip_reason[:450]}"
+    elif result.codex is None:
+        codex_detail = "실행되지 않음"
+    else:
+        codex_detail = result.codex.diagnostic(450)
+    text = (
+        "❌ 대체 provider 체인도 완료하지 못했습니다.\n"
+        f"- Antigravity: {antigravity_detail}\n"
+        f"- Codex: {codex_detail}\n"
+        "사용량 회복 후 다시 말씀해주세요."
+    )
+    return text[:max_chars]
+
+
+def load_provider_context(path: Path) -> dict | None:
+    """Load one bounded fallback response for the next native session turn."""
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict) or not data.get("response"):
+            return None
+        return data
+    except Exception:
+        return None
+
+
+def save_provider_context(path: Path, provider: str, user_text: str, response: str) -> None:
+    """Persist bounded cross-provider context without making the turn fail."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "provider": provider,
+            "user_message": user_text[-4000:],
+            "response": response[-6000:],
+        }, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+def clear_provider_context(path: Path) -> None:
+    path.unlink(missing_ok=True)
+
+
+def format_provider_context(data: dict) -> str:
+    """Render persisted fallback context as an explicitly untrusted prompt block."""
+    return (
+        "[참고 — 직전 요청에 대한 대체 provider 응답. Claude 세션 기록에는 아직 "
+        "들어오지 않은 참고자료이므로, 사실 여부를 확인하며 이어서 답해:]\n"
+        f"provider: {data.get('provider', 'unknown')}\n"
+        f"사용자 요청: {data.get('user_message', '')}\n"
+        f"대체 응답:\n{data.get('response', '')}"
+    )
+
+
+async def run_provider_fallback_chain(
+    antigravity_attempt: Callable[[], Awaitable[ProviderResult]],
+    codex_gate: Callable[[], Awaitable[str | None]],
+    codex_attempt: Callable[[], Awaitable[ProviderResult]],
+    should_continue: Callable[[], bool] | None = None,
+) -> ProviderFallbackResult:
+    """Advance to Codex only when Antigravity did not produce an answer."""
+    antigravity = await antigravity_attempt()
+    if antigravity.usable:
+        return ProviderFallbackResult(antigravity, None, None)
+    if should_continue is not None and not should_continue():
+        return ProviderFallbackResult(antigravity, None, None, "사용자가 중단함")
+    skip_reason = await codex_gate()
+    if skip_reason:
+        return ProviderFallbackResult(antigravity, None, skip_reason)
+    if should_continue is not None and not should_continue():
+        return ProviderFallbackResult(antigravity, None, None, "사용자가 중단함")
+    return ProviderFallbackResult(antigravity, await codex_attempt(), None)
 
 # Natural-chat wake words for codex-bot.py's handle_codex_chat_wake — a
 # message starting with one of these (e.g. "코덱스야 ...", "콕스 ...") is
@@ -355,6 +485,56 @@ async def _kill_process_group_graceful(proc, grace_seconds: float = 2.0) -> None
     except (ProcessLookupError, PermissionError, OSError):
         return  # group is confirmed empty (or we can't check further)
     _force_kill_pgid(pgid)
+
+
+async def run_provider_attempt(
+    provider: str,
+    args: list[str],
+    timeout_seconds: float,
+    env: dict[str, str] | None = None,
+    cwd: str | os.PathLike[str] | None = None,
+    on_process_started: Callable[[object], None] | None = None,
+    on_process_finished: Callable[[object], None] | None = None,
+) -> ProviderResult:
+    """Run one text provider attempt under the shared process contract.
+
+    All fallback callers use a new process group, stdin is closed, stdout and
+    stderr are combined, and timeout cleanup is graceful before escalation.
+    Spawn/timeout failures are returned as a normal `ProviderResult` so a
+    later provider can still turn the same request's next gear.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError("timeout_seconds must be positive")
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            env=env or SUBPROCESS_ENV,
+            cwd=str(cwd) if cwd is not None else None,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            stdin=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        return ProviderResult(provider, None, f"spawn failed: {exc}")
+
+    try:
+        if on_process_started is not None:
+            on_process_started(proc)
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+    except asyncio.TimeoutError:
+        await _kill_process_group_graceful(proc)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except (asyncio.TimeoutError, ProcessLookupError):
+            pass
+        return ProviderResult(provider, None, f"timeout after {timeout_seconds:g}s")
+    except OSError as exc:
+        return ProviderResult(provider, proc.returncode, f"communication failed: {exc}")
+    finally:
+        if on_process_finished is not None:
+            on_process_finished(proc)
+    return ProviderResult(provider, proc.returncode, (stdout or b"").decode(errors="replace").strip())
 
 
 REPO_LOCK_DIR = Path.home() / ".claude" / "discord-bot" / "repo-locks"

@@ -836,7 +836,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
         if proc.returncode != 0 or thread_id is None:
             # 2026-07-30, 사용자 명시적 요청("실제 계정을 따라가지 말고
             # 멀티에이전트를 따라가야 한다") — discord-bot.py의
-            # _fallback_to_codex와 대칭: 콕스가 계정/사용량 한도로 실패하면
+            # 자유채팅의 provider 폴백과 대칭: 콕스가 계정/사용량 한도로 실패하면
             # "재시도하세요"로 끝내지 말고 맥으로 자동 폴백한다.
             # _delegate_to_claude()는 콕스→맥 위임 마커 처리에 이미 쓰던
             # 헬퍼를 그대로 재사용 — "판단해서 위임"이든 "실패해서 폴백"이든

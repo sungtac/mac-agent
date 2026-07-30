@@ -11,11 +11,12 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 - `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`. `!주간보고서`/`!상태`/`!새대화`/`!중지`, work-log/verify-task-v2 답장 재시도, Phase 3 자유채팅을 담당.
 - `bin/codex-bot.py` — **별도 프로세스, 별도 launchd 등록**(`com.macagent.codex-bot.plist`, 같은 `KeepAlive`/`RunAtLoad` 패턴, 재기동은 `launchctl kickstart -k gui/$(id -u)/com.macagent.codex-bot`), **별도 설정 파일**(`~/.claude/discord-bot/codex-bot-config.json` — `discord-bot.py`의 `config.json`과 의도적으로 분리, 자체 토큰). `!코덱스`(직접 디스패치), `!코덱스대화`(연속 대화, 세션 지속), `!코덱스대화초기화`(세션 리셋)를 담당 — 상세는 아래 "`!코덱스` 계열 명령" 절.
-- `bin/discord_bot_common.py` — 두 프로세스가 공유하는 헬퍼 모듈: 서브프로세스 env 빌더(`SUBPROCESS_ENV`), 사용량 게이트(`usage_gate_check`), 프로세스그룹 종료 헬퍼(`_kill_process_group`/`_kill_process_group_graceful`), 코덱스 wake-word 상수(`CODEX_CHAT_WAKE_WORDS`).
+- `bin/discord_bot_common.py` — 두 프로세스가 공유하는 헬퍼 모듈: 서브프로세스 env 빌더(`SUBPROCESS_ENV`), 사용량 게이트(`usage_gate_check`), provider 결과/폴백 체인/세션 맥락 계약(`ProviderResult`, `run_provider_attempt`, `run_provider_fallback_chain`, `*_provider_context`), 프로세스그룹 종료 헬퍼(`_kill_process_group`/`_kill_process_group_graceful`), 코덱스 wake-word 상수(`CODEX_CHAT_WAKE_WORDS`).
 - **두 프로세스가 같은 Discord 채널을 함께 본다**(`config.json`/`codex-bot-config.json`의 `channel_id`가 동일 — 의도된 설계, 둘 다 모든 메시지를 봐야 각자 자기 명령만 골라 응답할 수 있다). 그래서 라우팅 배제 로직이 정합적이어야 한다 — 한쪽이 처리할 메시지를 다른 쪽이 못 걸러내면 이중 응답이 난다(2026-07-30에 실제로 이 클래스 버그가 발견·수정됨, 아래 "2026-07-30 통합 감사" 절 참고).
 - `bin/discord-notify.sh <message>` — 봇 프로세스와 무관하게 Discord REST API로 메시지 한 번 보내는 헬퍼. 실패해도 항상 exit 0 — 알림 실패가 호출한 스크립트(주간보고서 등)를 절대 죽이면 안 됨. Phase 2부터 성공 시 게시된 메시지의 Discord id를 stdout으로 반환(실패 시 빈 문자열) — 호출한 스크립트가 그 id로 pending-job을 기록해 나중에 답장을 매칭할 수 있게 함.
 - 설정: `~/.claude/discord-bot/config.json` (`{"token":..., "channel_id":..., "free_chat_user_id":...}`) — 이 레포 밖, `chmod 600`. 토큰은 Discord 개발자 포털(https://discord.com/developers/applications)에서 발급, "Message Content Intent"를 반드시 켜야 봇이 메시지 내용을 읽음. `free_chat_user_id`는 Phase 1부터 미리 넣어둔 값이었고, `!코덱스`(2026-07-28)에서 처음 참조하기 시작했으며 Phase 3(2026-07-29, 자유 채팅)에서도 그대로 재사용한다 — "Claude/코덱스에게 임의 지시를 내릴 수 있는 사람"이라는 같은 권한 레벨을 의미.
 - `~/.claude/discord-bot/free-chat-session.json` — Phase 3 세션 상태(레포 밖, git 추적 안 함). `{"session_id": <uuid>, "last_used_at": ISO시각}` 하나만 담는다 — 채널당 자유 채팅 사용자가 한 명뿐이라 여러 대화를 구분할 필요가 없음. `!새대화`로 삭제하면 다음 메시지가 새 세션을 시작한다.
+- `~/.claude/discord-bot/free-chat-fallback-context.json` — Claude 한도 때 Antigravity/Codex가 답한 마지막 요청/응답을 bounded하게 저장한다. 다음 Claude 턴에 “신뢰되지 않은 참고자료”로 한 번 주입하고 Claude가 정상 응답하면 삭제한다. `!새대화`에서도 삭제한다.
 - `~/.claude/discord-bot/pending/<message_id>.json` — Phase 2 pending-job 저장소(레포 밖, git 추적 안 함). 에스컬레이션을 쏜 스크립트가 `discord-notify.sh`가 반환한 message id로 기록: `{"type":"weekly-report-retry"|"work-log-retry"|"verify-task-v2-retry"|"verify-task-v2-decision-retry","created_at":ISO시각,"params":{...}}` — `weekly-report-retry`는 `params`가 비어있고(자기완결 스크립트라 외부 상태 불필요), `work-log-retry`는 `params`에 `session_id`/`transcript_path`를, `verify-task-v2-retry`는 `params`에 `task`(원본 전체, 자르지 않음)/`cwd`/`persona`/`maxRounds`/`historyFile`/`harnessFile`/`questions`를, `verify-task-v2-decision-retry`는 `questions`만 빼고 동일한 필드를 담는다(각각 재실행에 필요한 상태를 스크립트/워크플로우 자체가 못 들고 있어서). `discord-bot.py`가 답장을 받으면 `message.reference.message_id`로 이 파일을 찾아 `type`에 따라 디스패치하고 처리 후 즉시 삭제(중복 답장 방지). 48시간 지난 항목은 만료 처리. `type`을 못 알아들으면(향후 미구현 소스 등) 조용히 로그만 남기고 무시 — 스키마가 깨지지 않고 확장 가능.
 
 ## 권한 경계 (사용자가 명시적으로 결정한 것, 재검토 없이 그냥 넓히지 말 것)
@@ -428,6 +429,17 @@ Phase 3은 그보다 훨씬 넓은 "뭐든 클로드에게, 대화하듯"을 목
 - 계정 사용량 사전 게이트(`usage_gate_check("claude")`, `!코덱스`/verify-task-v2 재시도와
   공유)를 여기도 그대로 적용. 타임아웃 30분(`!코덱스`와 동일).
 
+**Claude 한도 폴백 톱니(2026-07-30)**: 자유채팅에서 Claude 사전 게이트가 막히거나
+Claude의 짧은 재시도까지 quota 오류로 끝나면, `discord-bot.py`는 같은 사용자 메시지를
+Antigravity에 먼저 전달한다. Antigravity는 `coach`에서 신뢰할 수 있는 잔여량이 보이지
+않으므로 수치 게이트를 만들지 않고, 빈 응답/비정상 종료/짧은 quota 오류를 결과로 판정한다.
+Antigravity가 실패할 때만 Codex 7일창 사전 게이트를 확인한 뒤 Codex를 실행한다. 두 대체
+provider가 모두 실패하면 provider별 진단을 포함한 Discord 1900자 이내 실패 봉투를 보낸다.
+모든 대체 실행은 `FREE_CHAT_LOCK` 안에서 순차적으로 진행하며, 실제 timeout은 process
+group 전체를 종료한다. 이 경로는 응답 폴백이고, 코딩 작업의 계획/비평/실행 검증 역할은
+기존 `verify-task-v2`를 그대로 따른다. 상세 기준선은
+[`provider-gear-mesh-audit.md`](provider-gear-mesh-audit.md)에 기록했다.
+
 **실측 검증(2026-07-29)**: 실제 계정이 이 시점 클로드 5시간창 0%라, 사용량 게이트가 진짜
 SKIP을 태우는 것까지 가짜 `discord.Message`로 확인(claude -p 스폰 자체가 안 일어나는 것을
 spawn 가드로 assert). PROCEED 경로는 `claude -p` 서브프로세스 자체를 모킹해서(실제 헤드리스
@@ -707,11 +719,13 @@ verify-task-v2로"** 확정.
   파이썬으로 옮긴 공유 상수)을 추가해 discord-bot.py/codex-bot.py가 같은 기준으로 "이건
   코드 버그가 아니라 계정 한도"를 판정하도록 통일.
 - `discord-bot.py`: `handle_free_chat`의 두 감지 지점(사전 `usage_gate_check` 게이트 / 실행
-  후 실패 문구 매칭) 모두에서 새 헬퍼 `_fallback_to_codex(message, text)`를 호출 — 같은
-  메시지를 `codex exec -s workspace-write -C <FREE_CHAT_CWD>`로 그대로 재시도(자유채팅과
-  동일한 넓은 권한 범위 승계, `FREE_CHAT_USER_ID` 검사는 이미 통과한 요청이므로). 코덱스도
-  한도 부족이면(이중 폴백 실패) 그 사실을 명확히 안내. 응답에 "🔀 (맥 대신 코덱스가 응답)"
-  라벨을 붙여 어떤 엔진이 실제로 답했는지 투명하게 표시.
+  후 실패 문구 매칭) 모두에서 `_fallback_to_provider_chain(message, text)`를 호출 — 같은
+  메시지를 먼저 `agy --print --mode plan`으로 전달하고, Antigravity가 usable하지 않을 때만
+  Codex 7일창 게이트 후 `codex exec -s read-only -C <FREE_CHAT_CWD>`로 재시도한다. 이
+  폴백은 읽기/응답 전용이며 실제 파일 수정은 하지 않는다. 각 provider의 현재 process를
+  `FREE_CHAT_CURRENT_PROC`에 등록하므로 `!중지`가 실제 실행 중인 톱니를 종료하고 다음
+  provider 진행도 막는다. 성공한 대체 응답은 다음 Claude 턴의 bounded 참고자료로 연결한다.
+  응답에는 실제 엔진 라벨을 붙이고, 둘 다 실패하면 두 provider 진단을 함께 안내한다.
 - `codex-bot.py`: `_codex_chat_turn_locked`의 실패 분기에서 `raw` 출력이
   `QUOTA_LIMIT_PATTERN`에 매칭되면 기존 `_delegate_to_claude()`(콕스→맥 위임 마커 처리에
   이미 쓰던 헬퍼)를 그대로 재사용해 맥으로 폴백 — "판단해서 위임"이든 "실패해서 폴백"이든
