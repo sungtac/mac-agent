@@ -14,12 +14,13 @@ Codex가 실제 실행 경로에서 서로 이어지는지 감사하고, 변경 
 Discord 자유채팅
   └─ discord-bot.py / handle_free_chat
        ├─ usage_gate_check(claude)
+       ├─ 새 세션이고 Codex가 20%p 이상 여유 있으면 usage-advisor→대체 체인
        ├─ Claude claude -p (--resume 세션)
        ├─ quota 문구면 Claude 10초 후 1회 재시도
        └─ 실패하면 _fallback_to_provider_chain
             ├─ Antigravity agy --mode plan (읽기 전용)
             ├─ 실패하면 usage_gate_check(codex)
-            ├─ Codex codex exec -s read-only
+            ├─ Codex codex exec -s read-only --skip-git-repo-check
             └─ Codex도 차단/실패하면 종료
 
 별도 단순작업 라우터
@@ -34,20 +35,22 @@ Discord 자유채팅
        └─ Codex: 조정/실행
 ```
 
-핵심 결론: Discord 자유채팅에도 Antigravity→Codex 톱니를 연결했고, 실행 중 provider
-추적/중단과 직전 대체 응답의 다음 Claude 턴 주입을 추가했다. 단, 이 경로는 적극적인
-잔여량 균등 배분이 아니라 Claude 정상 사용을 우선하는 장애완화형 폴백이다.
+핵심 결론: Discord 자유채팅에 Antigravity→Codex 톱니를 연결했고, 새 Claude 세션의
+시작점에서는 `usage-advisor.sh`의 잔여량 비교를 실제 라우팅에 반영한다. Codex가
+20%p 이상 앞설 때만 Claude를 아끼고 대체 체인으로 시작하며, 기존 `--resume` 세션은
+대화 연속성 때문에 Claude에 고정한다. 실행 중 provider 추적/중단과 직전 대체 응답의
+다음 Claude 턴 주입도 유지된다.
 
 ## 확인된 구성요소와 계약
 
 | 구성요소 | 현재 역할 | 검증 가능한 사실 | 결손 |
 | --- | --- | --- | --- |
-| `bin/discord-bot.py` | Discord Claude 자유채팅, Claude→Antigravity→Codex 폴백 | 권한은 `FREE_CHAT_USER_ID`, 락은 `FREE_CHAT_LOCK`, 현재 provider 추적, 30분 타임아웃 | 활성 잔여량 기반 분산은 아직 없음 |
+| `bin/discord-bot.py` | Discord Claude 자유채팅, 새 세션 잔여량 라우팅 + Claude→Antigravity→Codex 폴백 | 권한은 `FREE_CHAT_USER_ID`, 락은 `FREE_CHAT_LOCK`, 현재 provider 추적, 30분 타임아웃, 20%p 히스테리시스 | Antigravity 잔여량은 측정 불가 |
 | `bin/codex-bot.py` | Codex 전용 명령/대화, Codex→Claude 위임 | 별도 프로세스/토큰, Codex 저장소 allowlist | 자유채팅 폴백과 공통 provider 실행기가 아님 |
 | `bin/discord_bot_common.py` | 공통 환경, 게이트, provider 실행/결과/맥락 계약 | PATH 보정, 게이트 15초 타임아웃, process group 종료, lifecycle callback | 실제 CLI 조합은 라이브 미검증 |
 | `workflows/lib/usage-preflight-gate.sh` | Claude 5h/Codex 7d 사전 차단 | 임계값 10%, 게이트 고장 시 fail-open | Antigravity 수치 게이트 불가 |
 | `workflows/lib/route-dispatch.sh` | 단순작업 Antigravity→Codex | 짧은 quota 오류/빈 응답만 Antigravity 고갈로 판정 | 자유채팅과 실행/타임아웃 계약 불일치 |
-| `workflows/lib/usage-advisor.sh` | Claude/Codex 잔여량 비교 | `coach` 기반 결정론적 추천 | Antigravity 비교 불가 |
+| `workflows/lib/usage-advisor.sh` | Claude/Codex 잔여량 비교 및 새 자유채팅 세션 라우팅 입력 | `coach` 기반 결정론적 추천, 조회 실패 시 fail-open | Antigravity 비교 불가 |
 | `workflows/verify-task-v2.js` | 코딩 전후 다자 검증 | Claude+Antigravity 비평/리뷰, Codex 실행 | 자유채팅 응답 폴백과 역할이 다름 |
 | Stop 훅 | Claude 세션 규율/검증 강제 | verify-task-v2, 라우팅, 컨텍스트 크기 경고 | Discord 헤드리스 출력에는 일부 경고가 안 보임 |
 

@@ -12,15 +12,18 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parents[1] / "bin"))
 
 from discord_bot_common import (
+    HeadroomAdvice,
     ProviderResult,
     ProviderFallbackResult,
     clear_provider_context,
     format_provider_context,
     format_provider_fallback_failure,
     load_provider_context,
+    parse_headroom_advice,
     run_provider_attempt,
     run_provider_fallback_chain,
     save_provider_context,
+    should_prefer_codex,
 )  # noqa: E402
 
 
@@ -46,6 +49,40 @@ class ProviderResultTests(unittest.TestCase):
         result = ProviderResult("codex", 1, "prefix\n" + ("x" * 400))
         self.assertEqual(len(result.diagnostic(20)), 20)
         self.assertIn("응답 없음", ProviderResult("codex", 1, "").diagnostic())
+
+
+class HeadroomAdviceTests(unittest.TestCase):
+    def test_parses_strict_usage_advisor_contract(self):
+        advice = parse_headroom_advice(
+            "PREFER: codex (claude:22% codex:81%)\n"
+        )
+        self.assertEqual(advice, HeadroomAdvice("codex", 22, 81, advice.raw))
+
+    def test_invalid_or_out_of_range_advice_is_unknown(self):
+        for output in (
+            "",
+            "PREFER: codex (claude:unknown codex:81%)",
+            "PREFER: codex (claude:101% codex:81%)",
+            "warning\nPREFER: codex (claude:22% codex:81%)",
+        ):
+            advice = parse_headroom_advice(output)
+            self.assertIsNone(advice.preferred_provider)
+            self.assertFalse(should_prefer_codex(advice))
+
+    def test_requires_hysteresis_margin_and_fails_open_on_unknown(self):
+        self.assertTrue(should_prefer_codex(HeadroomAdvice("codex", 20, 40)))
+        self.assertFalse(should_prefer_codex(HeadroomAdvice("codex", 20, 39)))
+        self.assertFalse(should_prefer_codex(HeadroomAdvice("claude", 80, 10)))
+        self.assertFalse(should_prefer_codex(HeadroomAdvice("claude", 20, 40)))
+        self.assertFalse(should_prefer_codex(HeadroomAdvice(None, None, None)))
+
+    def test_existing_session_policy_is_expressed_by_caller_contract(self):
+        # The helper itself is intentionally stateless; the Discord handler
+        # applies it only when no Claude session id exists.  Keep this test
+        # explicit so a future refactor does not turn the helper into a
+        # per-message provider flapper.
+        advice = parse_headroom_advice("PREFER: codex (claude:10% codex:90%)")
+        self.assertTrue(should_prefer_codex(advice, 20))
 
 
 class ProviderAttemptTests(unittest.TestCase):
@@ -237,6 +274,14 @@ class DiscordIntegrationSourceTests(unittest.TestCase):
         source = self.SOURCE.read_text()
         self.assertIn('"--mode", "plan"', source)
         self.assertIn('"-s", "read-only"', source)
+        self.assertIn('"--skip-git-repo-check"', source)
+
+    def test_headroom_rebalance_is_new_session_only(self):
+        source = self.SOURCE.read_text()
+        self.assertIn("if is_new_session:", source)
+        self.assertIn("advice = await usage_headroom_advice()", source)
+        self.assertIn("should_prefer_codex(advice, FREE_CHAT_HEADROOM_MIN_MARGIN_PCT)", source)
+        self.assertIn("FREE_CHAT_HEADROOM_MIN_MARGIN_PCT = 20", source)
 
 
 if __name__ == "__main__":

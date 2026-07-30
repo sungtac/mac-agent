@@ -47,10 +47,19 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, run_provider_attempt, run_provider_fallback_chain, format_provider_fallback_failure, load_provider_context, save_provider_context, clear_provider_context, format_provider_context, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
+from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, usage_headroom_advice, should_prefer_codex, run_provider_attempt, run_provider_fallback_chain, format_provider_fallback_failure, load_provider_context, save_provider_context, clear_provider_context, format_provider_context, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
+# Telegram's existing OpenClaw service is the canonical local workspace.  The
+# Discord adapter must enter the same workspace so both channels see the same
+# files, Team OS state, approval artifacts, and OpenClaw configuration boundary.
+OPENCLAW_WORKSPACE = Path(
+    os.environ.get("OPENCLAW_WORKSPACE", str(Path.home() / ".openclaw" / "workspace"))
+).expanduser().resolve()
+OPENCLAW_HOME = Path(
+    os.environ.get("OPENCLAW_HOME", str(OPENCLAW_WORKSPACE.parent))
+).expanduser().resolve()
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
 VERIFY_TASK_V2_JS = MAC_AGENT / "workflows" / "verify-task-v2.js"
@@ -719,7 +728,7 @@ async def on_ready():
 
 FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-session.json"
 FREE_CHAT_FALLBACK_CONTEXT_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-fallback-context.json"
-FREE_CHAT_CWD = Path.home()
+FREE_CHAT_CWD = OPENCLAW_WORKSPACE
 FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 — full tool access can run a real coding task
 # 2026-07-30, 사용자 명시적 요청: 맥이 계정 한도로 응답 자체가 실패하면
 # "기다리세요"로 끝내지 말고, 이 저장소 다른 곳(route-dispatch.sh Rule B —
@@ -734,6 +743,11 @@ FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 
 CODEX_BIN = Path("/opt/homebrew/bin/codex")
 CODEX_FALLBACK_TIMEOUT_SECONDS = 30 * 60  # 다른 provider 호출들과 동일 예산
 ANTIGRAVITY_FALLBACK_TIMEOUT_SECONDS = 30 * 60
+# A new free-chat session is the only safe place to rebalance: routing a
+# resumed Claude session elsewhere would silently discard its conversation
+# continuity.  Twenty percentage points is intentionally a wide hysteresis
+# band, so a noisy coach reading does not make providers flap turn by turn.
+FREE_CHAT_HEADROOM_MIN_MARGIN_PCT = 20
 # 2026-07-30, 사용자 확정("짧은 Claude 재시도 후 대체 provider 체인") — 실측 근거:
 # 실제 한도초과 거부(15:04:35)와 같은 계정의 바로 다음 정상 요청(15:04:44)
 # 사이 간격이 9초였다. 10초면 그 순단을 넘기기에 충분하면서도 사용자를
@@ -920,6 +934,22 @@ async def handle_free_chat(message: discord.Message):
         is_new_session = existing_session_id is None
         session_id = existing_session_id or str(uuid.uuid4())
 
+        # 2026-07-30, active headroom balancing: usage-advisor.sh used to be
+        # advisory only, so a new Claude conversation still consumed Claude
+        # even when Codex had materially more remaining capacity.  Apply the
+        # comparison only before a new session starts.  A resumed Claude
+        # session stays on Claude because moving it would discard context and
+        # make the user's conversation appear to reset.  Unknown/stale
+        # advisor data fails open and keeps the proven Claude path.
+        if is_new_session:
+            advice = await usage_headroom_advice()
+            if should_prefer_codex(advice, FREE_CHAT_HEADROOM_MIN_MARGIN_PCT):
+                await message.channel.send(
+                    "⚖️ 새 대화는 잔여량 균형을 위해 Claude 대신 대체 provider 체인으로 시작합니다."
+                )
+                await _fallback_to_provider_chain(message, text)
+                return
+
         # 2026-07-30, 사용자 명시적 요청("이 부분을 기억해달라"): 자유채팅의
         # --resume 세션은 그대로 독립 유지하되(세션 병합 아님), 같은 채널에서
         # codex-bot.py와 나눈 대화를 이 턴의 프롬프트에 참고자료로 얹어준다 —
@@ -942,7 +972,15 @@ async def handle_free_chat(message: discord.Message):
         if FREE_CHAT_STOP_REQUESTED:
             return
 
-        env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
+        env = {
+            **SUBPROCESS_ENV,
+            "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0",
+            "OPENCLAW_HOME": str(OPENCLAW_HOME),
+            "OPENCLAW_WORKSPACE": str(OPENCLAW_WORKSPACE),
+            "PYTHONPATH": os.pathsep.join(
+                part for part in (str(OPENCLAW_WORKSPACE), SUBPROCESS_ENV.get("PYTHONPATH", "")) if part
+            ),
+        }
         # --append-system-prompt는 매 턴(resume 포함) 넣는다 — Claude
         # 쪽엔 이 페르소나를 스레드 상태처럼 한 번만 넣고 재사용할 방법이
         # 없고(-p는 매번 새 프로세스, resume은 대화 기록만 이어받지 CLI
@@ -1085,7 +1123,10 @@ async def _fallback_to_provider_chain(message: discord.Message, text: str) -> No
         async def codex_attempt():
             return await run_provider_attempt(
                 "codex",
-                [str(CODEX_BIN), "exec", "-s", "read-only", "-C", str(FREE_CHAT_CWD), "--", prompt_text],
+                [
+                    str(CODEX_BIN), "exec", "-s", "read-only",
+                    "-C", str(FREE_CHAT_CWD), "--skip-git-repo-check", "--", prompt_text,
+                ],
                 CODEX_FALLBACK_TIMEOUT_SECONDS,
                 cwd=FREE_CHAT_CWD,
                 on_process_started=_publish_free_chat_process,

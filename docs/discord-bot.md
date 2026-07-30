@@ -4,6 +4,23 @@ Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac�
 
 ## 구성 (2026-07-30 갱신 — 봇 프로세스가 둘로 분리됨)
 
+## Telegram과 공용 환경 (2026-07-30 추가)
+
+Telegram의 기존 OpenClaw 서비스가 사용하는
+`$OPENCLAW_WORKSPACE`를 세 채널의 기준 workspace로 삼는다. Discord 자유채팅도
+이제 기본적으로 `/Users/edge_ai/.openclaw/workspace`에서 실행하며, subprocess에
+`OPENCLAW_HOME`, `OPENCLAW_WORKSPACE`, `PYTHONPATH`를 전달한다.
+
+따라서 터미널·Discord·Telegram은 다음 경계를 공유한다.
+
+- 동일한 workspace 파일과 Git 상태
+- 동일한 Team OS 상태·승인 산출물·로컬 하네스 결과
+- 동일한 OpenClaw home/workspace 환경변수
+
+채널별 Discord/Telegram 사용자 세션 ID는 의도적으로 별도다. 이것은 대화 기록을
+무리하게 합치지 않으면서 동일한 실행 환경과 안전 경계를 공유하기 위한 것이다.
+실제 Telegram polling 재시작이나 Discord launchd 재기동은 별도 운영 활성화 단계다.
+
 **2026-07-29에 `!코덱스` 계열 명령이 `discord-bot.py`에서 별도 프로세스 `codex-bot.py`로
 분리됐다** — 이 문서 원본(2026-07-29T01:13 마지막 수정) 작성 당시엔 아직 분리 전이라, 아래
 "`!코덱스`" 절은 옛 위치를 그대로 서술한 채 남아있었다(2026-07-30 통합 감사로 발견·정정).
@@ -721,7 +738,9 @@ verify-task-v2로"** 확정.
 - `discord-bot.py`: `handle_free_chat`의 두 감지 지점(사전 `usage_gate_check` 게이트 / 실행
   후 실패 문구 매칭) 모두에서 `_fallback_to_provider_chain(message, text)`를 호출 — 같은
   메시지를 먼저 `agy --print --mode plan`으로 전달하고, Antigravity가 usable하지 않을 때만
-  Codex 7일창 게이트 후 `codex exec -s read-only -C <FREE_CHAT_CWD>`로 재시도한다. 이
+  Codex 7일창 게이트 후 `codex exec -s read-only -C <FREE_CHAT_CWD> --skip-git-repo-check`로
+  재시도한다. 읽기 전용 폴백이라 홈 디렉터리의 Git trusted-directory 검사를 우회해도 파일을
+  수정할 수 없다. 이
   폴백은 읽기/응답 전용이며 실제 파일 수정은 하지 않는다. 각 provider의 현재 process를
   `FREE_CHAT_CURRENT_PROC`에 등록하므로 `!중지`가 실제 실행 중인 톱니를 종료하고 다음
   provider 진행도 막는다. 성공한 대체 응답은 다음 Claude 턴의 bounded 참고자료로 연결한다.

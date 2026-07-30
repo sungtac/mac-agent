@@ -39,6 +39,65 @@ QUOTA_LIMIT_PATTERN = re.compile(
 
 
 @dataclass(frozen=True)
+class HeadroomAdvice:
+    """Parsed Claude/Codex remaining-usage advice.
+
+    ``None`` means the advisor could not produce a trustworthy numeric
+    comparison.  Callers must fail open in that case rather than turning a
+    monitoring failure into a provider outage.
+    """
+
+    preferred_provider: str | None
+    claude_pct: int | None
+    codex_pct: int | None
+    raw: str = ""
+
+
+_HEADROOM_ADVICE_PATTERN = re.compile(
+    r"PREFER:\s*(claude|codex)\s*\(claude:(\d+)%\s+codex:(\d+)%\)",
+    re.IGNORECASE,
+)
+
+
+def parse_headroom_advice(output: str) -> HeadroomAdvice:
+    """Parse the strict one-line contract emitted by usage-advisor.sh."""
+    raw = (output or "").strip()
+    # Do not route on a recommendation embedded in unrelated stderr/log text.
+    # The shell helper promises exactly one line; anything else is unknown.
+    match = _HEADROOM_ADVICE_PATTERN.fullmatch(raw)
+    if not match:
+        return HeadroomAdvice(None, None, None, raw)
+    try:
+        claude_pct = int(match.group(2))
+        codex_pct = int(match.group(3))
+    except (TypeError, ValueError):
+        return HeadroomAdvice(None, None, None, raw)
+    if not 0 <= claude_pct <= 100 or not 0 <= codex_pct <= 100:
+        return HeadroomAdvice(None, None, None, raw)
+    return HeadroomAdvice(
+        match.group(1).lower(), claude_pct, codex_pct, raw,
+    )
+
+
+def should_prefer_codex(advice: HeadroomAdvice, minimum_margin_pct: int = 20) -> bool:
+    """Return whether a new, non-resumable turn should spare Claude.
+
+    The margin prevents noisy coach readings or a one-point tie-break from
+    constantly moving new conversations between providers.  Unknown data,
+    an invalid margin, and an advantage in Claude's direction all fail open.
+    Existing Claude sessions are handled by the caller and are never routed
+    here because continuity is more valuable than a small usage difference.
+    """
+    if advice.preferred_provider != "codex":
+        return False
+    if advice.claude_pct is None or advice.codex_pct is None:
+        return False
+    if minimum_margin_pct < 1:
+        return False
+    return advice.codex_pct - advice.claude_pct >= minimum_margin_pct
+
+
+@dataclass(frozen=True)
 class ProviderResult:
     """Normalized result contract for a single external provider attempt.
 
@@ -372,6 +431,8 @@ SUBPROCESS_ENV = {
 
 USAGE_PREFLIGHT_GATE_SH = MAC_AGENT / "workflows" / "lib" / "usage-preflight-gate.sh"
 USAGE_GATE_TIMEOUT_SECONDS = 15  # should return in well under a second normally; bounds a `coach` hang instead of wedging the caller's lock forever
+USAGE_ADVISOR_SH = MAC_AGENT / "workflows" / "lib" / "usage-advisor.sh"
+USAGE_ADVISOR_TIMEOUT_SECONDS = 15
 
 
 async def usage_gate_check(actor: str) -> str | None:
@@ -413,6 +474,40 @@ async def usage_gate_check(actor: str) -> str | None:
     if text.startswith("SKIP:"):
         return text[len("SKIP:"):].strip()
     return None
+
+
+async def usage_headroom_advice() -> HeadroomAdvice:
+    """Read the bounded Claude/Codex headroom recommendation.
+
+    This is deliberately separate from ``usage_gate_check``: the gate answers
+    "is this provider safe to start?", while this answers "which provider has
+    materially more room?".  It is used only at a new free-chat session
+    boundary, so a failed/slow advisor cannot interrupt an established
+    Claude conversation.  Like the gate, it fails open with unknown data.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "/bin/bash", str(USAGE_ADVISOR_SH),
+            env=SUBPROCESS_ENV,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+        )
+        try:
+            out, _ = await asyncio.wait_for(
+                proc.communicate(), timeout=USAGE_ADVISOR_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            # coach is a grandchild of the shell helper; killing only the
+            # shell would leave the usage query alive after the caller has
+            # already failed open.  Keep the same process-group invariant as
+            # the provider runners and wait for the leader to be reaped.
+            _kill_process_group(proc)
+            await proc.wait()
+            return HeadroomAdvice(None, None, None, "advisor timeout")
+        return parse_headroom_advice((out or b"").decode(errors="replace"))
+    except Exception as exc:
+        return HeadroomAdvice(None, None, None, f"advisor error: {exc}")
 
 
 def _kill_process_group(proc) -> None:

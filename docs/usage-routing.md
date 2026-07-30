@@ -38,13 +38,16 @@
 
 ### Discord 자유채팅의 provider 순서
 
-`usage-advisor.sh`의 Claude↔Codex 비교는 라이브 오케스트레이터의 작업 배정 권고이고,
-Discord 자유채팅의 실패 폴백은 별도 자동 경로다. 자유채팅은 정상일 때 Claude의
-`--resume` 세션을 유지한다. Claude가 사전/사후 quota 실패를 보이면
-`Antigravity → Codex` 순으로 한 번씩 시도한다. Antigravity 사용량을 임의의 퍼센트로
-환산하지 않는 것이 중요하다. Codex는 실행 직전 기존 `usage-preflight-gate.sh codex`를
-통과해야 하며, 둘 다 실패하면 원인 요약을 사용자에게 돌려준다. 이 경로는
-`verify-task-v2`의 역할 고정(Claude/Antigravity 리뷰, Codex 실행)을 변경하지 않는다.
+`usage-advisor.sh`의 Claude↔Codex 비교는 이제 Discord 자유채팅의 **새 세션**에도
+연결된다. Codex 잔여량이 Claude보다 20%p 이상 높으면 Claude 호출을 생략하고
+`Antigravity → Codex` 대체 체인으로 시작한다. 이 비교가 실패하거나 차이가 20%p
+미만이면 기존 Claude 경로를 사용한다. 이미 존재하는 Claude `--resume` 세션은
+대화 연속성을 위해 provider를 바꾸지 않는다. Claude가 사전/사후 quota 실패를 보여도
+기존과 같이 `Antigravity → Codex` 순으로 한 번씩 시도한다. Antigravity 사용량을
+임의의 퍼센트로 환산하지 않는 것이 중요하다. Codex는 실행 직전 기존
+`usage-preflight-gate.sh codex`를 통과해야 하며, 둘 다 실패하면 원인 요약을 사용자에게
+돌려준다. 이 경로는 `verify-task-v2`의 역할 고정(Claude/Antigravity 리뷰, Codex 실행)을
+변경하지 않는다.
 
 ## `usage-preflight-gate.sh` — 예약/트리거 자동화용 사전 게이트 (2026-07-28)
 
