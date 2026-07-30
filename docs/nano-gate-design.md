@@ -1,6 +1,25 @@
 # 나노단위 z코딩 게이트 설계 — 통합검사는 위험도 기반 선택 실행
 
-**상태: 설계 확정, 미구현.** 이 문서는 코드가 아니라 결정 기록이다. 2026-07-30, `verify-task-stop-check.sh`가 작은 버그 수정 하나에도 v1(무조건 풀-웨이트, 코덱스+안티그래비티 반복 채점)을 안내해서 30분/65만+ 토큰이 든 사고가 있었고, 콕스가 이를 v2(경량/전체 티어 자동 분기) 안내로 고쳤다. 사용자가 이 교훈을 "토큰 사용량 균형화" 전체 운영 원칙으로 확장하자고 제안했고, 맥·콕스가 Discord에서 3라운드 상호 비평(제안→재의견→재재의견)을 거쳐 수렴한 결과가 아래다. 구현 전 이 문서를 먼저 읽을 것.
+**상태: 설계 확정, 1·2·3단계 및 격리 계약 파일럿 완료·임계값 분석기 준비·실 provider 파일럿은 실행 도달했으나 성공 완료 대기.** 이 문서는 코드가 아니라 결정 기록이다. 2026-07-30, `verify-task-stop-check.sh`가 작은 버그 수정 하나에도 v1(무조건 풀-웨이트, 코덱스+안티그래비티 반복 채점)을 안내해서 30분/65만+ 토큰이 든 사고가 있었고, 콕스가 이를 v2(경량/전체 티어 자동 분기) 안내로 고쳤다. 사용자가 이 교훈을 "토큰 사용량 균형화" 전체 운영 원칙으로 확장하자고 제안했고, 맥·콕스가 Discord에서 3라운드 상호 비평(제안→재의견→재재의견)을 거쳐 수렴한 결과가 아래다. 구현 전 이 문서를 먼저 읽을 것.
+
+2026-07-30 1단계 기록: `workflows/lib/decide-risk-tier.js`에 순수 위험도 함수와 단위 테스트를 두었다. 단일 `remainingTokenPct`는 호환하고, 새 `providerHeadroom`이 있으면 Claude/Codex/Antigravity 중 관측된 최솟값을 기준으로 보수적으로 `mid`로 올린다. Workflow 내부 `journal.jsonl`은 나노 이벤트 저장소로 재사용하지 않는다. 내부 `started/result` 기록은 관찰용으로만 활용되고, 외부 이벤트 주입·멱등 갱신 계약이 없기 때문이다. 동시 append 200회 스파이크에서는 줄 손상은 재현되지 않았지만, `task_id+step_id` 중복 방지는 제공하지 않았다. 이벤트 저장은 다음 단계에서 별도 원자적·멱등 계층으로 설계한다.
+
+2026-07-30 2단계 기록: `workflows/lib/nano-event-store.js`에 별도 이벤트 원장을 구현했다. 기본 저장 위치는 `~/.claude/nano-gate-events.jsonl`이며, CLI에 파일 경로를 넘겨 격리할 수 있다. 이벤트는 `schemaVersion: 1`, `eventType: "nano_step"`, `taskId`, `stepId`, `idempotencyKey`, 변경 파일, 담당 agent, 검증 티어, 결과, 사유, 소요 시간, 토큰 사용량, 재발 방지 규칙을 갖는다. `taskId::stepId` 키를 원자적 디렉터리 락으로 보호해 기존 키와 동일한 payload는 `duplicate`로 성공 처리하고, 다른 payload는 `idempotency_conflict`로 실패시킨다. 손상된 기존 JSONL과 락 획득 시간 초과도 실패로 반환한다. 따라서 호출자는 기록 결과가 `ok`가 아니면 다음 나노 스텝을 진행하면 안 된다. Workflow 스크립트 자체는 파일시스템 API가 없으므로 이후 게이트 통합 단계에서 이 CLI를 `agent()`의 Bash 호출로 연결한다.
+
+2026-07-30 3단계 기록: `verify-task-v2.js`에 `nanoMode: true` 선택 트랙을 통합했다. 계획이 없으면 코덱스가 최대 32개 계약 단위 스텝을 만들고, 각 스텝마다 기존 이벤트 조회(재시작 시 통과 스텝 재실행 금지) → 코덱스 쓰기 실행 → Codex light 검증 → 순수 위험도 재평가 → 필요 시 mid(클로드) 또는 full(클로드+안티그래비티) 통합검증 → 이벤트 기록 순으로 진행한다. 이벤트 기록이 실패하거나 조회/검증 결과가 없으면 즉시 중단한다. 기존 `nanoMode`가 없는 v2 호출은 기존 light/full 트랙을 그대로 탄다. 호출 예시는 `Workflow({scriptPath: ".../verify-task-v2.js", args: {task, cwd, nanoMode: true, taskId, nanoEventFile}})`다. Stop hook의 verify-task-v2 정규식은 변경하지 않았다.
+
+2026-07-30 4단계 격리 파일럿 기록: `tests/nano-gate-pilot.test.js`로 저위험 light 통과, 파일 4개 경계의 mid 승격, 민감 경로의 full 승격, 재시작 시 통과 스텝 재사용, 락 실패 시 다음 단계 차단을 실행했다. 5개 케이스 모두 통과했고 전체 JavaScript 46개·Python 17개 테스트도 통과했다. 이 파일럿은 provider 토큰을 소비하지 않는 계약/복구 검증이다. 실제 provider는 실행 도달 증거가 생겼지만 성공 이벤트까지 완료된 파일럿은 아직 없으므로, 임계값 확정과 실제 토큰 비용 판단의 근거로 사용하지 않는다.
+
+2026-07-30 5단계 기록: 실제 `~/.claude/nano-gate-events.jsonl`은 아직 존재하지 않았고, 기존 verify-task 이력에도 나노별 provider headroom/token 신호가 없었다. 그래서 `workflows/lib/analyze-nano-events.js`를 추가해 tier/status/실행시간/token 합계/위험 신호를 집계하고, 이벤트 20건·위험 입력 10건·잔여량 신호 10건·손상 줄 0건을 모두 만족할 때만 사람이 임계값을 검토하도록 했다. 자동 숫자 변경은 하지 않는다. 현재 임계값 `누적 3 초과`, `단일 스텝 3 초과`, `잔여량 10% 이하`는 실 provider 데이터가 쌓일 때까지 유지한다. CLI: `node workflows/lib/analyze-nano-events.js [event-file]`.
+
+2026-07-30 실 provider 파일럿 시도: `/private/tmp/nano-provider-pilot.tYlzLe` 임시 Git 저장소와 전용 `events.jsonl`로 저위험 한 스텝을 실행하려 했다. 일반 실행은 API DNS 오류(`ENOTFOUND`)로 실패했고, 네트워크 권한을 허용한 재시도는 Claude 세션 한도 초과(`429`, reset 2pm)로 실패했다. 파일 변경과 이벤트 기록은 발생하지 않았고 원장은 0건이다. 따라서 이 시도는 Workflow 코드 결함의 증거가 아니라 외부 provider 가용성 차단으로 분류하며, 임계값 조정 데이터로 사용하지 않는다.
+2026-07-30 실 provider 파일럿 재시도: 동일한 격리 저장소에서 일반 실행은 다시 `ENOTFOUND`로 실패했다. 네트워크 권한 승인 후 재시도는 API 연결 뒤 장시간 응답하지 않아 제한적으로 중단했으며, `pilot.py`·이벤트 원장 모두 변경되지 않았다. 이번 결과는 provider/세션 실행 완료가 확인되지 않은 `provider_timeout_or_hang`으로 기록하고, 성공 표본이나 코드 결함 표본으로 집계하지 않는다.
+
+2026-07-30 이식성 보강: `MAC_AGENT_ROOT`/`HOME` 기반 기본 경로와 `CODEX_BIN`/`AGY_BIN` override를 추가하고, score·write·route 디스패처가 공통 실행파일 resolver를 사용하도록 정리했다. 기본값은 기존 머신에서 유지되며, `$HOME/.local/bin`, Apple Silicon/Intel Homebrew 경로, `PATH` 순서로 탐색한다.
+2026-07-30 파일럿 watchdog 보강: `bin/run-nano-provider-pilot.sh`를 추가했다. 실제 `claude -p`를 기본 1회·300초 제한으로 실행하고, `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`으로 Workflow 완료 전 백그라운드 분리를 막으며, 정지 시 종료/자식 정리, quota/session-limit 즉시 중단, 출력 로그와 이벤트 원장 바이트 변화 보고를 수행한다. fake CLI 테스트로 성공·hang·quota 비재시도를 검증한다. 이 래퍼는 Workflow 내부 게이트가 아니라 실제 provider 파일럿의 외부 실행 경계다.
+2026-07-30 watchdog 실측: 사용량 사전 게이트는 `PROCEED`였지만 실제 격리 파일럿은 120초 제한에서 `status=timeout`, `exit=124`로 종료됐다. debug 로그에는 Workflow가 시작된 뒤 완료 응답 없이 중단됐고, 종료 시 MCP 자식 프로세스가 정리된 사실이 남았다. `pilot.py`와 `events.jsonl`은 변경되지 않았다. 따라서 기존의 무기한 정지 문제는 bounded failure로 바뀌었지만, provider 성공 표본은 여전히 0건이다.
+2026-07-30 provider 계약 수정 및 재실측: 실제 로그에서 (a) headless Workflow 임시 파일을 `Read` 없이 `Write`하던 지시, (b) `gatherContext`/`gatherRealDiff`가 StructuredOutput 필드를 누락할 수 있던 프롬프트를 발견해 수정했다. 수정 후 명시적 단일 나노 스텝이 실제 Codex 실행까지 도달했고 `pilot.py`에 `cube()`가 반영됐다. 그러나 300초 시점에 최종 light 검증/이벤트 기록 전 중단되어 `events-explicit.jsonl`은 생성되지 않았고, scratch 저장소에는 부분 변경이 남았다. 이는 provider 실행·코드 수정 성공의 증거이지 나노 게이트 통과 증거가 아니며, 성공 표본으로 집계하지 않는다.
+2026-07-30 이벤트 기록 계약 수정: `recordNanoEvent`에도 임시 파일 선행 Read 지시를 추가하고, nano light 검토 응답에 `hasBlockingIssue`/`issues`/`notes` 세 필드 템플릿을 명시했다. 최종 clean 파일럿은 이 단계까지 도달했으나 Claude API가 `429 This request would exceed your account's rate limit`을 반환해 중단했다. clean scratch의 `pilot.py`와 이벤트 원장은 변경되지 않았으며, 성공 표본은 여전히 0건이다. 현재 남은 운영 작업은 rate limit 회복 후 새 clean scratch에서 한 번 성공 이벤트를 확인하는 것이다.
 
 ## 배경 — 사용자 원 제안
 
@@ -79,7 +98,7 @@ light 검증 (diff 기반 가벼운 품질 체크)
 
 - 위험도 함수의 정확한 임계값 수치 (파일수 몇 개부터 mid, 몇 개부터 full / 잔여 토큰 몇 %부터 경보).
 - 의존성 경계를 정적으로 계산하는 구체 알고리즘 (import 그래프 파싱 범위, 언어별 처리).
-- 나노 게이트 실행 루프를 `verify-task-v2.js`에 통합할지, 별도 워크플로우로 둘지.
+- 실제 파일럿에서 provider 토큰 사용량과 mid/full 승격 빈도를 측정할 것.
 - 하네스 파일 무한 증가 문제 (기존 미정 항목 승계).
 
 ## 구현 계획 (초안, 단계별)
@@ -87,9 +106,9 @@ light 검증 (diff 기반 가벼운 품질 체크)
 0. **기존 구조·호환성 기준선 확인 (읽기 전용)**: 구현 시작 전에 아래를 먼저 확인 — `verify-task-v2`가 현재 받는 입력/반환값, 기존 하네스(`docs/codex-harness.md`) 기록 형식, Stop hook(`verify-task-stop-check.sh`)이 검증 결과를 판정하는 방식, 이벤트를 저장할 위치와 동시 기록(concurrent write) 가능 여부, 기존 작업 흐름을 깨지 않는 호환성 조건. 저비용 사전점검이라 생략할 이유가 없음 — 이걸 건너뛰면 나노 게이트가 기존 계약과 충돌하는 걸 구현 다 하고 나서야 발견하게 된다.
 1. **위험도 함수**: `workflows/lib/`에 `decide-risk-tier.js`(가칭) — 기존 `decideTier()`를 흡수해 위 5개 입력을 받는 순수 함수로 재작성. 유닛 테스트로 임계값 케이스 검증.
 2. **버전이 있는 나노 이벤트 스키마 + 원자적 자동 기록**: 나노 스텝 통과 시 남길 JSON 이벤트 스키마 정의(스키마 버전 필드 포함), `task_id+step_id` 멱등 키로 원자적 기록, 기록 실패 시 진행 차단 로직 구현 (기존 `codex-harness.md` append 로직 패턴 재사용).
-3. **나노 게이트 루프**: 계획 → 계약단위 수정 → 자동기록 → light검증 → 위험도 재평가 → (필요시) 통합검증 흐름을 실제 워크플로우 스크립트로 구현, 기록 실패 시 중단하는 게이트 포함 — `verify-task-v2.js` 확장 vs 신규 워크플로우 여부는 1~2단계 구현하며 결정.
-4. **파일럿 실행**: 저위험 작업 + 경계 사례(임계값에 걸치는 케이스) 각 1건을 이 흐름으로 돌려서 이벤트 기록·위험도 재평가·통합검사 트리거·복구(재시도/재시작 시 멱등성)가 의도대로 동작하는지 확인.
-5. **임계값 조정**: 파일럿에서 나온 실제 시간·토큰·실패율을 바탕으로 위험도 함수의 임계값을 확정.
+3. **나노 게이트 루프**: 계획 → 계약단위 수정 → 자동기록 → light검증 → 위험도 재평가 → (필요시) 통합검증 흐름을 `verify-task-v2.js`의 선택 트랙으로 구현, 기록 실패 시 중단하는 게이트 포함. 완료.
+4. **파일럿 실행**: 저위험 작업 + 경계 사례(임계값에 걸치는 케이스) 각 1건을 이 흐름으로 돌려서 이벤트 기록·위험도 재평가·통합검사 트리거·복구(재시도/재시작 시 멱등성)가 의도대로 동작하는지 확인. 격리 계약 파일럿 완료; 실 provider 파일럿은 별도 운영 검증으로 남김.
+5. **임계값 조정**: 분석기가 표본 조건을 충족한다고 보고한 뒤, 파일럿에서 나온 실제 시간·토큰·실패율을 사람이 검토해 위험도 함수의 임계값을 확정. 현재는 데이터 부족으로 기준값을 유지.
 6. **문서화**: 파일럿 검증 끝나면 이 문서 상태를 "구현됨"으로 갱신하고 `CLAUDE.md` 인덱스에 항목 추가 (기존 `verify-task-v2` 항목 옆).
 
 처음부터 전체 작업에 적용하지 않고, 작은 파일럿 하나로 기록·게이트·복구 흐름부터 검증한 뒤 확장한다.

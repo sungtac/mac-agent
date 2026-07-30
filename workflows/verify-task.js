@@ -27,7 +27,7 @@ async function preflightCheck() {
   // 심어서, 실행 시점에 그 Bash 호출 환경에 CODEX_BIN/AGY_BIN이 설정돼
   // 있으면 그걸 쓰고 없으면 기존 기본값으로 폴백하도록 통일.
   return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 아래 기본 절대경로를 써 — 이 실행 환경 PATH에 /opt/homebrew/bin이 없을 수 있어서 bare 명령어 "codex"는 "command not found"로 실패할 수 있음):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-/Users/edge_ai/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행(CODEX_BIN 설정돼 있으면 그 경로로)" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 Homebrew/사용자 bin 후보를 찾아 써 — 축소된 launchd PATH에서 bare 명령어만 믿지 말 것):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-\$HOME/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행(CODEX_BIN 설정돼 있으면 그 경로로)" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
     { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
   )
 }
@@ -94,10 +94,11 @@ ${verificationBlock}
 {"scores":{"목표달성도":0,"정확성":0,"제약안전성":0,"완성도":0,"명확성":0,"효율성":0},"total":0,"dealbreaker":false,"dealbreaker_reason":"","feedback":"구체적인 감점 사유와 개선점, 그리고 실제로 무엇을 확인해서 이 결론에 도달했는지"}`
 }
 
-const DISPATCH_SCRIPT = '/Users/edge_ai/mac-agent/workflows/lib/score-dispatch.sh'
+const MAC_AGENT_ROOT = process.env.MAC_AGENT_ROOT || '/Users/edge_ai/mac-agent'
+const DISPATCH_SCRIPT = process.env.SCORE_DISPATCH_SCRIPT || `${MAC_AGENT_ROOT}/workflows/lib/score-dispatch.sh`
 
 function buildDispatchInstruction(tool, prompt) {
-  return `1. Bash로 \`mktemp /tmp/verify-task-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${DISPATCH_SCRIPT} ${tool} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야(성공이든 실패든 스크립트가 결정적으로 만든 값) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+  return `1. Bash로 \`mktemp /tmp/verify-task-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환): bash ${DISPATCH_SCRIPT} ${tool} <파일경로>\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야(성공이든 실패든 스크립트가 결정적으로 만든 값) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 async function scoreWithCodex(task, result, persona, cwd, verificationContent, isRetry) {
@@ -178,7 +179,7 @@ const MAX_ROUNDS = parsedArgs.maxRounds || 3
 const task = parsedArgs.task
 const persona = parsedArgs.persona || '일반 사용자'
 const cwd = parsedArgs.cwd
-const historyFile = parsedArgs.historyFile || '/Users/edge_ai/.claude/verify-task-history.jsonl'
+const historyFile = parsedArgs.historyFile || `${process.env.HOME || '/Users/edge_ai'}/.claude/verify-task-history.jsonl`
 
 let result = parsedArgs.result
 const history = []

@@ -37,14 +37,21 @@ async function preflightCheck() {
   // 2026-07-30 fix (Codex 코드리뷰로 발견) — verify-task.js와 동일한 이유로
   // CODEX_BIN/AGY_BIN 환경변수 override를 존중하도록 통일.
   return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 아래 기본 절대경로를 써 — 이 실행 환경 PATH에 /opt/homebrew/bin이 없을 수 있어서 bare 명령어 "codex"는 "command not found"로 실패할 수 있음):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-/Users/edge_ai/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법을 issues에 적어줘.`,
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 Homebrew/사용자 bin 후보를 찾아 써 — 이 실행 환경 PATH가 축소돼 있을 수 있어서 bare 명령어만 믿지 말 것):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-\$HOME/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법을 issues에 적어줘.`,
     { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
   )
 }
 
-const SCORE_DISPATCH = '/Users/edge_ai/mac-agent/workflows/lib/score-dispatch.sh'
-const CODEX_EXECUTE_DISPATCH = '/Users/edge_ai/mac-agent/workflows/lib/codex-execute-dispatch.sh'
-const HARNESS_FILE_DEFAULT = '/Users/edge_ai/mac-agent/docs/codex-harness.md'
+// Workflow 스크립트는 Node.js API에 접근할 수 없다(process 미정의) — 여기서
+// env override를 시도하면 스크립트 자체가 로드 시점에 죽는다. 경로가 다른
+// 환경에서 필요하면 args로 받아서 써야지 process.env로 받으면 안 된다.
+const MAC_AGENT_ROOT = '/Users/edge_ai/mac-agent'
+const CLAUDE_HOME = '/Users/edge_ai'
+const SCORE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/score-dispatch.sh`
+const CODEX_EXECUTE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/codex-execute-dispatch.sh`
+const NANO_EVENT_RECORDER = `${MAC_AGENT_ROOT}/workflows/lib/nano-event-store.js`
+const HARNESS_FILE_DEFAULT = `${MAC_AGENT_ROOT}/docs/codex-harness.md`
+const NANO_EVENT_FILE_DEFAULT = `${CLAUDE_HOME}/.claude/nano-gate-events.jsonl`
 
 // score-dispatch.sh는 읽기전용 채점/의견용(codex 또는 agy 모두 --sandbox
 // read-only 기본값). 실제 파일을 쓰는 유일한 지점(전체 트랙 실행 단계)만
@@ -66,9 +73,9 @@ const HARNESS_FILE_DEFAULT = '/Users/edge_ai/mac-agent/docs/codex-harness.md'
 function buildScoreDispatchInstruction(tool, prompt, harnessFile, schemaKind) {
   const injectHarness = tool === 'codex' && !!harnessFile
   const harnessNote = injectHarness
-    ? `[하네스 주입] 2번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
+    ? `[하네스 주입] 3번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
     : ''
-  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로> ${schemaKind}\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로> ${schemaKind}\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 // v1(verify-task.js)은 문자열(dealbreaker_reason) 동기화로 도구 실패를
@@ -94,9 +101,9 @@ async function dispatchWithRetry(dispatchFn, label) {
 
 function buildExecuteDispatchInstruction(cwd, prompt, harnessFile) {
   const harnessNote = harnessFile
-    ? `[하네스 주입] 2번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
+    ? `[하네스 주입] 3번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
     : ''
-  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-exec-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${harnessFile ? ', 단 위에서 설명한 하네스 합본으로' : ''}) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환, timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} <파일경로>\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 3번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
+  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-exec-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${harnessFile ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환, timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} <파일경로>\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 const EXECUTE_ENVELOPE_SCHEMA = {
@@ -138,7 +145,7 @@ function isSensitivePath(path) {
 
 async function gatherContext(cwd, task) {
   const gathered = await agent(
-    `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n0. 먼저 Bash로 \`[ -d ${JSON.stringify(cwd)} ] && echo EXISTS || echo MISSING\`을 실행해. "MISSING"이면 cwdExists=false로 하고, contextText에는 그 사실만 짧게 적고, intendedFiles는 빈 배열, sensitivePath는 false로 채워서 즉시 끝내 — 존재하지 않는 디렉토리에서 아래 1~7번을 시도하지 마(git 명령이 엉뚱한 디렉토리에서 실행되거나 에러 텍스트가 진짜 컨텍스트인 것처럼 섞여 들어감).\n1. cwdExists=true로 하고, Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.`,
+    `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n0. 먼저 Bash로 \`[ -d ${JSON.stringify(cwd)} ] && echo EXISTS || echo MISSING\`을 실행해. "MISSING"이면 cwdExists=false로 하고, contextText에는 그 사실만 짧게 적고, intendedFiles는 빈 배열, sensitivePath는 false로 채워서 즉시 끝내 — 존재하지 않는 디렉토리에서 아래 1~7번을 시도하지 마(git 명령이 엉뚱한 디렉토리에서 실행되거나 에러 텍스트가 진짜 컨텍스트인 것처럼 섞여 들어감).\n1. cwdExists=true로 하고, Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.\n\n마지막 응답은 반드시 다른 설명 없이 아래 네 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"cwdExists":true,"contextText":"수집한 사실","intendedFiles":["예상 경로"],"sensitivePath":false}`,
     { phase: 'Context', label: 'gather-context', schema: CONTEXT_SCHEMA }
   )
   return gathered
@@ -171,7 +178,7 @@ const REAL_DIFF_SCHEMA = {
 // 상태를 건드리지 않고 읽기만 한다.
 async function gatherRealDiff(cwd) {
   const gathered = await agent(
-    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.`,
+    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.\n\n마지막 응답은 반드시 다른 설명 없이 아래 세 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"content":"위 명령의 원문 출력","filesChanged":["실제 변경 경로"],"sensitivePath":false}`,
     { phase: 'Light', label: 'gather-real-diff', schema: REAL_DIFF_SCHEMA }
   )
   return gathered
@@ -491,6 +498,345 @@ async function antigravityReviewDiff(task, context, realDiff, isRetry) {
   })
 }
 
+// ---------- 선택적 나노 게이트 트랙 (2026-07-30) ----------
+const NANO_PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    steps: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          stepId: { type: 'string' },
+          taskType: { type: 'string' },
+          files: { type: 'array', items: { type: 'string' } },
+          instruction: { type: 'string' },
+          doneCriteria: { type: 'string' },
+          dependencyBoundaryCrossed: { type: 'boolean' },
+        },
+        required: ['stepId', 'instruction'],
+      },
+    },
+  },
+  required: ['steps'],
+}
+
+const NANO_REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    hasBlockingIssue: { type: 'boolean' },
+    issues: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { description: { type: 'string' }, blocking: { type: 'boolean' } },
+        required: ['description', 'blocking'],
+      },
+    },
+    notes: { type: 'string' },
+  },
+  required: ['hasBlockingIssue', 'issues'],
+}
+
+const NANO_CHECK_SCHEMA = {
+  type: 'object',
+  properties: { ok: { type: 'boolean' }, found: { type: 'boolean' }, eventJson: { type: 'string' } },
+  required: ['ok', 'found', 'eventJson'],
+}
+
+const NANO_RECORD_SCHEMA = {
+  type: 'object',
+  properties: { ok: { type: 'boolean' }, outcome: { type: 'string' }, idempotencyKey: { type: 'string' } },
+  required: ['ok', 'outcome', 'idempotencyKey'],
+}
+
+function buildNanoPlanPrompt(task, context) {
+  return [
+    '아래 작업을 서로 독립적으로 검증·롤백할 수 있는 나노 스텝 목록으로 쪼개줘. 각 스텝은 앞 스텝이 통과·기록된 뒤에만 실행할 수 있어야 하고, 한 스텝의 계약이 끝난 지점에서 기존 테스트/문법검사를 실행할 수 있어야 해.',
+    '',
+    '[원 작업]',
+    task,
+    '',
+    '[저장소 컨텍스트]',
+    context.contextText,
+    '',
+    '최대 32개 steps 배열만 JSON으로 반환해. 각 항목에는 stepId(재시작해도 변하지 않는 짧은 영문/숫자 id), taskType, files 배열, instruction, doneCriteria, dependencyBoundaryCrossed(boolean)를 넣어.',
+    '예시: {"steps":[{"stepId":"step-1","taskType":"code","files":["path"],"instruction":"","doneCriteria":"","dependencyBoundaryCrossed":false}]}',
+  ].join('\n')
+}
+
+async function codexNanoPlan(task, context, harnessFile) {
+  return agent(buildScoreDispatchInstruction('codex', buildNanoPlanPrompt(task, context), harnessFile, 'nano-plan'), {
+    phase: 'FullPlan',
+    label: 'nano-plan',
+    schema: NANO_PLAN_SCHEMA,
+  })
+}
+
+function normalizeNanoSteps(rawSteps) {
+  if (!Array.isArray(rawSteps) || rawSteps.length === 0 || rawSteps.length > 32) return null
+  const seen = new Set()
+  const steps = []
+  for (const raw of rawSteps) {
+    if (!raw || typeof raw !== 'object') return null
+    const stepId = typeof raw.stepId === 'string' ? raw.stepId.trim() : ''
+    const instruction = typeof raw.instruction === 'string' ? raw.instruction.trim() : ''
+    if (!stepId || !instruction || seen.has(stepId)) return null
+    seen.add(stepId)
+    steps.push({
+      stepId,
+      taskType: typeof raw.taskType === 'string' && raw.taskType.trim() ? raw.taskType.trim() : 'code-change',
+      files: Array.isArray(raw.files) ? raw.files.filter((file) => typeof file === 'string') : [],
+      instruction,
+      doneCriteria: typeof raw.doneCriteria === 'string' ? raw.doneCriteria : '',
+      dependencyBoundaryCrossed: raw.dependencyBoundaryCrossed === true,
+    })
+  }
+  return steps
+}
+
+function stableNanoTaskId(task, cwd) {
+  let hash = 2166136261
+  for (const char of `${cwd}\\0${task}`) {
+    hash ^= char.charCodeAt(0)
+    hash = Math.imul(hash, 16777619)
+  }
+  return `nano-${(hash >>> 0).toString(16)}`
+}
+
+function nanoText(value, fallback) {
+  const textValue = String(value || fallback || '').replace(/[\r\n]+/g, ' ').trim()
+  return textValue.slice(0, 9000) || String(fallback || 'unspecified')
+}
+
+function lowestNanoHeadroom(providerHeadroom) {
+  if (!providerHeadroom || typeof providerHeadroom !== 'object') return undefined
+  const values = ['claude', 'codex', 'antigravity']
+    .map((provider) => providerHeadroom[provider])
+    .filter((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100)
+  return values.length ? Math.min(...values) : undefined
+}
+
+// Workflow 샌드박스에서는 외부 모듈을 import할 수 없으므로 위험도 함수의
+// 우선순위/임계값을 workflows/lib/decide-risk-tier.js와 의도적으로 복제한다.
+function decideNanoRiskTier(input) {
+  const { stepFileCount = 0, cumulativeFileCount = 0, sensitivePath = false, dependencyBoundaryCrossed = false, remainingTokenPct, providerHeadroom } = input || {}
+  const providerHeadroomPct = lowestNanoHeadroom(providerHeadroom)
+  const singlePct = typeof remainingTokenPct === 'number' && Number.isFinite(remainingTokenPct) && remainingTokenPct >= 0 && remainingTokenPct <= 100 ? remainingTokenPct : undefined
+  const tokenPct = providerHeadroomPct ?? singlePct
+  if (sensitivePath) return 'full'
+  if (dependencyBoundaryCrossed) return 'mid'
+  if (cumulativeFileCount > 3) return 'mid'
+  if (stepFileCount > 3) return 'mid'
+  if (tokenPct !== undefined && tokenPct <= 10) return 'mid'
+  return 'light'
+}
+
+async function checkNanoEvent(eventFile, idempotencyKey) {
+  return agent(
+    `Bash로 node ${NANO_EVENT_RECORDER} --check ${JSON.stringify(eventFile)} ${JSON.stringify(idempotencyKey)} 를 실행하고 stdout JSON을 그대로 반환해. 파일은 수정하지 마.`,
+    { phase: 'Light', label: 'nano-event-check', schema: NANO_CHECK_SCHEMA, agentType: 'general-purpose' }
+  )
+}
+
+async function recordNanoEvent(eventFile, event) {
+  const eventJson = JSON.stringify(event)
+  return agent(
+    `mktemp로 임시 JSON 파일을 만들고, 반드시 Read 툴로 그 빈 임시 파일을 한 번 읽은 뒤 Write로 아래 이벤트를 그대로 저장해(Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음). 그 다음 node ${NANO_EVENT_RECORDER} ${JSON.stringify(eventFile)} <임시파일> 를 실행해. stdout JSON을 그대로 반환하고 임시 파일은 삭제해.\n\n${eventJson}`,
+    { phase: 'Light', label: 'nano-event-record', schema: NANO_RECORD_SCHEMA, agentType: 'general-purpose' }
+  )
+}
+
+async function nanoLightValidate(task, step, context, realDiff) {
+  const prompt = [
+    '너는 나노 스텝의 독립 light 검증자야. 파일을 수정하지 말고, 아래 실제 diff와 완료조건만 검토해. 점수는 매기지 않는다. 변경이 완료조건을 충족하고 명백한 문법/연동 결함이 없으면 hasBlockingIssue=false, 그렇지 않으면 실제 근거와 함께 blocking=true 이슈를 적어. 제공된 diff 밖의 사실은 추측하지 마.',
+    '',
+    '[원 작업]', task,
+    '',
+    '[현재 나노 스텝]', JSON.stringify(step),
+    '',
+    '[저장소 컨텍스트]', context.contextText,
+    '',
+    '[실제 변경사항]', realDiff?.content || '(diff 없음)',
+    '',
+    '마지막 응답은 반드시 다른 설명 없이 아래 세 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지): {"hasBlockingIssue":false,"issues":[],"notes":""}',
+  ].join('\n')
+  return agent(buildScoreDispatchInstruction('codex', prompt, null, 'review'), {
+    phase: 'Light',
+    label: 'nano-light-validate',
+    schema: NANO_REVIEW_SCHEMA,
+  })
+}
+
+async function nanoIntegrationValidate(task, context, realDiff, tier) {
+  if (tier === 'light') return { ok: true, issues: [], reviewers: ['codex'] }
+  if (tier === 'mid') {
+    const review = await claudeReviewDiff(task, context, realDiff)
+    if (!review) return { ok: false, reason: 'mid 통합 리뷰어가 결과를 반환하지 않음' }
+    return { ok: !review.hasBlockingIssue, issues: (review.issues || []).map((issue) => ({ ...issue, source: 'claude' })), reviewers: ['claude'] }
+  }
+  const [claudeReview, antigravityReview] = await parallel([
+    () => claudeReviewDiff(task, context, realDiff),
+    () => antigravityReviewDiff(task, context, realDiff, false),
+  ])
+  if (!claudeReview || !antigravityReview) return { ok: false, reason: 'full 통합 리뷰어 중 하나 이상이 결과를 반환하지 않음' }
+  const issues = [
+    ...(claudeReview.issues || []).map((issue) => ({ ...issue, source: 'claude' })),
+    ...(antigravityReview.issues || []).map((issue) => ({ ...issue, source: 'antigravity' })),
+  ]
+  return { ok: !claudeReview.hasBlockingIssue && !antigravityReview.hasBlockingIssue, issues, reviewers: ['claude', 'antigravity'] }
+}
+
+// Workflow 스크립트는 Date.now()/argless new Date()를 못 쓴다(resume 재현성이
+// 깨짐) — 그래서 시각은 항상 `date -u +%s` Bash 호출(nanoEpochSeconds)로
+// 받아온 정수 초를 넘겨받는다. new Date(epochMs)처럼 인자가 있는 형태는
+// 결정적이라 허용되므로 recordedAt 변환에는 그대로 쓴다.
+async function nanoEpochSeconds() {
+  const result = await agent(
+    'Bash로 정확히 `date -u +%s`만 실행해서 나온 정수(초 단위 UTC epoch)를 다른 텍스트 없이 seconds 필드(숫자)에 그대로 반환해.',
+    {
+      phase: 'Light',
+      label: 'nano-epoch-seconds',
+      agentType: 'general-purpose',
+      schema: { type: 'object', properties: { seconds: { type: 'number' } }, required: ['seconds'] },
+    }
+  )
+  return typeof result?.seconds === 'number' && Number.isFinite(result.seconds) ? result.seconds : null
+}
+
+function makeNanoEvent(taskId, step, status, tier, changedFiles, agents, reason, startedAtSeconds, nowSeconds, tokenUsage, riskInputs = null) {
+  const durationMs = Number.isFinite(startedAtSeconds) && Number.isFinite(nowSeconds)
+    ? Math.max(0, Math.round((nowSeconds - startedAtSeconds) * 1000))
+    : 0
+  return {
+    schemaVersion: 1,
+    eventType: 'nano_step',
+    taskId,
+    stepId: step.stepId,
+    idempotencyKey: `${taskId}::${step.stepId}`,
+    taskType: nanoText(step.taskType, 'code-change'),
+    changedFiles: [...new Set(changedFiles.filter((file) => typeof file === 'string'))],
+    agents: [...new Set(agents)],
+    verificationTier: tier,
+    status,
+    reason: nanoText(reason, status === 'passed' ? 'nano step passed' : 'nano step failed'),
+    durationMs,
+    tokenUsage: tokenUsage && typeof tokenUsage === 'object' && !Array.isArray(tokenUsage) ? tokenUsage : null,
+    riskInputs,
+    preventionRules: [],
+    recordedAt: Number.isFinite(nowSeconds) ? new Date(nowSeconds * 1000).toISOString() : null,
+  }
+}
+
+async function recordNanoOutcome(eventFile, event) {
+  const recorded = await recordNanoEvent(eventFile, event)
+  if (!recorded || recorded.ok !== true) return { ok: false, reason: '나노 이벤트 기록기에서 성공 응답을 받지 못함' }
+  return { ok: true, recorded }
+}
+
+async function runNanoGate(task, context, cwd, harnessFile, eventFile, options = {}) {
+  let steps = normalizeNanoSteps(options.nanoSteps)
+  if (!steps) {
+    const plan = await codexNanoPlan(task, context, harnessFile)
+    if (!plan || isDispatchFailure(plan)) {
+      return {
+        history: [],
+        finalVerdict: { passed: false, tier: 'nano', error: 'nano_plan_failed', reason: isDispatchFailure(plan) ? `나노 계획 도구 실패: ${plan.dispatchFailureReason}` : '나노 계획을 받지 못함', needsUserDecision: true },
+      }
+    }
+    steps = normalizeNanoSteps(plan.steps)
+  }
+  if (!steps) {
+    return {
+      history: [],
+      finalVerdict: { passed: false, tier: 'nano', error: 'nano_plan_invalid', reason: '나노 계획에 중복/빈 stepId 또는 instruction이 있음', needsUserDecision: true },
+    }
+  }
+
+  const taskId = options.taskId || stableNanoTaskId(task, cwd)
+  const tokenUsage = options.tokenUsage || null
+  const providerHeadroom = options.providerHeadroom
+  const remainingTokenPct = options.remainingTokenPct
+  const history = []
+  const cumulativeFiles = new Set()
+  const baseline = await gatherRealDiff(cwd)
+  const baselineFiles = new Set(baseline?.filesChanged || [])
+
+  for (const step of steps) {
+    const startedAtSeconds = await nanoEpochSeconds()
+    const idempotencyKey = `${taskId}::${step.stepId}`
+    const existing = await checkNanoEvent(eventFile, idempotencyKey)
+    if (!existing || existing.ok !== true) {
+      return { history, finalVerdict: { passed: false, tier: 'nano', error: 'nano_event_check_failed', stepId: step.stepId, reason: '기존 나노 이벤트 조회 실패 — 안전을 위해 실행을 중단함', needsUserDecision: true } }
+    }
+    if (existing.found) {
+      let previous
+      try { previous = JSON.parse(existing.eventJson) } catch (error) { previous = null }
+      if (!previous || previous.status !== 'passed') {
+        return { history, finalVerdict: { passed: false, tier: 'nano', error: 'nano_step_previously_failed', stepId: step.stepId, reason: '동일 나노 스텝의 실패 이벤트가 이미 존재함 — 자동 재실행하지 않음', needsUserDecision: true } }
+      }
+      history.push({ stepId: step.stepId, reused: true, event: previous })
+      for (const file of previous.changedFiles || []) cumulativeFiles.add(file)
+      if (previous.verificationTier !== 'light') cumulativeFiles.clear()
+      continue
+    }
+
+    log(`[나노] ${step.stepId}: 계약 단위 실행`)
+    const execution = await fullExecute(cwd, `${step.instruction}\n\n[완료조건]\n${step.doneCriteria}`, context, harnessFile)
+    const realDiff = await gatherRealDiff(cwd)
+    const actualFiles = Array.isArray(realDiff?.filesChanged) ? realDiff.filesChanged : []
+    const declaredFiles = Array.isArray(step.files) ? step.files : []
+    const changedFiles = [...new Set([
+      ...declaredFiles.filter((file) => actualFiles.includes(file)),
+      ...actualFiles.filter((file) => !baselineFiles.has(file)),
+      ...declaredFiles,
+    ])]
+    for (const file of changedFiles) cumulativeFiles.add(file)
+
+    const riskInputs = {
+      stepFileCount: changedFiles.length,
+      cumulativeFileCount: cumulativeFiles.size,
+      sensitivePath: !!realDiff?.sensitivePath,
+      dependencyBoundaryCrossed: step.dependencyBoundaryCrossed,
+      remainingTokenPct,
+      providerHeadroom,
+    }
+
+    const finishFailure = async (errorCode, reason, tier = 'light', issues = []) => {
+      const failedAtSeconds = await nanoEpochSeconds()
+      const event = makeNanoEvent(taskId, step, 'failed', tier, changedFiles, ['codex'], reason, startedAtSeconds, failedAtSeconds, tokenUsage, riskInputs)
+      event.preventionRules = issues.map((issue) => nanoText(issue.description || issue, 'review issue')).slice(0, 20)
+      const recorded = await recordNanoOutcome(eventFile, event)
+      if (!recorded.ok) {
+        return { history, finalVerdict: { passed: false, tier: 'nano', error: 'nano_event_record_failed', stepId: step.stepId, reason: `${errorCode}: ${reason}; 실패 이벤트 기록도 실패하여 중단함`, needsUserDecision: true } }
+      }
+      history.push({ stepId: step.stepId, event, error: errorCode, issues })
+      return { history, finalVerdict: { passed: false, tier: 'nano', error: errorCode, stepId: step.stepId, reason, issues, needsUserDecision: true } }
+    }
+
+    if (!execution || execution.ok === false) return await finishFailure('nano_execute_failed', '계약 단위 실행이 성공 응답을 반환하지 않음')
+
+    const lightReview = await nanoLightValidate(task, step, context, realDiff)
+    if (!lightReview || isDispatchFailure(lightReview)) return await finishFailure('nano_light_validation_failed', 'light 검증 도구가 결과를 반환하지 않음')
+    if (lightReview.hasBlockingIssue) return await finishFailure('nano_light_blocked', 'light 검증에서 블로킹 이슈가 발견됨', 'light', lightReview.issues || [])
+
+    const tier = decideNanoRiskTier(riskInputs)
+    const integration = await nanoIntegrationValidate(task, context, realDiff, tier)
+    if (!integration.ok) return await finishFailure('nano_integration_blocked', integration.reason || '통합 검증에서 블로킹 이슈가 발견됨', tier, integration.issues || [])
+
+    const passedAtSeconds = await nanoEpochSeconds()
+    const event = makeNanoEvent(taskId, step, 'passed', tier, changedFiles, ['codex', ...integration.reviewers], 'light 및 필요한 통합 검증 통과', startedAtSeconds, passedAtSeconds, tokenUsage, riskInputs)
+    const recorded = await recordNanoOutcome(eventFile, event)
+    if (!recorded.ok) {
+      return { history, finalVerdict: { passed: false, tier: 'nano', error: 'nano_event_record_failed', stepId: step.stepId, reason: '검증은 통과했지만 이벤트 기록에 실패하여 다음 스텝으로 진행하지 않음', needsUserDecision: true } }
+    }
+    history.push({ stepId: step.stepId, event, verification: { lightReview, integration } })
+    if (tier !== 'light') cumulativeFiles.clear()
+  }
+
+  return { history, finalVerdict: { passed: true, tier: 'nano', steps: history.length, taskId } }
+}
+
 function formatFixInstruction(combinedIssues) {
   return combinedIssues.map((it, i) => `${i + 1}. [${it.source}] ${it.description}`).join('\n')
 }
@@ -512,8 +858,10 @@ const MAX_ROUNDS = parsedArgs.maxRounds || 2
 const task = parsedArgs.task
 const persona = parsedArgs.persona || '일반 사용자'
 const cwd = parsedArgs.cwd
-const historyFile = parsedArgs.historyFile || '/Users/edge_ai/.claude/verify-task-v2-history.jsonl'
+const historyFile = parsedArgs.historyFile || `${CLAUDE_HOME}/.claude/verify-task-v2-history.jsonl`
 const HARNESS_FILE = parsedArgs.harnessFile || HARNESS_FILE_DEFAULT
+const NANO_MODE = parsedArgs.nanoMode === true || Array.isArray(parsedArgs.nanoSteps)
+const NANO_EVENT_FILE = parsedArgs.nanoEventFile || NANO_EVENT_FILE_DEFAULT
 
 if (!cwd) {
   return {
@@ -574,6 +922,21 @@ const history = []
 let finalVerdict = null
 let baseline = null // 탈출구 발동 시 경량 트랙 산출물을 여기 보관 — 전체 트랙에서 1~8단계(계획/비평/실행)를 생략하고 바로 코드리뷰로 직행하는 데 씀
 let harnessRulesAddedCount = 0
+
+if (NANO_MODE) {
+  log('[나노] 나노 게이트 트랙 시작')
+  const nanoResult = await runNanoGate(task, context, cwd, HARNESS_FILE, NANO_EVENT_FILE, {
+    nanoSteps: parsedArgs.nanoSteps,
+    taskId: parsedArgs.taskId,
+    tokenUsage: parsedArgs.tokenUsage,
+    providerHeadroom: parsedArgs.providerHeadroom,
+    remainingTokenPct: parsedArgs.remainingTokenPct,
+  })
+  tier = 'nano'
+  history.push(...(nanoResult.history || []))
+  finalVerdict = nanoResult.finalVerdict
+  return await finalizeAndReturn()
+}
 
 // ---------- 경량 트랙 ----------
 if (tier === 'light') {
@@ -857,14 +1220,14 @@ async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
   try {
     if (!pendingJobParams) {
       await agent(
-        `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}`,
+        `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "${MAC_AGENT_ROOT}/bin/discord-notify.sh" ${JSON.stringify(message)}`,
         { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
       )
       return
     }
     const paramsJson = JSON.stringify(pendingJobParams)
     const result = await agent(
-      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "$HOME/mac-agent/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 written=false, reason에 "no message id"라고 채워서 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. Write가 성공했으면 written=true, messageId에 그 id를 채워서 답해. Write가 실패했으면 written=false, reason에 무엇이 실패했는지 적어.\n\n[원본 params JSON]\n${paramsJson}`,
+      `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "${MAC_AGENT_ROOT}/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 written=false, reason에 "no message id"라고 채워서 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. Write가 성공했으면 written=true, messageId에 그 id를 채워서 답해. Write가 실패했으면 written=false, reason에 무엇이 실패했는지 적어.\n\n[원본 params JSON]\n${paramsJson}`,
       { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose', schema: NOTIFY_ESCALATION_SCHEMA }
     )
     if (!result) {
@@ -900,7 +1263,24 @@ async function finalizeAndReturn() {
     await notifyDiscordEscalation(
       `⚠️ verify-task-v2 에스컬레이션 (${tier} 트랙) — "${shortTask}"\n${reason}${replyHint}`,
       jobType,
-      { task, cwd, persona, maxRounds: MAX_ROUNDS, historyFile, harnessFile: HARNESS_FILE, ...(isClarification ? { questions: finalVerdict?.questions } : {}) }
+      {
+        task,
+        cwd,
+        persona,
+        maxRounds: MAX_ROUNDS,
+        historyFile,
+        harnessFile: HARNESS_FILE,
+        ...(NANO_MODE ? {
+          nanoMode: true,
+          nanoSteps: parsedArgs.nanoSteps,
+          taskId: parsedArgs.taskId,
+          nanoEventFile: NANO_EVENT_FILE,
+          tokenUsage: parsedArgs.tokenUsage,
+          providerHeadroom: parsedArgs.providerHeadroom,
+          remainingTokenPct: parsedArgs.remainingTokenPct,
+        } : {}),
+        ...(isClarification ? { questions: finalVerdict?.questions } : {}),
+      }
     )
   }
 
@@ -918,6 +1298,8 @@ async function finalizeAndReturn() {
       finalTotal: tier === 'light' ? (finalVerdict?.evalResult?.total ?? null) : null,
       finalHasBlockingIssue: tier === 'full' && finalVerdict && !finalVerdict.error ? !finalVerdict.passed : null,
       rulesAddedToHarness: tier === 'full' ? harnessRulesAddedCount : null,
+      nanoMode: NANO_MODE,
+      nanoStepsCompleted: NANO_MODE ? history.length : null,
     },
     historyFile
   )

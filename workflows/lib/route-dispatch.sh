@@ -18,6 +18,15 @@ set -uo pipefail
 
 PROMPT_FILE="${1:?usage: route-dispatch.sh <prompt-file>}"
 
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=provider-bin.sh
+. "$SCRIPT_DIR/provider-bin.sh"
+
+AGY_BIN="${AGY_BIN:-}"
+CODEX_BIN="${CODEX_BIN:-}"
+[ -n "$AGY_BIN" ] || AGY_BIN="$(find_agy_bin || true)"
+[ -n "$CODEX_BIN" ] || CODEX_BIN="$(find_codex_bin || true)"
+
 if [ ! -f "$PROMPT_FILE" ]; then
   echo "ROUTED-TO: none"
   echo "route-dispatch: prompt file not found: $PROMPT_FILE" >&2
@@ -32,7 +41,11 @@ fi
 # silently fell back to codex every time. This calls agy directly and only
 # treats an actually-empty response or literal rate-limit/quota wording as
 # a depletion signal.
-AGY_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat "$PROMPT_FILE")" 2>&1)"
+if [ -z "$AGY_BIN" ] || [ ! -x "$AGY_BIN" ]; then
+  AGY_OUTPUT=""
+else
+  AGY_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$AGY_BIN" -p "$(cat "$PROMPT_FILE")" 2>&1)"
+fi
 # Phrase match alone false-positives when agy's own LEGITIMATE answer
 # happens to discuss rate limiting as its actual subject (e.g. the prompt
 # asked how to implement rate limiting) — a real depletion/error message
@@ -58,4 +71,8 @@ fi
 read -r CLAUDE_PCT CODEX_PCT < <(bash "$(dirname "$0")/coach-headroom.sh")
 
 echo "ROUTED-TO: codex (antigravity unavailable/depleted; headroom at fallback time — claude:${CLAUDE_PCT:-0}% codex:${CODEX_PCT:-0}%)"
-/opt/homebrew/bin/codex exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1
+if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
+  echo "route-dispatch: codex 실행파일을 찾을 수 없음(CODEX_BIN override 또는 Homebrew 경로 확인)" >&2
+  exit 1
+fi
+"$CODEX_BIN" exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1

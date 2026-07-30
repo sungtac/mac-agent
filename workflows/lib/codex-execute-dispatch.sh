@@ -64,12 +64,21 @@ if ! /usr/bin/git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
   exit 0
 fi
 
-# Absolute path, not bare `codex` — a Workflow-spawned agent's Bash
+# Resolved absolute path, not bare `codex` — a Workflow-spawned agent's Bash
 # environment can have a PATH stripped of /opt/homebrew/bin (see score-dispatch.sh).
 # No --skip-git-repo-check — the check above already guarantees this is a
 # real git repo, so there's nothing to skip; keeping the flag would have
 # silently masked the check above's own guarantee if the two ever drifted.
-RAW_OUTPUT="$(/opt/homebrew/bin/codex exec -s workspace-write -C "$CWD" "$(cat "$PROMPT_FILE")" 2>&1)"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=provider-bin.sh
+. "$SCRIPT_DIR/provider-bin.sh"
+CODEX_BIN="${CODEX_BIN:-}"
+CODEX_BIN="${CODEX_BIN:-$(find_codex_bin || true)}"
+if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
+  FAILURE_ENVELOPE "codex 실행파일을 찾을 수 없음(CODEX_BIN override 또는 Homebrew 경로 확인)"
+  exit 0
+fi
+RAW_OUTPUT="$("$CODEX_BIN" exec -s workspace-write -C "$CWD" "$(cat "$PROMPT_FILE")" 2>&1)"
 EXIT_CODE=$?
 
 if [ "$EXIT_CODE" -ne 0 ]; then

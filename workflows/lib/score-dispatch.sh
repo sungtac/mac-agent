@@ -21,7 +21,8 @@ PROMPT_FILE="${2:?usage: score-dispatch.sh <codex|agy> <prompt-file> [schema-kin
 # original rubric-shaped envelope unchanged. verify-task-v2.js (v1's sibling,
 # many different schemas per stage) passes this explicitly. Discovered
 # 2026-07-27/28: a single fixed rubric-shaped envelope only matches v1's
-# schema — every v2 stage schema (plan/critique/reconcile/review/light-eval)
+# schema — every v2 stage schema (plan/critique/reconcile/review/light-eval/
+# nano-plan)
 # is structurally different, so a v1-shaped failure envelope would itself
 # fail v2's schema validation instead of surfacing as a clean, retryable
 # "dispatch failed" signal. docs/verify-task-v2-design.md "손 안 댄 것" 기록.
@@ -67,6 +68,9 @@ V2_ENVELOPES = {
         "clarifyingQuestions": "",
         "plan": "",
     },
+    "nano-plan": {
+        "steps": [],
+    },
     # issues를 빈 배열로 두면 "안티그래비티가 검토해서 문제 없다고 함"으로
     # 오독될 수 있음(fail-open) — 대신 실패 자체를 이슈 하나로 넣어서
     # 취합(reconcile) 단계에서 "이 비평은 실행 자체가 안 됐다"는 사실이
@@ -102,7 +106,8 @@ if [ ! -f "$PROMPT_FILE" ]; then
   exit 0
 fi
 
-# Both codex and agy are invoked by absolute path, not bare command name —
+# Both codex and agy are invoked by a resolved absolute path, not a bare
+# command name —
 # confirmed 2026-07-26 that a Workflow-spawned agent's Bash environment can
 # have a stripped PATH missing /opt/homebrew/bin (same recurring gotcha as
 # tmux/coach/claude/ffmpeg/whisper-cli elsewhere on this Mac), which silently
@@ -112,8 +117,13 @@ fi
 # (not hardcoded-only) so the same script still works if ported to another
 # agent/machine with different install locations — set-and-forget default,
 # not a portability dead end.
-CODEX_BIN="${CODEX_BIN:-/opt/homebrew/bin/codex}"
-AGY_BIN="${AGY_BIN:-/Users/edge_ai/.local/bin/agy}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=provider-bin.sh
+. "$SCRIPT_DIR/provider-bin.sh"
+CODEX_BIN="${CODEX_BIN:-}"
+AGY_BIN="${AGY_BIN:-}"
+[ -n "$CODEX_BIN" ] || CODEX_BIN="$(find_codex_bin || true)"
+[ -n "$AGY_BIN" ] || AGY_BIN="$(find_agy_bin || true)"
 
 truncate_output() {
   printf '%s' "$1" | head -c 2000
