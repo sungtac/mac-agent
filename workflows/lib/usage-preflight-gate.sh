@@ -22,14 +22,30 @@
 # never-string-interpolate-JSON-into-python-source discipline
 # coach-headroom.sh documents (piped via stdin here too).
 #
-# Threshold: SKIP if the relevant window's left_pct < FLOOR_PCT, OR coach's
-# own `level` for that provider is "red". Claude is checked on its 5h
-# window specifically (not 7d) — that's the window whose exhaustion is what
-# actually causes a mid-run failure; the 7d window can be comfortably high
-# while 5h is at 0%, exactly as observed live on 2026-07-28 (claude 5h=0%,
-# 7d=83%, level=yellow). Codex only has a 7d window
-# (coach has no visibility into antigravity at all, same reason
+# Threshold: SKIP only if the checked window's own left_pct < FLOOR_PCT.
+# Claude is checked on its 5h window specifically (not 7d) — that's the
+# window whose exhaustion is what actually causes a mid-run failure; the 7d
+# window can be comfortably high while 5h is at 0%, exactly as observed live
+# on 2026-07-28 (claude 5h=0%, 7d=83%, level=yellow). Codex only has a 7d
+# window (coach has no visibility into antigravity at all, same reason
 # coach-headroom.sh never reports it — "dual" here means claude+codex only).
+#
+# 2026-07-30 fix (실측으로 발견): 예전엔 여기서 coach의 provider-level
+# `level`(red/yellow/green)도 OR 조건으로 같이 봤다. 근데 `level`은 provider
+# 전체를 대표하는 단일 값이라 windows 중 가장 빠듯한 쪽이 좌우한다 — claude
+# 5h=97%(멀쩡)인데도 7d=56%라 level=red가 되면, 검사 대상은 5h인데 엉뚱한
+# 창이 만든 level 때문에 SKIP되고 메시지엔 "5h창 잔여 98% (level=red)"라는
+# 앞뒤 안 맞는 조합이 나갔다. 지금은 SKIP 여부를 window_key 자신의
+# left_pct만으로 결정한다.
+#
+# 표시 형식(1차 수정 후 리뷰 피드백 반영, 2026-07-30 2차): 두 창(5h/7d)을
+# "항상" 함께 보여준다 — 예전엔 다른 창 데이터가 있을 때만 덧붙여서, codex처럼
+# 구조적으로 5h창 자체가 없는 provider에서는 여전히 한쪽만 보였다. 지금은
+# 없는 창도 "N/A"로 명시한다. 그리고 `level`/`reason`은 특정 창이 아니라
+# provider 전체를 요약한 값이라는 걸 "전체상태="라는 라벨로 분리해서, 두 창
+# 잔여율 뒤에만 붙인다 — "5h창 98%인데 왜 전체상태=red냐"는 오해가 다시
+# 나오지 않도록, 어느 창 숫자에도 level을 직접 매달지 않는다(사용자 요청:
+# 둘 다 알려주는 방향으로, 차단 여부와는 분리해서 정보로).
 #
 # Fail-open, not fail-closed: if coach is missing, errors, or returns
 # unparseable/incomplete data, this prints PROCEED — an unreachable checker
@@ -71,45 +87,9 @@ if [ -z "$COACH_OUTPUT" ]; then
   exit 0
 fi
 
-printf '%s' "$COACH_OUTPUT" | python3 -c "
-import json, sys
-
-actor = sys.argv[1]
-floor = int(sys.argv[2])
-
-try:
-    providers = json.load(sys.stdin)['providers']
-except Exception:
-    print('PROCEED (coach output unparseable — gate skipped, not enforced)')
-    sys.exit(0)
-
-def check(name, window_key):
-    p = providers.get(name) or {}
-    if not p.get('ok'):
-        return None  # provider unreadable — don't block on it (fail open)
-    windows = p.get('windows') or {}
-    w = windows.get(window_key)
-    if not w or w.get('left_pct') is None:
-        return None
-    pct = w['left_pct']
-    level = p.get('level')
-    if level == 'red' or pct < floor:
-        reason = p.get('reason', '')
-        return f'{name} {window_key}창 잔여 {pct}% (level={level}) — {reason}'
-    return None
-
-blockers = []
-if actor in ('claude', 'dual'):
-    r = check('claude', '5h')
-    if r:
-        blockers.append(r)
-if actor in ('codex', 'dual'):
-    r = check('codex', '7d')
-    if r:
-        blockers.append(r)
-
-if blockers:
-    print('SKIP: ' + ' / '.join(blockers))
-else:
-    print('PROCEED')
-" "$ACTOR" "$FLOOR_PCT"
+# 판정 로직은 usage-preflight-gate.py로 분리(2026-07-30) — bash heredoc
+# 안에 python 문자열을 직접 박아두면 따옴표 이스케이프가 계속 꼬이고, 무엇보다
+# fixture JSON으로 직접 단위 테스트하기 어려웠다(usage-preflight-gate.test.sh
+# 참고).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+printf '%s' "$COACH_OUTPUT" | python3 "$SCRIPT_DIR/usage-preflight-gate.py" "$ACTOR" "$FLOOR_PCT"
