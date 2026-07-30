@@ -113,7 +113,7 @@ if [ "${#MANDATORY_HITS[@]}" -gt 0 ]; then
   HITS_STR="$(IFS=', '; echo "${MANDATORY_HITS[*]}")"
   jq -n --arg hits "$HITS_STR" '{
     decision: "block",
-    reason: ("이 세션은 무조건 독립검증 대상 카테고리(" + $hits + ")에 해당하는데 verify-task 실행 흔적이 없습니다. 이 카테고리는 \"검증 필요 없었다\"는 설명으로 넘어갈 수 없습니다 — Workflow({scriptPath:\"~/.claude/workflows/verify-task.js\", args:{task, result, persona, cwd}})를 실제로 돌리세요."),
+    reason: ("이 세션은 무조건 독립검증 대상 카테고리(" + $hits + ")에 해당하는데 verify-task 실행 흔적이 없습니다. 이 카테고리는 \"검증 필요 없었다\"는 설명으로 넘어갈 수 없습니다 — Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona}})로 verify-task-v2를 실제로 돌리세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다)."),
     systemMessage: "무조건 독립검증 카테고리 감지 — verify-task 실행 필수, 생략 불가."
   }'
   exit 0
@@ -123,7 +123,7 @@ if [ "${RISKY_BASH_COUNT:-0}" -ge 1 ]; then
   touch "$NAG_MARKER"
   jq -n '{
     decision: "block",
-    reason: "이 세션에서 설치/커밋 등 위험 신호가 있는 Bash 명령이 감지됐는데, verify-task로 독립 검증한 흔적이 안 보입니다. 이번 작업이 검증 대상(중요/복잡한 작업)이라면 Workflow({scriptPath:\"~/.claude/workflows/verify-task.js\", args:{task, result, persona, cwd}})를 돌리세요. 검증이 필요 없는 가벼운 작업이었다면, 그 이유를 사용자에게 한 줄로 알려주고 종료하세요.",
+    reason: "이 세션에서 설치/커밋 등 위험 신호가 있는 Bash 명령이 감지됐는데, verify-task로 독립 검증한 흔적이 안 보입니다. 이번 작업이 검증 대상(중요/복잡한 작업)이라면 Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona}})로 verify-task-v2를 돌리세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다). 검증이 필요 없는 가벼운 작업이었다면, 그 이유를 사용자에게 한 줄로 알려주고 종료하세요.",
     systemMessage: "verify-task 미실행 감지 — 검증하거나, 왜 생략하는지 사용자에게 알려주세요."
   }'
 fi
