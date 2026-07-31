@@ -1,13 +1,15 @@
 # 엣지 에이전트 파일럿 수용 기록
 
-작성일: 2026-07-31
-상태: token-free 수용 통과, 제한적 운영 전환 대기
+작성일: 2026-08-01
+상태: 기준선 확정, 실제 provider 파일럿 대기
 
 ## 이번 검증
 
-- Python 관련 테스트 82개 통과
+- Python 관련 테스트 107개 통과
 - Nano/workflow Node 테스트 48개 통과
 - `git diff --check` 통과
+- 기준 커밋 `7b73d0a` 생성 및 clean 상태 확인
+- 파일럿 전용 clean worktree 준비: `/tmp/edge-agent-pilot-pNnY1i/worktree`
 - 병렬 worktree 읽기 전용 감사 결과: finding 0건
 - 자동 병합 기본값 비활성 확인
 - 세션 lease·ContextStore·결과 DTO·worktree 연결 테스트 통과
@@ -47,10 +49,17 @@
 4. 실행 후 diff·검증·이벤트 원장·lease 해제를 확인한다.
 5. 성공 표본을 누적한 뒤에만 제한적 병렬 실행을 별도로 승인한다.
 
+## 2026-08-01 사용량 게이트 상태
+
+- Claude: 5시간창 0%, 전체 상태 red — 실제 파일럿 차단
+- Codex: 주간 잔여 66%, 전체 상태 green
+- Dual 파일럿: Claude 차단으로 시작하지 않음
+
 ## 남은 작업으로 기록
 
-- [ ] 별도 터미널의 Codex·Antigravity canary 종료 상태 확인
-- [ ] Claude 사용량 회복 후 usage preflight 재확인
-- [ ] 전용 clean worktree에서 단일 저위험 실제 provider 파일럿 재시도
+- [ ] Claude 사용량 회복 후 `usage-preflight-gate.sh dual` 재확인
+- [ ] 전용 clean worktree에서 단일 저위험 실제 provider 파일럿 실행
 - [ ] 자동 병합 없이 diff·검증·nano 이벤트·lease 해제 확인
-- [ ] 결과가 통과한 뒤에만 제한적 운영 연결과 병렬 실행을 별도 검토
+- [ ] 파일럿 결과를 효율성 원장에 기록하고 임계값 분석 자료로 편입
+- [ ] 파일럿 통과 후에만 3개 이상 병렬 provider 실행 검토
+- [ ] 병렬 결과 누적 후 nano 임계값 조정
