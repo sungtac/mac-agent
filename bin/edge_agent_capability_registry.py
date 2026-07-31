@@ -66,6 +66,36 @@ def resolve(prompt: str, *, max_chars: int = 6000, include_core: bool = True) ->
     return CapabilityResolution(tuple(selected), "".join(sections), tuple(omitted))
 
 
+def prepare_provider_argv(provider: str, args: list[str], *, max_chars: int = 6000) -> list[str]:
+    """Inject the common context into a known provider prompt argv slot.
+
+    Only the prompt value is replaced; provider flags and cwd arguments are
+    preserved byte-for-byte. Unknown argv shapes are returned unchanged.
+    """
+    prompt_index: int | None = None
+    if provider == "claude" and "-p" in args:
+        index = args.index("-p") + 1
+        if index < len(args):
+            prompt_index = index
+    elif provider == "agy" and "--print" in args:
+        index = args.index("--print") + 1
+        if index < len(args):
+            prompt_index = index
+    elif provider == "codex" and "--" in args:
+        index = len(args) - 1
+        if index >= 0 and args[index] != "--":
+            prompt_index = index
+    if prompt_index is None:
+        return list(args)
+    original = args[prompt_index]
+    context = resolve(original, max_chars=max_chars).context
+    if not context:
+        return list(args)
+    prepared = list(args)
+    prepared[prompt_index] = f"{context}\n\n[공통 가능 기능 요청]\n{original}"
+    return prepared
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--prompt", required=True)
