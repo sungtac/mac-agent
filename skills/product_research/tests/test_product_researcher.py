@@ -1,0 +1,75 @@
+from __future__ import annotations
+
+import unittest
+
+from skills.product_research.product_researcher import (
+    ProductCandidate,
+    extract_prices_excluding_shipping,
+    infer_shipping_fee,
+    parse_danawa_html,
+    parse_naver_brand_html,
+    parse_quantity_kg,
+    rank_candidates,
+    unit_price_per_100g,
+    accessory_exclusion_reason,
+)
+
+
+class ProductResearcherTest(unittest.TestCase):
+    def test_parse_quantity_kg_single(self):
+        self.assertEqual(parse_quantity_kg("하드볼 8.3kg, 1개"), 8.3)
+
+    def test_parse_quantity_kg_count_comma(self):
+        self.assertEqual(parse_quantity_kg("하드볼 8.3kg, 4개"), 33.2)
+
+    def test_parse_quantity_kg_count_x(self):
+        self.assertEqual(parse_quantity_kg("미친모래 6.3kg X 3개"), 18.9)
+
+    def test_unit_price_per_100g(self):
+        self.assertEqual(unit_price_per_100g(51100, 16.6), 307.8)
+
+    def test_rank_prefers_lower_unit_price(self):
+        a = ProductCandidate(source="a", name="A", url="u", price=1000, quantity_kg=1, unit_price_per_100g=100)
+        b = ProductCandidate(source="b", name="B", url="u", price=900, quantity_kg=0.5, unit_price_per_100g=180)
+        self.assertEqual(rank_candidates([b, a])[0].name, "A")
+
+    def test_shipping_fee_should_not_be_considered_lower_than_product_price(self):
+        text = "닥터펠리스 하드볼 4.3kg 4개 66,190 원 배송비 3,000원"
+        self.assertEqual(extract_prices_excluding_shipping(text)[0], 66190)
+        self.assertEqual(infer_shipping_fee(text), 3000)
+
+    def test_parse_danawa_fixture_uses_conservative_confidence(self):
+        html = 'prod_main_info"> 닥터펠리스 하드볼 4.3kg 4개 66,190 원 배송비 3,000원 <div class="x">'
+        candidates = parse_danawa_html("닥터펠리스 하드볼", "https://search.danawa.com/dsearch.php?query=x", html)
+        self.assertEqual(candidates[0].price, 66190)
+        self.assertEqual(candidates[0].shipping_fee, 3000)
+        self.assertEqual(candidates[0].confidence, "marketplace_search_parsed")
+        self.assertEqual(candidates[0].link_status, "stable_search_url_only")
+
+    def test_accessory_result_is_excluded_when_query_did_not_ask_for_part(self):
+        reason = accessory_exclusion_reason("르젠 LZEF-DC02 선풍기", "[호환] 르젠 LZEF-DC02 사용 선풍기 날개")
+        self.assertIn("accessory", reason)
+
+    def test_accessory_result_not_excluded_when_query_asks_for_part(self):
+        reason = accessory_exclusion_reason("르젠 LZEF-DC02 선풍기 날개", "[호환] 르젠 LZEF-DC02 사용 선풍기 날개")
+        self.assertEqual(reason, "")
+
+    def test_parse_danawa_fixture_marks_accessory_candidate(self):
+        html = 'prod_main_info"> [호환] 호환 르젠 LZEF-DC02 사용 선풍기 날개 9,900 원 무료배송 <div class="x">'
+        candidates = parse_danawa_html("르젠 LZEF-DC02 선풍기", "https://search.danawa.com/dsearch.php?query=x", html)
+        self.assertIn("accessory", candidates[0].excluded_reason)
+
+    def test_parse_naver_brand_fixture_extracts_conditional_price(self):
+        fixture = (
+            '하드볼 {"productNo":11329531694,"name":"김명철 미야옹철 수의사 고양이모래 벤토나이트 카사바 카사벤토 하드볼 8.3kg, 2개",'
+            '"salePrice":81800,"discountedSalePrice":51100,"mobileDiscountedSalePrice":51100}'
+        )
+        candidates = parse_naver_brand_html("https://brand.naver.com/drfelis", ["하드볼"], fixture)
+        self.assertEqual(candidates[0].conditional_price, 51100)
+        self.assertEqual(candidates[0].unit_price_per_100g, 307.8)
+        self.assertEqual(candidates[0].confidence, "conditional_price_parsed")
+        self.assertIn("checkout", candidates[0].condition)
+
+
+if __name__ == "__main__":
+    unittest.main()
