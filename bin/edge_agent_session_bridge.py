@@ -84,15 +84,39 @@ def bounded_context(session_id: str) -> str:
     return _store().bounded_context(session_id)
 
 
+def finish_session(session_id: str, *, status: str, summary: str = "") -> None:
+    update_session(
+        session_id,
+        status=status,
+        summary=summary,
+        next_action="사용자 후속 요청 대기" if status == "succeeded" else "실패 원인과 검증 결과 확인",
+        event_type="terminal_provider_finished",
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("context", "session-id"))
+    parser.add_argument("command", choices=("context", "session-id", "start", "finish"))
     parser.add_argument("value")
+    parser.add_argument("provider", nargs="?")
+    parser.add_argument("workspace", nargs="?")
+    parser.add_argument("status", nargs="?")
     args = parser.parse_args()
     if args.command == "context":
         print(bounded_context(args.value), end="")
-    else:
+    elif args.command == "session-id":
         print(session_id_for_task(args.value))
+    elif args.command == "start":
+        if not args.provider or not args.workspace:
+            parser.error("start requires task_id provider workspace")
+        provider = "antigravity" if args.provider == "agy" else args.provider
+        print(start_session(task_id=args.value, channel="terminal", provider=provider,
+                            owner="terminal", workspace=args.workspace, worktree=args.workspace))
+    else:
+        finish_status = args.status or args.provider
+        if finish_status not in {"succeeded", "failed"}:
+            parser.error("finish requires status succeeded|failed")
+        finish_session(args.value, status=finish_status)
     return 0
 
 
