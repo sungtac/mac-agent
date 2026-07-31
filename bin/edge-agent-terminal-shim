@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROLE="${EDGE_AGENT_SHIM_ROLE:-$(basename "$0")}"
+ROOT="${EDGE_AGENT_ROOT:-$HOME/mac-agent}"
+REAL=""
+case "$ROLE" in
+  claude) REAL="${CLAUDE_REAL_BIN:-$HOME/.local/bin/claude}" ;;
+  codex) REAL="${CODEX_REAL_BIN:-/opt/homebrew/bin/codex}" ;;
+  agy) REAL="${AGY_REAL_BIN:-$HOME/.local/bin/agy}" ;;
+  *) echo "unsupported terminal provider shim: $ROLE" >&2; exit 64 ;;
+esac
+
+prompt=""
+if [ "$ROLE" = claude ]; then
+  args=("$@")
+  for ((i=0; i<${#args[@]}-1; i++)); do
+    if [ "${args[$i]}" = "-p" ] || [ "${args[$i]}" = "--prompt" ]; then prompt="${args[$((i+1))]}"; break; fi
+  done
+elif [ "$ROLE" = codex ]; then
+  args=("$@")
+  for ((i=0; i<${#args[@]}-1; i++)); do
+    if [ "${args[$i]}" = "--" ]; then prompt="${args[$((i+1))]}"; break; fi
+  done
+elif [ "$ROLE" = agy ]; then
+  args=("$@")
+  for ((i=0; i<${#args[@]}-1; i++)); do
+    if [ "${args[$i]}" = "--print" ]; then prompt="${args[$((i+1))]}"; break; fi
+  done
+fi
+
+if [ -n "$prompt" ] && [ -x "$ROOT/bin/edge-agent-provider.sh" ]; then
+  tmp="$(mktemp "${TMPDIR:-/tmp}/edge-agent-prompt.XXXXXX")"
+  trap 'rm -f "$tmp"' EXIT
+  printf '%s\n' "$prompt" > "$tmp"
+  exec "$ROOT/bin/edge-agent-provider.sh" "$ROLE" "$tmp" "$PWD"
+fi
+
+# Preserve native interactive/provider-specific invocations. One-shot forms
+# are the unified path; unsupported argument layouts remain non-destructive.
+exec "$REAL" "$@"

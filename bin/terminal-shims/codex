@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+EDGE_AGENT_SHIM_ROLE=codex exec "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)/edge-agent-terminal-shim" "$@"
