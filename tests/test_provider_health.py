@@ -247,6 +247,8 @@ class ProviderContextTests(unittest.TestCase):
             rendered = format_provider_context(data)
             self.assertIn("참고", rendered)
             self.assertIn("provider: codex", rendered)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
             clear_provider_context(path)
             self.assertIsNone(load_provider_context(path))
 

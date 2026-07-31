@@ -97,6 +97,20 @@ class ProviderSandboxCanaryTests(unittest.TestCase):
             )
             self.assertNotEqual(result.returncode, 0)
 
+    def test_review_mode_denies_repository_writes(self):
+        with tempfile.TemporaryDirectory(prefix="edge-agent-review-canary-") as temp_dir:
+            target = Path(temp_dir) / "review-write"
+            result = subprocess.run(
+                [str(WRAPPER), "/bin/sh", "-c", f"touch '{target}'"],
+                cwd=temp_dir,
+                env={**__import__("os").environ, "EDGE_AGENT_PROVIDER_MODE": "review"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+            self.assertFalse(target.exists())
+
 
 
 if __name__ == "__main__":

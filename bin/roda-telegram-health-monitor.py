@@ -13,11 +13,14 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 try:
-    from edge_agent_parallel_locks import repository_lifecycle_lock
+    from edge_agent_parallel_locks import integration_lock, repository_lifecycle_lock
 except ImportError:  # system-Python test loader; launchd uses the repo bin path
+    integration_lock = None
     repository_lifecycle_lock = None
 
 
@@ -63,10 +66,52 @@ TARGETS = {
     },
 }
 RESTART_HELPER = Path(__file__).with_name("edge-agent-telegram-restart.py")
+LOCAL_TIMEZONE = ZoneInfo("Asia/Seoul")
 
 ERROR_PATTERNS = (
     ("empty_response", re.compile(r"빈 응답|empty response", re.I)),
     ("execution_error", re.compile(r"실행 오류|실행에 실패|처리 실패|exit=\d+", re.I)),
+)
+# Usage exhaustion is an operational state, not a code defect. Keep these
+# patterns provider-neutral because Claude, Codex and Antigravity expose
+# different wording for the same condition.
+USAGE_LIMIT_RE = re.compile(
+    r"hit your (?:session|usage) limit|usage cap|quota\s*(?:exceeded|reached|exhausted)|"
+    r"resource_exhausted|baseline quota.*(?:reached|exhausted)|사용량\s*(?:제한|한도)|"
+    r"쿼터\s*(?:초과|소진)",
+    re.I,
+)
+EXPLICIT_USAGE_LIMIT_RE = re.compile(
+    r"hit your (?:session|usage) limit|quota\s*(?:exceeded|reached|exhausted)|resource_exhausted|"
+    r"baseline quota.*(?:reached|exhausted)|사용량\s*(?:제한|한도)|쿼터\s*(?:초과|소진)",
+    re.I,
+)
+RATE_LIMIT_RE = re.compile(
+    r"rate[_ -]?limit(?:_error)?|too many requests|HTTP\s*429|status code\s*:?\s*429|"
+    r"\b429\b|retry[- _]?after|throttl",
+    re.I,
+)
+FAILURE_CONTEXT_RE = re.compile(r"error|fail|실패|오류|provider|exit\s*=|status code|HTTP", re.I)
+EXPLICIT_RATE_LIMIT_RE = re.compile(
+    r"rate[_ -]?limit(?:_error)|rate[_ -]?limit(?:s)?\s+(?:exceeded|reached)|"
+    r"too many requests|HTTP\s*429|status code\s*:?\s*429|\b429\b",
+    re.I,
+)
+NON_REPAIRABLE_CODES = frozenset({"usage_limited", "rate_limited", "context_exceeded", "auth_error"})
+USAGE_RECOVERY_CODES = frozenset({"usage_limited", "rate_limited"})
+USAGE_WINDOW_RE = re.compile(
+    r"(?P<window>5\s*(?:h|hours?)|7\s*(?:d|days?)|weekly|monthly)",
+    re.I,
+)
+RESET_AFTER_RE = re.compile(
+    r"(?:retry[- _]?after|resets?\s+in)\D*(?P<amount>\d+(?:\.\d+)?)\s*"
+    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?",
+    re.I,
+)
+RESET_AT_RE = re.compile(
+    r"(?:resets?|reset\s+at|available\s+at)\D*"
+    r"(?P<value>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)",
+    re.I,
 )
 # This code was emitted by older monitor versions for an intentional
 # ``stop_running()``/launchd restart cycle. Do not resurrect it from a state
@@ -103,10 +148,113 @@ def _save_state(state: dict) -> None:
 
 
 def classify_line(line: str) -> str | None:
+    prompt_marker = re.search(r"\btext\s*=", line, re.I)
+    provider_prefix = line[:prompt_marker.start()] if prompt_marker else line
+    if prompt_marker and not FAILURE_CONTEXT_RE.search(provider_prefix):
+        usage_candidate = None
+        rate_candidate = None
+    else:
+        usage_candidate = USAGE_LIMIT_RE.search(line)
+        rate_candidate = RATE_LIMIT_RE.search(line)
+    if usage_candidate and (EXPLICIT_USAGE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
+        return "usage_limited"
+    if rate_candidate and (EXPLICIT_RATE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
+        return "rate_limited"
     for code, pattern in ERROR_PATTERNS:
         if pattern.search(line):
             return code
     return None
+
+
+def _duration_seconds(amount: str, unit: str | None) -> float:
+    value = float(amount)
+    normalized = (unit or "s").lower()
+    if normalized.startswith("h"):
+        return value * 3600
+    if normalized.startswith("m"):
+        return value * 60
+    return value
+
+
+def _format_reset_at(value: str | None) -> str | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(LOCAL_TIMEZONE).strftime("%Y-%m-%d %H:%M KST")
+    except ValueError:
+        return value
+
+
+def _usage_details(line: str, *, now: float | None = None) -> dict:
+    observed = datetime.now(timezone.utc) if now is None else datetime.fromtimestamp(now, timezone.utc)
+    window_match = USAGE_WINDOW_RE.search(line)
+    details = {
+        "window": window_match.group("window").lower().replace(" ", "") if window_match else "unknown",
+        "reset_at": None,
+        "reset_source": None,
+        "recovery_confidence": "unknown",
+    }
+    reset_at_match = RESET_AT_RE.search(line)
+    if reset_at_match:
+        try:
+            parsed = datetime.fromisoformat(reset_at_match.group("value").replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            details.update({
+                "reset_at": parsed.astimezone(timezone.utc).isoformat(),
+                "reset_source": "provider_reset_at",
+                "recovery_confidence": "exact",
+            })
+        except ValueError:
+            pass
+    if details["reset_at"] is None:
+        reset_after_match = RESET_AFTER_RE.search(line)
+        if reset_after_match:
+            seconds = _duration_seconds(reset_after_match.group("amount"), reset_after_match.group("unit"))
+            details.update({
+                "reset_at": (observed + timedelta(seconds=seconds)).isoformat(),
+                "reset_source": "provider_retry_after" if "retry" in reset_after_match.group(0).lower() else "provider_reset_in",
+                "recovery_confidence": "exact" if "retry" in reset_after_match.group(0).lower() else "estimated",
+            })
+    if details["reset_at"] is None and details["window"] != "unknown":
+        details["recovery_confidence"] = "estimated"
+    return details
+
+
+def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -> dict:
+    details = _usage_details(line, now=now)
+    reset_text = _format_reset_at(details["reset_at"])
+    if reset_text:
+        recovery = f"재개 예상: {reset_text}"
+    elif details["window"] != "unknown":
+        recovery = f"회복 창: {details['window']} (정확한 시각 확인 불가)"
+    else:
+        recovery = "회복 시각: provider 정보 없음"
+    alternatives = {
+        "claude": "Codex, Antigravity",
+        "codex": "Claude, Antigravity",
+        "antigravity": "Claude, Codex",
+    }.get(role, "다른 provider")
+    return {
+        "kind": "provider_usage",
+        "role": role,
+        "code": code,
+        "fingerprint": _fingerprint(role, code, line),
+        "message": (
+            f"[Roda 사용량 제한 감지] {role} provider의 사용량 제한 상태입니다.\n"
+            f"유형: {code}\n{recovery}\n"
+            f"대체 provider: {alternatives}\n자동 Codex 복구: 실행하지 않음"
+        ),
+        "detail": _safe_detail(line),
+        "window": details["window"],
+        "reset_at": details["reset_at"],
+        "reset_source": details["reset_source"],
+        "recovery_confidence": details["recovery_confidence"],
+        "auto_repair": "blocked",
+    }
 
 
 def _fingerprint(role: str, code: str, line: str) -> str:
@@ -241,13 +389,22 @@ def _run_codex_repair_impl(event: dict) -> str:
     repair_commit = subprocess.run(["/usr/bin/git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
     if not repair_commit:
         return "Codex repair commit hash를 확인하지 못했습니다."
-    source_status = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "status", "--porcelain"], capture_output=True, text=True, check=False).stdout.splitlines()
-    if any(line and not line.startswith("??") for line in source_status):
-        return "main에 추적 파일 변경이 있어 자동 병합하지 않았습니다."
-    merge = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--no-ff", repair_commit, "-m", f"merge: automated Telegram health repair {fingerprint}"], capture_output=True, text=True, check=False)
-    if merge.returncode != 0:
-        subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--abort"], capture_output=True, text=True, check=False)
-        return f"Codex 수정은 생성됐지만 main 병합에 실패했습니다: {merge.stderr[-500:]}"
+    integration = integration_lock(SOURCE_REPO) if integration_lock else contextlib.nullcontext()
+    try:
+        with integration:
+            source_status = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "status", "--porcelain"], capture_output=True, text=True, check=False).stdout.splitlines()
+            if any(line and not line.startswith("??") for line in source_status):
+                return "main에 추적 파일 변경이 있어 자동 병합하지 않았습니다."
+            source_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+            merge = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--no-ff", repair_commit, "-m", f"merge: automated Telegram health repair {fingerprint}"], capture_output=True, text=True, check=False)
+            if merge.returncode != 0:
+                current_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+                merge_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "-q", "--verify", "MERGE_HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+                if current_head == source_head and merge_head == repair_commit:
+                    subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--abort"], capture_output=True, text=True, check=False)
+                return f"Codex 수정은 생성됐지만 main 병합에 실패했습니다: {merge.stderr[-500:]}"
+    except Exception as exc:
+        return f"Codex 수정은 생성됐지만 통합 락을 획득하지 못했습니다: {type(exc).__name__}"
     restart = subprocess.run(
         [
             sys.executable,
@@ -343,6 +500,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("delivery_retry", [])
     state.setdefault("repair_results", {})
     state.setdefault("recovery_watch", {})
+    state.setdefault("usage_watch", {})
     state.setdefault("service_down_since", {})
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
@@ -374,10 +532,25 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                 state["pending"][role].pop(0)
             code = classify_line(line)
             if code:
-                fingerprint = _fingerprint(role, code, line)
+                event = _usage_event(role, code, line, now=current) if code in USAGE_RECOVERY_CODES else {
+                    "role": role,
+                    "code": code,
+                    "fingerprint": _fingerprint(role, code, line),
+                    "message": f"[Roda 감지] {role} 봇에 {code} 문제가 발생했습니다. 확인이 필요합니다.",
+                    "detail": _safe_detail(line),
+                }
+                fingerprint = event["fingerprint"]
                 if fingerprint not in state["alerted"]:
-                    alerts.append({"role": role, "code": code, "fingerprint": fingerprint, "message": f"[Roda 감지] {role} 봇에 {code} 문제가 발생했습니다. 확인이 필요합니다.", "detail": _safe_detail(line)})
+                    alerts.append(event)
                     state["alerted"][fingerprint] = current
+                    if code in USAGE_RECOVERY_CODES:
+                        state["usage_watch"][fingerprint] = {
+                            "role": role,
+                            "status": "waiting_for_probe",
+                            "created_at": current,
+                            "reset_at": event.get("reset_at"),
+                            "notified": False,
+                        }
             for recovery in state["recovery_watch"].values():
                 if recovery.get("role") != role or recovery.get("status") in {"completed_success", "completed_failure", "timeout"}:
                     continue
@@ -386,6 +559,23 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     recovery["started_at"] = current
                 elif recovery.get("status") == "reprocess_started" and DONE_RE.search(line):
                     recovery["status"] = "completed_failure" if "처리 실패" in line else "completed_success"
+            for fingerprint, usage in state["usage_watch"].items():
+                if usage.get("role") != role or usage.get("status") in {"completed_success", "completed_failure"}:
+                    continue
+                if usage.get("status") == "waiting_for_probe" and START_RE.search(line):
+                    usage["status"] = "probe_started"
+                    usage["started_at"] = current
+                elif usage.get("status") == "probe_started" and re.search(r"처리 완료", line):
+                    usage["status"] = "completed_success"
+                    usage["completed_at"] = current
+                    alerts.append({
+                        "kind": "usage_recovery",
+                        "role": role,
+                        "code": "usage_recovered",
+                        "fingerprint": f"usage-recovery:{fingerprint}",
+                        "message": f"[Roda 사용량 회복 확인] {role} provider가 제한 이후 요청을 정상 완료했습니다.",
+                        "detail": f"원래 감지={fingerprint}",
+                    })
         if _planned_restart_active(role, now=current):
             state["service_down_since"].pop(role, None)
         elif not _service_running(target["label"]):
@@ -428,10 +618,18 @@ def _process_cycle(state: dict) -> None:
     _save_state(state)
     for event in alerts:
         try:
-            if event.get("kind") == "recovery_result":
+            if event.get("kind") in {"recovery_result", "usage_recovery"}:
                 _send_alert(f"{event['message']}\n세부: {event['detail']}")
                 continue
             fingerprint = str(event["fingerprint"])
+            if event.get("code") in NON_REPAIRABLE_CODES or event.get("auto_repair") == "blocked":
+                # A depleted provider cannot be repaired by changing local
+                # code. Alert once and wait for a real subsequent request to
+                # prove recovery; never spend Codex usage on diagnosis.
+                _send_alert(f"{event['message']}\n세부: {event['detail']}")
+                state["repair_results"][fingerprint] = "사용량 제한 이벤트 — 자동복구 차단"
+                _save_state(state)
+                continue
             diagnosis = state["repair_results"].get(fingerprint)
             if diagnosis is None:
                 try:

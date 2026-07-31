@@ -14,9 +14,33 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(health.classify_line("[codex] 빈 응답"), "empty_response")
         self.assertEqual(health.classify_line("[claude] 처리 실패 error=https://secret.example/x"), "execution_error")
         self.assertEqual(health.classify_line("[claude] claude exit=1:"), "execution_error")
+        self.assertEqual(health.classify_line('[claude] provider error type=rate_limit_error retry-after: 60'), "rate_limited")
+        self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: quota exceeded"), "usage_limited")
+        self.assertIsNone(health.classify_line("text='how should I handle rate limits?'"))
+        self.assertIsNone(health.classify_line("text='what is a usage cap?'"))
+        self.assertIsNone(health.classify_line("text='what does quota exceeded mean?'"))
         self.assertIsNone(health.classify_line("처리 완료 duration=3s"))
         self.assertIsNone(health.classify_line("[codex] run_polling 종료 — 프로세스 재시작을 위해 종료합니다."))
         self.assertNotIn("https://", health._safe_detail("error https://secret.example/x"))
+
+    def test_usage_event_extracts_exact_retry_after_without_guessing_window(self):
+        event = health._usage_event(
+            "claude",
+            "rate_limited",
+            "provider error rate_limit_error retry-after: 60",
+            now=100,
+        )
+        self.assertEqual(event["reset_source"], "provider_retry_after")
+        self.assertEqual(event["recovery_confidence"], "exact")
+        self.assertIn("1970-01-01T00:02:40", event["reset_at"])
+        self.assertIn("자동 Codex 복구: 실행하지 않음", event["message"])
+
+    def test_usage_event_uses_window_without_fabricating_reset_time(self):
+        event = health._usage_event("antigravity", "usage_limited", "baseline quota exhausted; weekly window", now=100)
+        self.assertEqual(event["window"], "weekly")
+        self.assertIsNone(event["reset_at"])
+        self.assertEqual(event["recovery_confidence"], "estimated")
+        self.assertIn("정확한 시각 확인 불가", event["message"])
 
     def test_initial_poll_only_establishes_offsets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -100,6 +124,63 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 for name, value in original.items():
                     setattr(health, name, value)
 
+    def test_usage_limit_alert_never_launches_codex_repair(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "x.log"
+            state_file = Path(td) / "state.json"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original = {
+                "TARGETS": health.TARGETS,
+                "STATE_FILE": health.STATE_FILE,
+                "_service_running": health._service_running,
+                "_run_codex_repair": health._run_codex_repair,
+                "_send_alert": health._send_alert,
+            }
+            alerts = []
+            repairs = []
+            health.TARGETS = {"claude": {"label": "present", "log": log}}
+            health.STATE_FILE = state_file
+            health._service_running = lambda label: True
+            health._run_codex_repair = lambda event: repairs.append(event) or "should not run"
+            health._send_alert = alerts.append
+            try:
+                state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "repair_results": {}, "recovery_watch": {}}
+                health._process_cycle(state)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("provider error rate_limit_error retry-after: 60\n")
+                health._process_cycle(state)
+                self.assertEqual(repairs, [])
+                self.assertEqual(len(alerts), 1)
+                self.assertIn("사용량 제한 감지", alerts[0])
+                self.assertIn("자동 Codex 복구: 실행하지 않음", alerts[0])
+            finally:
+                for name, value in original.items():
+                    setattr(health, name, value)
+
+    def test_usage_recovery_is_reported_only_after_a_real_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "x.log"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original_targets = health.TARGETS
+            original_running = health._service_running
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            health._service_running = lambda label: True
+            try:
+                state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "repair_results": {}, "recovery_watch": {}}
+                health.poll_once(state, now=100)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("provider error quota exceeded; weekly window\n")
+                alerts = health.poll_once(state, now=101)
+                self.assertEqual([event["code"] for event in alerts], ["usage_limited"])
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
+                alerts = health.poll_once(state, now=102)
+                self.assertEqual([event["code"] for event in alerts], ["usage_recovered"])
+                self.assertEqual(next(iter(state["usage_watch"].values()))["status"], "completed_success")
+            finally:
+                health.TARGETS = original_targets
+                health._service_running = original_running
+
     def test_repair_result_only_instructs_reprocess_after_success(self):
         event = {"role": "claude", "code": "service_down"}
         failed = health._format_repair_result(event, "Codex 진단 실행 실패: TimeoutExpired")
@@ -177,6 +258,12 @@ class RodaHealthMonitorTests(unittest.TestCase):
             finally:
                 for name, value in original.items():
                     setattr(health, name, value)
+
+    def test_repair_merge_is_guarded_by_integration_lock(self):
+        source = (Path(__file__).parents[1] / "bin" / "roda-telegram-health-monitor.py").read_text()
+        self.assertIn("integration_lock(SOURCE_REPO)", source)
+        self.assertIn('"merge", "--no-ff"', source)
+        self.assertIn('"merge", "--abort"', source)
 
 
 if __name__ == "__main__":

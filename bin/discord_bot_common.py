@@ -206,11 +206,12 @@ def save_provider_context(path: Path, provider: str, user_text: str, response: s
     """Persist bounded cross-provider context without making the turn fail."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({
+        os.chmod(path.parent, 0o700)
+        atomic_write_json(path, {
             "provider": provider,
             "user_message": user_text[-4000:],
             "response": response[-6000:],
-        }, ensure_ascii=False))
+        })
     except Exception:
         pass
 

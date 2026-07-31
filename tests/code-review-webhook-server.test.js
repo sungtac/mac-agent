@@ -129,3 +129,29 @@ test('webhook server fails closed for route, method, and body-size violations', 
     assert.equal(large.statusCode, 413)
   })
 })
+
+test('webhook server applies bounded transport settings', async () => {
+  await withServer({
+    secret: 'http-secret',
+    requestTimeout: 3333,
+    headersTimeout: 2222,
+    socketTimeout: 1111,
+    maxConcurrentBodies: 2,
+  }, async (server) => {
+    assert.equal(server.requestTimeout, 3333)
+    assert.equal(server.headersTimeout, 2222)
+    assert.equal(server.timeout, 1111)
+    assert.equal(server.maxRequestsPerSocket, 100)
+  })
+})
+
+test('webhook server clamps headers timeout to the request timeout', async () => {
+  await withServer({
+    secret: 'http-secret',
+    requestTimeout: 1111,
+    headersTimeout: 2222,
+  }, async (server) => {
+    assert.equal(server.requestTimeout, 1111)
+    assert.equal(server.headersTimeout, 1111)
+  })
+})

@@ -10,6 +10,9 @@ fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "$0")" && pwd)"
 PROFILE="${EDGE_AGENT_PROTECTED_PATH_PROFILE:-$SCRIPT_DIR/../config/edge-agent-protected-paths.sb}"
+if [ "${EDGE_AGENT_PROVIDER_MODE:-}" = "review" ]; then
+  PROFILE="${EDGE_AGENT_REVIEW_PROFILE:-$SCRIPT_DIR/../config/code-review-read-only.sb}"
+fi
 if [ ! -r "$PROFILE" ]; then
   echo "edge-agent-provider-sandbox: sandbox profile is missing or unreadable: $PROFILE" >&2
   exit 2

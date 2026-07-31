@@ -23,10 +23,10 @@ Do **not** use this skill to claim a fix is complete unless current evidence pro
 ## required_tools
 
 - Python 3
-- `scripts/hermes_lifecycle_gate.py`
-- `scripts/hermes_active_resolution_plan.py`
-- `scripts/hermes_evidence_tickets.py`
-- `scripts/hermes_lifecycle_evidence.py`
+- `skills/hermes_runtime/hermes_lifecycle_gate.py`
+- `skills/hermes_runtime/hermes_active_resolution_plan.py`
+- `skills/hermes_runtime/hermes_evidence_tickets.py`
+- `skills/hermes_runtime/hermes_lifecycle_evidence.py`
 
 ## inputs
 
@@ -47,25 +47,25 @@ Do **not** use this skill to claim a fix is complete unless current evidence pro
 Check lifecycle gate status:
 
 ```bash
-python3 scripts/hermes_lifecycle_gate.py --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_gate.py" --json
 ```
 
 Plan safe next actions for active high-priority Hermes items:
 
 ```bash
-python3 scripts/hermes_active_resolution_plan.py --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_active_resolution_plan.py" --json
 ```
 
 Generate read-only evidence tickets:
 
 ```bash
-python3 scripts/hermes_evidence_tickets.py --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_evidence_tickets.py" --json
 ```
 
 Inspect live-evidence candidates without mutating records:
 
 ```bash
-python3 scripts/hermes_lifecycle_evidence.py --plan --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_evidence.py" --plan --json
 ```
 
 ## safety
@@ -82,11 +82,11 @@ python3 scripts/hermes_lifecycle_evidence.py --plan --json
 ## examples
 
 ```bash
-python3 scripts/hermes_lifecycle_gate.py --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_gate.py" --json
 ```
 
 ```bash
-python3 scripts/hermes_active_resolution_plan.py --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_active_resolution_plan.py" --json
 ```
 
 ## Quality follow-up

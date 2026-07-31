@@ -9,9 +9,10 @@ ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 TARGET_DIR="${HOME:?HOME is required}/Library/LaunchAgents"
 REPLACE=0
 INSTALL=0
+ALLOW_EXECUTE=0
 
 usage() {
-  printf '%s\n' 'usage: install-code-review-launchd.sh [--dry-run] [--install] [--replace]'
+  printf '%s\n' 'usage: install-code-review-launchd.sh [--dry-run] [--install] [--replace] [--allow-execute]'
 }
 
 for arg in "$@"; do
@@ -19,6 +20,7 @@ for arg in "$@"; do
     --dry-run) INSTALL=0 ;;
     --install) INSTALL=1 ;;
     --replace) REPLACE=1 ;;
+    --allow-execute) ALLOW_EXECUTE=1 ;;
     --help) usage; exit 0 ;;
     *) usage >&2; exit 2 ;;
   esac
@@ -29,6 +31,14 @@ WEBHOOK_PLIST="$ROOT_DIR/config/com.macagent.code-review-webhook-server.plist.te
 WORKER_TARGET="$TARGET_DIR/com.macagent.code-review-worker.plist"
 WEBHOOK_TARGET="$TARGET_DIR/com.macagent.code-review-webhook-server.plist"
 SECRET_FILE="${HOME}/.edge-agent/secrets/code-review-webhook.secret"
+
+if [ "$INSTALL" -eq 1 ]; then
+  if [ "$ALLOW_EXECUTE" -ne 1 ]; then
+    echo '--install requires explicit --allow-execute' >&2
+    exit 5
+  fi
+  python3 "$ROOT_DIR/bin/code-review-ops-preflight.py" --require-providers --allow-execute
+fi
 
 /usr/bin/plutil -lint "$WORKER_PLIST" >/dev/null
 /usr/bin/plutil -lint "$WEBHOOK_PLIST" >/dev/null

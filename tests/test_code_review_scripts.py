@@ -21,6 +21,11 @@ VALIDATOR = load_script("validate-review-report.py")
 
 
 class CodeReviewScriptTests(unittest.TestCase):
+    def test_launchd_installer_requires_explicit_execute_gate(self):
+        source = (ROOT / "bin" / "install-code-review-launchd.sh").read_text()
+        self.assertIn("--allow-execute", source)
+        self.assertIn("--require-providers --allow-execute", source)
+
     def test_all_korean_aliases_normalize_to_one_intent(self):
         for phrase in NORMALIZER.ALIASES:
             result = NORMALIZER.normalize_request(f"{phrase} 해줘", scope="files", paths=["src/app.py"])

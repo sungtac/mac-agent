@@ -142,7 +142,7 @@ case "$TOOL" in
       FAILURE_ENVELOPE "codex 실행파일을 찾을 수 없음: $CODEX_BIN (CODEX_BIN 환경변수로 경로를 override할 수 있음)"
       exit 0
     fi
-    RAW_OUTPUT="$("$PROVIDER_SANDBOX" "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT_CONTENT" 2>&1)"
+    RAW_OUTPUT="$(EDGE_AGENT_PROVIDER_MODE=review "$PROVIDER_SANDBOX" "$CODEX_BIN" exec --skip-git-repo-check -s read-only "$PROMPT_CONTENT" 2>&1)"
     EXIT_CODE=$?
     ;;
   agy)
@@ -150,7 +150,7 @@ case "$TOOL" in
       FAILURE_ENVELOPE "agy 실행파일을 찾을 수 없음: $AGY_BIN (AGY_BIN 환경변수로 경로를 override할 수 있음)"
       exit 0
     fi
-    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"
+    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT EDGE_AGENT_PROVIDER_MODE=review "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"
     EXIT_CODE=$?
     ;;
   *)

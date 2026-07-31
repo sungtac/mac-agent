@@ -20,6 +20,10 @@ const DEFAULT_PORT = 8787
 const DEFAULT_PATH = '/github/webhook'
 const HEALTH_PATH = '/health'
 const DEFAULT_MAX_BODY_BYTES = 1024 * 1024
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000
+const DEFAULT_HEADERS_TIMEOUT_MS = 15000
+const DEFAULT_SOCKET_TIMEOUT_MS = 120000
+const DEFAULT_MAX_CONCURRENT_BODIES = 16
 
 function readSecretFile(secretFile) {
   if (!secretFile) return ''
@@ -117,8 +121,29 @@ function createWebhookServer(options = {}) {
   const maxBodyBytes = Number.isSafeInteger(options.maxBodyBytes) && options.maxBodyBytes > 0
     ? options.maxBodyBytes
     : DEFAULT_MAX_BODY_BYTES
+  const requestTimeout = Number.isSafeInteger(options.requestTimeout) && options.requestTimeout > 0
+    ? options.requestTimeout
+    : DEFAULT_REQUEST_TIMEOUT_MS
+  const configuredHeadersTimeout = Number.isSafeInteger(options.headersTimeout) && options.headersTimeout > 0
+    ? options.headersTimeout
+    : DEFAULT_HEADERS_TIMEOUT_MS
+  // Node rejects a server when headersTimeout is greater than
+  // requestTimeout. Preserve the caller's total request bound and clamp the
+  // header phase to it instead of failing during http.createServer().
+  const headersTimeout = Math.min(configuredHeadersTimeout, requestTimeout)
+  const socketTimeout = Number.isSafeInteger(options.socketTimeout) && options.socketTimeout > 0
+    ? options.socketTimeout
+    : DEFAULT_SOCKET_TIMEOUT_MS
+  const maxConcurrentBodies = Number.isSafeInteger(options.maxConcurrentBodies) && options.maxConcurrentBodies > 0
+    ? options.maxConcurrentBodies
+    : DEFAULT_MAX_CONCURRENT_BODIES
+  let activeBodies = 0
 
-  return http.createServer(async (request, response) => {
+  const server = http.createServer({
+    requestTimeout,
+    headersTimeout,
+    maxHeaderSize: 16 * 1024,
+  }, async (request, response) => {
     if (request.method === 'GET' && request.url === healthPath) {
       sendJson(response, 200, { ok: true, service: 'code-review-webhook-server' })
       return
@@ -137,10 +162,17 @@ function createWebhookServer(options = {}) {
       return
     }
 
+    if (activeBodies >= maxConcurrentBodies) {
+      request.resume()
+      sendJson(response, 503, { ok: false, error: 'too_many_requests' })
+      return
+    }
+    activeBodies += 1
     let rawBody
     try {
       rawBody = await readBody(request, maxBodyBytes)
     } catch (error) {
+      activeBodies -= 1
       if (error.code === 'BODY_TOO_LARGE') {
         sendJson(response, 413, { ok: false, error: 'payload_too_large' })
         return
@@ -148,6 +180,7 @@ function createWebhookServer(options = {}) {
       sendJson(response, 400, { ok: false, error: 'invalid_request_body' })
       return
     }
+    activeBodies -= 1
 
     const verification = verifySignature(rawBody, headerValue(request, 'x-hub-signature-256'), secret)
     if (!verification.valid) {
@@ -183,6 +216,9 @@ function createWebhookServer(options = {}) {
     }
     sendJson(response, statusCode, output)
   })
+  server.setTimeout(socketTimeout)
+  server.maxRequestsPerSocket = 100
+  return server
 }
 
 function main() {

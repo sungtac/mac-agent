@@ -14,21 +14,21 @@ If the request involves exact model names, prices, coupons, events, official sto
 Default command:
 
 ```bash
-python3 scripts/product_researcher.py '<query>' \
-  --out audit_reports/product_research_<slug>.json \
+python3 "$HOME/mac-agent/skills/product_research/product_researcher.py" '<query>' \
+  --out "$HOME/mac-agent/audit_reports/product_research_<slug>.json" \
   --json
-python3 scripts/product_research_answer_gate.py audit_reports/product_research_<slug>.json
+python3 "$HOME/mac-agent/skills/product_research/product_research_answer_gate.py" "$HOME/mac-agent/audit_reports/product_research_<slug>.json"
 ```
 
 For official/brand stores:
 
 ```bash
-python3 scripts/product_researcher.py '<query>' \
+python3 "$HOME/mac-agent/skills/product_research/product_researcher.py" '<query>' \
   --naver-brand-url 'https://brand.naver.com/<store>' \
   --keyword '<product keyword>' \
-  --out audit_reports/product_research_<slug>.json \
+  --out "$HOME/mac-agent/audit_reports/product_research_<slug>.json" \
   --json
-python3 scripts/product_research_answer_gate.py audit_reports/product_research_<slug>.json
+python3 "$HOME/mac-agent/skills/product_research/product_research_answer_gate.py" "$HOME/mac-agent/audit_reports/product_research_<slug>.json"
 ```
 
 Do not present a final recommendation as researched if the answer gate fails. Say what is blocked or downgrade to a non-price-verified general suggestion.
