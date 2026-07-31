@@ -126,6 +126,12 @@ AGY_BIN="${AGY_BIN:-}"
 [ -n "$CODEX_BIN" ] || CODEX_BIN="$(find_codex_bin || true)"
 [ -n "$AGY_BIN" ] || AGY_BIN="$(find_agy_bin || true)"
 
+BEHAVIOR_RULES="$SCRIPT_DIR/../../skills/edge-agent-behavior/SKILL.md"
+PROMPT_CONTENT="$(cat "$PROMPT_FILE")"
+if [ -r "$BEHAVIOR_RULES" ]; then
+  PROMPT_CONTENT="$(cat "$BEHAVIOR_RULES"; printf '\n\n[검증 요청]\n'; cat "$PROMPT_FILE")"
+fi
+
 truncate_output() {
   printf '%s' "$1" | head -c 2000
 }
@@ -136,7 +142,7 @@ case "$TOOL" in
       FAILURE_ENVELOPE "codex 실행파일을 찾을 수 없음: $CODEX_BIN (CODEX_BIN 환경변수로 경로를 override할 수 있음)"
       exit 0
     fi
-    RAW_OUTPUT="$("$PROVIDER_SANDBOX" "$CODEX_BIN" exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1)"
+    RAW_OUTPUT="$("$PROVIDER_SANDBOX" "$CODEX_BIN" exec --skip-git-repo-check "$PROMPT_CONTENT" 2>&1)"
     EXIT_CODE=$?
     ;;
   agy)
@@ -144,7 +150,7 @@ case "$TOOL" in
       FAILURE_ENVELOPE "agy 실행파일을 찾을 수 없음: $AGY_BIN (AGY_BIN 환경변수로 경로를 override할 수 있음)"
       exit 0
     fi
-    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$(cat "$PROMPT_FILE")" 2>&1)"
+    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"
     EXIT_CODE=$?
     ;;
   *)
