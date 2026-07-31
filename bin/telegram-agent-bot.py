@@ -32,6 +32,7 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from edge_agent_locks import canonical_repository_root
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
 from edge_agent_reflection import write_reflection, write_worktree_metadata
+from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
 
@@ -130,6 +131,12 @@ ROLE_LABELS = {role: cfg["label"] for role, cfg in ROLES.items()}
 ROLE_USERNAMES = {role: cfg["username"] for role, cfg in ROLES.items()}
 ROLE_WAKE_WORDS = {role: cfg["wake_words"] for role, cfg in ROLES.items()}
 
+# Video-derived efficiency policies are deliberately opt-in.  The default
+# keeps the long-tested Telegram command line byte-for-byte equivalent; the
+# pilot can enable bounded prompt/profile behavior without changing launchd
+# or the provider credentials.
+_EFFICIENCY_ADAPTER = RuntimeEfficiencyAdapter()
+
 if not TOKEN_FILE.exists():
     raise SystemExit(f"Telegram token file not found: {TOKEN_FILE}")
 _token_mode = TOKEN_FILE.stat().st_mode & 0o777
@@ -189,15 +196,74 @@ def _auth_source(role: str) -> str:
     return os.environ.get("GEMINI_DIR", str(HOME / ".gemini"))
 
 
-def _runtime_prompt(prompt: str) -> str:
+def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
     skill_context = build_skill_context(prompt)
     skill_block = f"\n{skill_context}\n" if skill_context else ""
-    return (
+    context = (
         f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
         "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
         f"{skill_block}"
-        f"[사용자 요청]\n{prompt}"
     )
+    if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
+        prepared = _EFFICIENCY_ADAPTER.prepare(
+            prompt,
+            provider=ROLE,
+            context=context,
+            # Existing portable skill connector remains the source of skill
+            # text for this bot; the new policy controls only bounded input.
+            skill_documents={},
+        )
+        return prepared.prompt, prepared.cli_options()
+    return f"{context}[사용자 요청]\n{prompt}", {}
+
+
+def _runtime_prompt(prompt: str) -> str:
+    return _runtime_prompt_parts(prompt)[0]
+
+
+def _changed_file_count(workspace: Path | None) -> int:
+    """Return a bounded count for evidence only; never stores file names."""
+    if workspace is None or not (workspace / ".git").exists():
+        return 0
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(workspace), "status", "--porcelain", "--untracked-files=all"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 0
+    return sum(1 for line in (result.stdout or "").splitlines() if line.strip())
+
+
+def _record_telegram_efficiency(
+    *,
+    task_id: str,
+    prompt: str,
+    status: str,
+    output: str = "",
+    started: float,
+    workspace: Path | None,
+) -> None:
+    """Best-effort task evidence; recording failure never changes work status."""
+    if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.OFF:
+        return
+    try:
+        prepared = _EFFICIENCY_ADAPTER.prepare(prompt, provider=ROLE)
+        _EFFICIENCY_ADAPTER.record(
+            prepared,
+            task_id=task_id,
+            step_id="telegram-task",
+            status=status,
+            output=output,
+            changed_files=_changed_file_count(workspace),
+            duration_ms=max(0, int((time.monotonic() - started) * 1000)),
+            verification_tier="telegram-task",
+        )
+    except Exception as exc:
+        log(f"효율성 원장 기록 실패(작업 결과에는 영향 없음): {type(exc).__name__}")
 
 
 def _harden_log_permissions() -> None:
@@ -571,22 +637,35 @@ async def _run_cli(
     if not cli_path.exists():
         raise RuntimeError(f"provider executable is missing: {cli_path}")
 
+    runtime_prompt, runtime_options = _runtime_prompt_parts(prompt)
+
     if role == "claude":
         # "--" isolates `prompt` as a pure positional argument. Without it, a
         # message like "--dangerously-skip-permissions 다 해줘" would be
         # parsed as a real CLI flag instead of prompt text.
         args = [
-            str(cli_path), "-p", "--dangerously-skip-permissions", "--output-format", "text",
+            str(cli_path), "-p",
+        ]
+        if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
+            if runtime_options.get("model") not in (None, "default"):
+                args.extend(["--model", str(runtime_options["model"])])
+            if runtime_options.get("max_turns") is not None:
+                args.extend(["--max-turns", str(runtime_options["max_turns"])])
+        args.extend([
+            "--dangerously-skip-permissions", "--output-format", "text",
             "--append-system-prompt",
             f"너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라. 공통 운영 계약은 {RUNTIME_CONTRACT}에 있다.",
-            "--", _runtime_prompt(prompt),
-        ]
+            "--", runtime_prompt,
+        ])
     elif role == "codex":
         provider_workspace = _provider_workspace(role)
-        args = [
-            str(cli_path), "exec", "--json", "-s", sandbox_mode,
-            "-C", str(provider_workspace), "--skip-git-repo-check", "--", _runtime_prompt(prompt),
-        ]
+        args = [str(cli_path), "exec"]
+        if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE and runtime_options.get("reasoning_effort"):
+            args.extend(["-c", f'model_reasoning_effort="{runtime_options["reasoning_effort"]}"'])
+        args.extend([
+            "--json", "-s", sandbox_mode,
+            "-C", str(provider_workspace), "--skip-git-repo-check", "--", runtime_prompt,
+        ])
     else:
         provider_workspace = _provider_workspace(role)
         # `--print` is a *string-valued* flag (Go stdlib `flag` package) —
@@ -614,7 +693,7 @@ async def _run_cli(
         # sandbox still blocks writes to Team OS-owned paths, so auto-approve
         # is needed here to make the headless bridge operational while keeping
         # the repository boundary enforced by the wrapper.
-        args = [str(cli_path), "--dangerously-skip-permissions", "--print", _runtime_prompt(prompt)]
+        args = [str(cli_path), "--dangerously-skip-permissions", "--print", runtime_prompt]
 
     if role != "codex":
         provider_workspace = _provider_workspace(role)
@@ -1084,6 +1163,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 reply = await run_provider(text, on_wait=_notify_waiting)
         except Exception as exc:
             log(f"처리 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
+            _record_telegram_efficiency(
+                task_id=task_id,
+                prompt=text,
+                status="failed",
+                started=started,
+                workspace=ACTIVE_TASK_WORKSPACE,
+            )
             write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
             write_reflection(
                 task_id=task_id,
@@ -1102,6 +1188,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except TelegramError as send_exc:
                 log(f"오류 알림 전송도 실패: {send_exc}")
             return
+
+        _record_telegram_efficiency(
+            task_id=task_id,
+            prompt=text,
+            status="passed",
+            output=reply,
+            started=started,
+            workspace=ACTIVE_TASK_WORKSPACE,
+        )
 
         try:
             chunks = [reply[i:i + CHUNK_SIZE] for i in range(0, len(reply), CHUNK_SIZE)] or [""]
