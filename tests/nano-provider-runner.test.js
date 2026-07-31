@@ -17,12 +17,13 @@ function makeFixture(body) {
   const prompt = path.join(root, 'prompt.txt')
   fs.writeFileSync(prompt, 'pilot prompt')
   const outputDir = path.join(root, 'logs')
-  return { root, repo, fakeClaude, prompt, outputDir }
+  const auditFile = path.join(root, 'pilot-runs.jsonl')
+  return { root, repo, fakeClaude, prompt, outputDir, auditFile }
 }
 
 function run(fixture, extraEnv = {}) {
   return execFileSync('/bin/bash', [runner, fixture.repo, fixture.prompt], {
-    env: { ...process.env, CLAUDE_BIN: fixture.fakeClaude, NANO_PILOT_LOG_DIR: fixture.outputDir, NANO_PILOT_REQUIRE_USAGE_DATA: '0', ...extraEnv },
+    env: { ...process.env, CLAUDE_BIN: fixture.fakeClaude, NANO_PILOT_LOG_DIR: fixture.outputDir, NANO_PILOT_AUDIT_FILE: fixture.auditFile, NANO_PILOT_RETRY_BASE_SECONDS: '0', NANO_PILOT_RETRY_MAX_SECONDS: '0', NANO_PILOT_REQUIRE_USAGE_DATA: '0', ...extraEnv },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -30,7 +31,7 @@ function run(fixture, extraEnv = {}) {
 
 function runWithEvent(fixture, eventFile, extraEnv = {}) {
   return execFileSync('/bin/bash', [runner, fixture.repo, fixture.prompt, eventFile], {
-    env: { ...process.env, CLAUDE_BIN: fixture.fakeClaude, NANO_PILOT_LOG_DIR: fixture.outputDir, NANO_PILOT_REQUIRE_USAGE_DATA: '0', ...extraEnv },
+    env: { ...process.env, CLAUDE_BIN: fixture.fakeClaude, NANO_PILOT_LOG_DIR: fixture.outputDir, NANO_PILOT_AUDIT_FILE: fixture.auditFile, NANO_PILOT_RETRY_BASE_SECONDS: '0', NANO_PILOT_RETRY_MAX_SECONDS: '0', NANO_PILOT_REQUIRE_USAGE_DATA: '0', ...extraEnv },
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
   })
@@ -70,13 +71,19 @@ test('pilot records a post-task usage snapshot without changing task result', ()
 })
 
 test('bounded pilot runner reports success and removes debug artifact', () => {
-  const fixture = makeFixture('echo "wait-ceiling=$CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"; exit 0')
+  const fixture = makeFixture('echo "wait-ceiling=$CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS"; printf \'arg=%s\\n\' "$@"; exit 0')
   try {
     const output = run(fixture)
     assert.match(output, /status=success/)
     const outputLog = fs.readdirSync(fixture.outputDir).find((name) => name.endsWith('.out.log'))
-    assert.match(fs.readFileSync(path.join(fixture.outputDir, outputLog), 'utf8'), /wait-ceiling=0/)
+    const outputText = fs.readFileSync(path.join(fixture.outputDir, outputLog), 'utf8')
+    assert.match(outputText, /wait-ceiling=0/)
+    assert.match(outputText, /arg=--output-format[\s\S]*arg=json/)
     assert.equal(fs.readdirSync(fixture.outputDir).filter((name) => name.endsWith('.debug.log')).length, 0)
+    const audit = JSON.parse(fs.readFileSync(fixture.auditFile, 'utf8'))
+    assert.equal(audit.schema, 'edge_agent_nano_pilot_run.v1')
+    assert.equal(audit.status, 'success')
+    assert.equal(audit.failure_class, 'none')
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true })
   }
@@ -127,7 +134,20 @@ test('bounded pilot runner does not retry a quota failure', () => {
   try {
     assert.throws(
       () => run(fixture, { NANO_PILOT_MAX_ATTEMPTS: '3' }),
-      (error) => error.status === 75 && /status=provider_unavailable/.test(error.stdout),
+      (error) => error.status === 75 && /status=provider_unavailable/.test(error.stdout) && /failure_class=quota_exhausted/.test(error.stdout),
+    )
+    assert.equal(fs.readdirSync(fixture.outputDir).filter((name) => name.endsWith('.out.log')).length, 1)
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('pilot classifies a provider rate_limit_error as unavailable', () => {
+  const fixture = makeFixture('echo \'{"type":"error","error":{"type":"rate_limit_error"}}\'; exit 1')
+  try {
+    assert.throws(
+      () => run(fixture, { NANO_PILOT_MAX_ATTEMPTS: '3' }),
+      (error) => error.status === 75 && /status=provider_unavailable/.test(error.stdout) && /failure_class=rate_limited/.test(error.stdout),
     )
     assert.equal(fs.readdirSync(fixture.outputDir).filter((name) => name.endsWith('.out.log')).length, 1)
   } finally {
@@ -141,6 +161,47 @@ test('pilot does not call a provider-process success a workflow success', () => 
     assert.throws(
       () => run(fixture),
       (error) => error.status === 1 && /status=workflow_failed/.test(error.stdout),
+    )
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('pilot retries a transient network failure and records the final attempt', () => {
+  const fixture = makeFixture('if [ "$NANO_PILOT_ATTEMPT" = "1" ]; then echo ENOTFOUND; exit 1; fi; exit 0')
+  try {
+    const output = run(fixture, { NANO_PILOT_MAX_ATTEMPTS: '2' })
+    assert.match(output, /status=success/)
+    assert.match(output, /attempts=2/)
+    assert.equal(fs.readdirSync(fixture.outputDir).filter((name) => name.endsWith('.out.log')).length, 2)
+    const audit = JSON.parse(fs.readFileSync(fixture.auditFile, 'utf8'))
+    assert.equal(audit.attempts, 2)
+    assert.equal(audit.status, 'success')
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('pilot classifies a clean-exit no-op as workflow failure', () => {
+  const fixture = makeFixture('echo \'{"finalVerdict":{"passed":false,"reason":"diff is empty"}}\'; exit 0')
+  try {
+    assert.throws(
+      () => run(fixture),
+      (error) => error.status === 1 && /status=workflow_failed/.test(error.stdout) && /failure_class=no_op/.test(error.stdout),
+    )
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('pilot requires a new event when an event file is supplied', () => {
+  const fixture = makeFixture('exit 0')
+  const eventFile = path.join(fixture.root, 'events.jsonl')
+  fs.writeFileSync(fixture.prompt, 'Workflow({args:{cwd:"' + fixture.repo + '", nanoEventFile:"' + eventFile + '"}})')
+  try {
+    assert.throws(
+      () => runWithEvent(fixture, eventFile),
+      (error) => error.status === 1 && /status=workflow_failed/.test(error.stdout) && /failure_class=event_missing/.test(error.stdout),
     )
   } finally {
     fs.rmSync(fixture.root, { recursive: true, force: true })
