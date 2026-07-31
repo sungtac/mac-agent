@@ -10,6 +10,17 @@ SPEC.loader.exec_module(health)
 
 
 class RodaHealthMonitorTests(unittest.TestCase):
+    def setUp(self):
+        # poll_once() checks SOURCE_REPO's real git status for the
+        # main_dirty signal; stub it so tests aren't at the mercy of this
+        # repo's actual working-tree state. Tests exercising main_dirty
+        # itself override this per-test.
+        self._original_dirty_lines = health._source_repo_tracked_dirty_lines
+        health._source_repo_tracked_dirty_lines = lambda: []
+
+    def tearDown(self):
+        health._source_repo_tracked_dirty_lines = self._original_dirty_lines
+
     def test_classifies_provider_failures_without_raw_prompt(self):
         self.assertEqual(health.classify_line("[codex] 빈 응답"), "empty_response")
         self.assertEqual(health.classify_line("[claude] 처리 실패 error=https://secret.example/x"), "execution_error")
@@ -28,6 +39,8 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(health.classify_line("[codex] you have reached your usage limit"), "usage_limited")
         self.assertEqual(health.classify_line("usage cap"), "usage_limited")
         self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: limit exceeded"), "usage_limited")
+        self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: capacity unavailable"), "capacity_limited")
+        self.assertEqual(health.classify_line("[claude] overloaded_error"), "service_overloaded")
         self.assertEqual(health.classify_line("[codex] rate limit exceeded"), "rate_limited")
         self.assertEqual(health.classify_line("[claude] maximum context length exceeded"), "context_exceeded")
         self.assertIsNone(health.classify_line("text='please explain why the usage limit reached'"))
@@ -40,6 +53,17 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertNotIn("abc123", detail)
         self.assertNotIn("sk-live-value", detail)
         self.assertEqual(len(health._request_id_hash(line)), 12)
+        json_detail = health._safe_detail('{"api_key":"secret-json","authorization":"Bearer json-secret"}')
+        self.assertNotIn("secret-json", json_detail)
+        self.assertNotIn("json-secret", json_detail)
+
+    def test_structured_error_is_preferred_over_message_regex(self):
+        line = '{"error":{"type":"rate_limit_error","message":"quota exceeded"},"request_id":"req-123"}'
+        event = health._usage_event("claude", "rate_limited", line, now=100)
+        self.assertEqual(health.classify_line(line), "rate_limited")
+        self.assertEqual(event["source"], "structured_error")
+        self.assertIn("error.type=rate_limit_error", event["evidence"])
+        self.assertEqual(len(event["request_id_hash"]), 12)
 
     def test_usage_event_extracts_exact_retry_after_without_guessing_window(self):
         event = health._usage_event(
@@ -76,7 +100,28 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(event["reset_source"], "provider_retry_after")
         self.assertEqual(event["windows"], ["5h", "weekly"])
         self.assertEqual(event["confidence"], "exact")
+        self.assertIn("5h, weekly", event["message"])
         self.assertIn("가용성 미확인", event["message"])
+
+    def test_provider_capacity_does_not_fabricate_a_reset(self):
+        event = health._usage_event("antigravity", "capacity_limited", "RESOURCE_EXHAUSTED: capacity unavailable", now=100)
+        self.assertIsNone(event["reset_at"])
+        self.assertEqual(event["recovery_confidence"], "unknown")
+        self.assertIn("provider 용량 제한", event["message"])
+
+    def test_state_migration_adds_schema_and_expires_legacy_usage_watch(self):
+        original = health.STATE_FILE
+        with tempfile.TemporaryDirectory() as td:
+            health.STATE_FILE = Path(td) / "state.json"
+            health.STATE_FILE.write_text(
+                '{"initialized": true, "usage_watch": {"old": {"role": "codex", "created_at": 10}}}',
+                encoding="utf-8",
+            )
+            state = health._load_state()
+            self.assertEqual(state["schema_version"], health.STATE_SCHEMA_VERSION)
+            self.assertGreater(state["usage_watch"]["old"]["expires_at"], 10)
+            self.assertIn("metrics", state)
+        health.STATE_FILE = original
 
     def test_initial_poll_only_establishes_offsets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -139,7 +184,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
             health.TARGETS = {"x": {"label": "present", "log": log}}
             health.STATE_FILE = state_file
             health._service_running = lambda label: True
-            health._run_codex_repair = lambda event: repairs.append(event["code"]) or "Codex 자동 수정·main 병합·x 서비스 재기동 완료."
+            health._run_codex_repair = lambda event, state: repairs.append(event["code"]) or "Codex 자동 수정·main 병합·x 서비스 재기동 완료."
             health._send_alert = alerts.append
             try:
                 state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}, "recovery_watch": {}}
@@ -238,6 +283,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
                 self.assertEqual([event["code"] for event in health.poll_once(state, now=3)], ["usage_recovered"])
+                self.assertEqual(state["metrics"]["classified"]["usage_limited"], 2)
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write("provider error quota exhausted; weekly window\n")
                 health.poll_once(state, now=4)
