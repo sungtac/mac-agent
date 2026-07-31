@@ -78,6 +78,26 @@ def _normalize(value: str) -> str:
     return str(value).strip().replace("\\", "/").lstrip("./")
 
 
+def reservation_age_seconds(record: dict, *, now: datetime | None = None) -> float | None:
+    """Return age from the latest heartbeat, or None for invalid timestamps."""
+    timestamp = record.get("heartbeat_at") or record.get("created_at")
+    if not timestamp:
+        return None
+    try:
+        observed = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if observed.tzinfo is None:
+        observed = observed.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return max(0.0, (current - observed.astimezone(timezone.utc)).total_seconds())
+
+
+def reservation_is_stale(record: dict, *, ttl_seconds: float, now: datetime | None = None) -> bool:
+    age = reservation_age_seconds(record, now=now)
+    return age is None or age >= max(0.0, float(ttl_seconds))
+
+
 def _paths_overlap(left: str, right: str) -> bool:
     a, b = _normalize(left), _normalize(right)
     return a == b or a.startswith(f"{b}/") or b.startswith(f"{a}/")
@@ -142,6 +162,7 @@ class FileReservation:
                 "dependency_keys": list(requested_dependencies),
                 "state": "active",
                 "created_at": _now(),
+                "heartbeat_at": _now(),
             }
             records = [record for record in records if record.get("task_id") != task_id]
             records.append(reservation)
@@ -156,6 +177,20 @@ class FileReservation:
                 if record.get("task_id") == task_id and record.get("state") == "active":
                     record["state"] = "released"
                     record["released_at"] = _now()
+                    changed = True
+            if changed:
+                self._write(records)
+            return changed
+
+    def heartbeat(self, task_id: str) -> bool:
+        """Refresh an active reservation without changing its declared scope."""
+        with _lock(self.lock_path, blocking=True):
+            records = self._read()
+            changed = False
+            timestamp = _now()
+            for record in records:
+                if record.get("task_id") == task_id and record.get("state") == "active":
+                    record["heartbeat_at"] = timestamp
                     changed = True
             if changed:
                 self._write(records)

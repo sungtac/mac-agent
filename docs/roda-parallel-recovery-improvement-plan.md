@@ -44,15 +44,21 @@ usage-limit 정규식 확장 패치(테스트 18개 통과 확인 후) 커밋 `4
 
 병합 도중 이 두 파일을 동시에 고치던 별도 codex 세션의 변경(용량/과부하 분류, 구조화 오류 우선, 상태 스키마 버전/마이그레이션, 알림 보존기간, 코드별 메트릭)도 같은 커밋에 함께 정리됨 — 우연히 같은 저장소에서 겹쳐 작업하다 발견한 사례라 [[edge_agent_parallel_recovery_gaps]] 계열 문제(락 스코프가 아니라 "터미널에서 같은 파일을 직접 편집하는" 종류의 동시성)로 별도 기록할 가치가 있음.
 
-### P3 — 락 재시도 파라미터 현실화 + 대기 가시성
+### P3 — [완료 2026-08-01] 락 재시도 파라미터 현실화 + 대기 가시성
 `WORKTREE_LOCK_RETRIES`/`WORKTREE_LOCK_RETRY_SECONDS` 기본값을 상향 조정(예: 지수 백오프로 총 30~60초)하고, 재시도 중임을 이미 있는 `_notify_waiting` 패턴처럼 사용자에게 진행 상태로 보여준다(현재는 로그에만 남고 Telegram 사용자는 그냥 기다림). 5초 만에 포기하고 락 파일 경로를 그대로 노출하는 대신, 최소한 "다른 작업 처리 중, 잠시 후 재시도"로 사용자 경험 개선.
 
-### P4 — 복구 경로의 락 스코프 축소
+구현: 기본 7회 재시도, 1→2→4→8초(최대 8초) 지수 백오프, 작업공간 생성 전 진행 메시지와 대기 상태 편집을 적용했다.
+
+### P4 — [검토 완료 2026-08-01] 복구 경로의 락 스코프 축소
 `_run_codex_repair_impl`의 진단 worktree 생성을 `repository_lifecycle_lock` 대신, 가능하면 `task_lock`(fingerprint 단위)만 쓰도록 검토. 저장소 전체 배타 락을 잡는 지점을 하나 줄여 G1의 경합 확률을 낮춘다. (단, `git worktree add`가 내부적으로 `.git/worktrees` 메타데이터를 건드리므로 완전히 락-프리로 만들기는 어려움 — 최소한 lifecycle lock 보유 시간을 지금보다 더 줄이는 방향으로 검토.)
 
-### P5 — Reservation 감사/TTL
+검토 결과 `git worktree add`는 저장소 공용 worktree 메타데이터를 변경하므로 task별 lock만 사용하는 것은 안전하지 않다. 현재 구현은 lifecycle lock을 해당 `git worktree add` subprocess 구간에만 보유하고, Codex 진단 실행과 변경 검사는 lock 바깥에서 수행하므로 안전하게 축소된 범위로 확정했다.
+
+### P5 — [완료 2026-08-01] Reservation 감사/TTL
 `edge_agent_parallel_audit.py`에 reservation registry 감사 추가(각 `active` 레코드에 `created_at` 대비 경과시간 계산, 임계값 초과 시 `stale_reservation` finding). 지금 이 감사는 read-only 원칙을 지키고 있으니, 자동 해제는 하지 말고 finding만 내고 사람이 승인 후 해제하는 흐름 유지 (기존 설계 철학과 일치).
+
+구현: active reservation에 `heartbeat_at`과 `heartbeat(task_id)`를 추가하고, 병렬 executor가 provider 실행 중 heartbeat를 자동 갱신한다. 감사기는 기본 1시간(환경변수 `EDGE_AGENT_RESERVATION_TTL_SECONDS` 또는 CLI 옵션으로 조정) 초과 시 `stale_reservation` finding을 보고하며 자동 해제는 수행하지 않는다.
 
 ## 이 계획이 "병렬 처리" 관점에서 노리는 것
 
-지금 구조는 감지(Roda 헬스 모니터)는 이미 촘촘한데, 복구는 "한 번 해보고 안 되면 끝"이라 병렬로 여러 에이전트가 같은 저장소를 오갈 때 실패가 누적되기만 한다. P1(가시성)+P2(재시도 큐)만 넣어도 "탐지 잘하고 고치는 것"까지 완성되고, P3~P5는 애초에 그 실패가 덜 발생하게 만드는 예방 조치다. 구현 순서는 P0→P1→P2를 먼저 하고, P3~P5는 실제로 락 경합이 재발하는지 로그로 확인한 뒤 착수하는 걸 권장.
+지금 구조는 감지(Roda 헬스 모니터)는 이미 촘촘한데, 복구는 "한 번 해보고 안 되면 끝"이라 병렬로 여러 에이전트가 같은 저장소를 오갈 때 실패가 누적되기만 한다. P1(가시성)+P2(재시도 큐)만 넣어도 "탐지 잘하고 고치는 것"까지 완성되고, P3~P5는 애초에 그 실패가 덜 발생하게 만드는 예방 조치다. 구현 순서는 P0→P1→P2→P3~P5까지 완료했다. P4는 git worktree 메타데이터 안전성 때문에 lifecycle lock을 유지하되 보유 범위를 mutation 구간으로 제한하는 방식으로 확정했다.

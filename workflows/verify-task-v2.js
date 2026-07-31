@@ -5,22 +5,23 @@ export const meta = {
     { title: 'Preflight' },
     { title: 'Context' },
     { title: 'Light' },
+    { title: 'FullPromptify' },
+    { title: 'FullResearch' },
     { title: 'FullPlan' },
-    { title: 'FullCritique' },
-    { title: 'FullReconcile' },
+    { title: 'FullPlanReview' },
+    { title: 'FullPlanRevise' },
     { title: 'FullExecute' },
-    { title: 'FullReview' },
+    { title: 'FullCodeReviewSkill' },
   ],
 }
 
 // 설계 전체는 docs/verify-task-v2-design.md 참고 — 이 스크립트는 결정 기록이
 // 아니라 구현이다. 결정의 "왜"를 다시 읽지 않고 이 파일만 고치지 말 것.
 //
-// 2026-07-27 개정: 전체(full) 트랙이 채점표 기반(안티 스펙+고정/동적 rubric+
-// 90점)에서 하네스 기반 정성 검토(코덱스 자체계획→독립 리뷰어+안티
-// 블라인드 비평→코덱스 취합/개선→실행→코덱스+안티 무점수 듀얼 코드리뷰)로 재설계됨.
-// 경량(light) 트랙은 전혀 안 건드림. docs/verify-task-v2-design.md의
-// "## 개정" 섹션에 왜 바뀌었는지 기록돼 있음 — 여기서 다시 설명 안 함.
+// 2026-08-01 개정: 전체(full) 트랙을 Claude 프롬프트화→Antigravity 병렬
+// 조사→Claude 병렬화 계획→Codex 병렬 계획 검토→Codex 계획 수정/실행→
+// code-review 스킬 발동 흐름으로 변경함. 경량(light)·나노(nano) 트랙은
+// 비용과 호환성을 위해 유지한다.
 //
 // Workflow 스크립트는 다른 로컬 파일을 import 할 수 없어(자기완결적이어야
 // 함), verify-task.js와 겹치는 헬퍼(대시패치 지시문 생성, 검증용 diff 수집,
@@ -254,13 +255,26 @@ function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
     name: source + '-review',
     status: !result ? 'error' : result.hasBlockingIssue ? 'failed' : 'passed',
   }))
+  for (const [source, result] of reviewResults) {
+    for (const check of result?.checks || []) {
+      checks.push({
+        name: source + '-' + String(check.name || 'unnamed-check'),
+        status: ['passed', 'failed', 'not_run', 'error'].includes(check.status) ? check.status : 'error',
+        ...(check.evidence ? { evidence_ref: String(check.evidence) } : {}),
+      })
+    }
+  }
   checks.push({ name: 'verify-task-v2-verdict', status: verdict?.passed ? 'passed' : 'failed' })
+  const reviewerChecksPass = reviewResults.every(([, result]) =>
+    !!result && Array.isArray(result.checks) && result.checks.length > 0 && result.checks.every((check) => check.status === 'passed')
+  )
   const approvalEligible = tier === 'full' &&
     !!verdict?.passed &&
     !!lastRound.codexReview &&
     !!lastRound.antigravityReview &&
     !lastRound.codexReview.hasBlockingIssue &&
-    !lastRound.antigravityReview.hasBlockingIssue
+    !lastRound.antigravityReview.hasBlockingIssue &&
+    reviewerChecksPass
   const report = {
     schema_version: 'edge_agent.code_review_report.v1',
     review_id: 'verify-task-v2-' + stableNanoTaskId(task, cwd),
@@ -297,7 +311,7 @@ async function persistReviewReport(report) {
       '[리뷰 보고서 JSON]',
       reportJson,
     ].join('\n'),
-    { phase: 'FullReview', label: 'persist-code-review-report', schema: REVIEW_PERSIST_SCHEMA, agentType: 'general-purpose' }
+    { phase: 'FullCodeReviewSkill', label: 'persist-code-review-report', schema: REVIEW_PERSIST_SCHEMA, agentType: 'general-purpose' }
   )
 }
 
@@ -360,47 +374,166 @@ async function codexEvaluateLight(task, context, summary, realDiff, isRetry) {
   })
 }
 
-// ---------- 전체 트랙: 1단계 (코덱스 자체 계획 작성) ----------
+// ---------- 전체 트랙: Claude 프롬프트화 + Antigravity 병렬 조사 ----------
 
-const CODEX_PLAN_SCHEMA = {
+const PROMPTIFY_SCHEMA = {
   type: 'object',
   properties: {
-    needsClarification: { type: 'boolean' },
-    clarifyingQuestions: { type: 'string' },
-    plan: { type: 'string' },
+    normalizedPrompt: { type: 'string' },
+    researchBrief: { type: 'string' },
+    acceptanceCriteria: { type: 'array', items: { type: 'string' } },
+    constraints: { type: 'array', items: { type: 'string' } },
   },
-  required: ['needsClarification'],
+  required: ['normalizedPrompt', 'researchBrief', 'acceptanceCriteria', 'constraints'],
 }
 
-function buildCodexPlanPrompt(task, context) {
-  return `너는 이 작업을 실제로 코딩할 담당자야. 아래는 사용자의 원 지시문과 저장소 컨텍스트뿐이고, 다른 에이전트의 의견은 아직 없어 — 네가 이 작업에 대한 실행 계획을 처음으로 세우는 거야.
+function buildPromptifyPrompt(task, context) {
+  return `너는 작업 오케스트레이터인 클로드야. 사용자의 원 지시문을 조사·계획·구현 에이전트가 오해하지 않도록 실행 가능한 프롬프트로 정규화해. 아직 파일을 수정하지 말고, 사실을 새로 지어내지 마.
 
-[원 지시문]
+[사용자 원 지시문]
 ${task}
 
 [저장소 컨텍스트]
 ${context.contextText}
 
-1. 정보 충분성 판단: 이 계획을 세우고 실행하기에 정보가 충분해? 부족하면 needsClarification=true로 하고 clarifyingQuestions에 필수 질문 최대 3개 + 선택 질문 최대 3개를 적어(그 이상 필요해도 아는 만큼 계획을 쓰고 "확인 필요"라고 표시). 충분하면 needsClarification=false.
-2. (충분하면) plan에 네가 실제로 코딩할 구체적 실행 계획을 적어: 건드릴 파일, 각 파일에서 할 일, 예상되는 엣지케이스와 처리 방법, 완료 조건. "어떻게 할지"를 상세히 적어 — 이후 다른 에이전트들이 이 계획만 보고 비평할 거야.
+normalizedPrompt에는 목표·범위·완료 조건을 포함한 정규화된 지시문을 적어.
+researchBrief에는 Antigravity가 조사해야 할 핵심 질문을 적어.
+acceptanceCriteria에는 구현 완료를 판정할 수 있는 조건을 적어.
+constraints에는 기존 동작·호환성·안전 제약을 적어. 정보가 부족하면 추측하지 말고 "확인 필요"로 표시해.
 
-JSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","plan":""}`
+JSON으로만 답해: {"normalizedPrompt":"","researchBrief":"","acceptanceCriteria":[],"constraints":[]}`
 }
 
-async function codexOwnPlan(task, context, harnessFile, isRetry) {
-  const prompt = buildCodexPlanPrompt(task, context)
-  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile, 'plan'), {
-    phase: 'FullPlan',
-    label: isRetry ? 'codex-own-plan-retry' : 'codex-own-plan',
-    schema: CODEX_PLAN_SCHEMA,
+async function claudePromptifyTask(task, context) {
+  return agent(buildPromptifyPrompt(task, context), {
+    phase: 'FullPromptify',
+    label: 'claude-promptify',
+    schema: PROMPTIFY_SCHEMA,
+    agentType: 'general-purpose',
   })
 }
 
-// ---------- 전체 트랙: 2단계 (클로드+안티그래비티 블라인드 비평) ----------
+const RESEARCH_FOCI = [
+  { id: 'repository', label: '저장소 구조·기존 구현·컨벤션', instruction: '관련 파일, 기존 추상화, 호출 흐름, 컨벤션과 재사용 가능한 구현을 조사해.' },
+  { id: 'dependencies', label: '의존성·공식 자료·외부 정보', instruction: '사용 중인 라이브러리/프로토콜/API의 현재 제약과 공식 자료를 조사해. 불확실한 사실은 출처와 함께 표시해.' },
+  { id: 'risks-tests', label: '위험·엣지케이스·테스트', instruction: '실패 경로, 보안·호환성 위험, 동시성 문제와 필요한 테스트를 조사해.' },
+]
 
-const CRITIQUE_SCHEMA = {
+const RESEARCH_SCHEMA = {
   type: 'object',
   properties: {
+    focus: { type: 'string' },
+    findings: { type: 'string' },
+    evidence: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { source: { type: 'string' }, fact: { type: 'string' }, relevance: { type: 'string' } },
+        required: ['source', 'fact', 'relevance'],
+      },
+    },
+    risks: { type: 'array', items: { type: 'string' } },
+    testImplications: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['focus', 'findings', 'evidence', 'risks', 'testImplications'],
+}
+
+function buildResearchPrompt(promptified, context, focus) {
+  return `너는 Antigravity 조사 에이전트야. 코드를 수정하거나 계획을 확정하지 말고, 아래 작업을 ${focus.label} 관점에서 독립적으로 조사해. 다른 조사 에이전트의 결과는 보지 않아. 저장소 컨텍스트에 없는 사실은 추측하지 말고, 외부 자료를 확인했다면 evidence.source에 출처를 적어.
+
+[정규화된 작업 프롬프트]
+${promptified.normalizedPrompt}
+
+[조사 브리프]
+${promptified.researchBrief}
+
+[저장소 컨텍스트]
+${context.contextText}
+
+[이번 조사 초점]
+${focus.instruction}
+
+findings에는 조사한 사실과 구현에 미치는 영향을 적고, evidence에는 근거를, risks에는 이 초점의 위험을, testImplications에는 검증에 필요한 테스트를 적어.
+
+JSON으로만 답해: {"focus":"${focus.id}","findings":"","evidence":[{"source":"","fact":"","relevance":""}],"risks":[],"testImplications":[]}`
+}
+
+async function antigravityResearch(promptified, context, focus, isRetry) {
+  return agent(buildScoreDispatchInstruction('agy', buildResearchPrompt(promptified, context, focus), null, 'research'), {
+    phase: 'FullResearch',
+    label: isRetry ? `antigravity-research-${focus.id}-retry` : `antigravity-research-${focus.id}`,
+    schema: RESEARCH_SCHEMA,
+  })
+}
+
+// ---------- 전체 트랙: Claude 병렬화 계획 ----------
+
+const CLAUDE_PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    needsClarification: { type: 'boolean' },
+    clarifyingQuestions: { type: 'string' },
+    planSummary: { type: 'string' },
+    parallelTasks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          taskId: { type: 'string' },
+          objective: { type: 'string' },
+          files: { type: 'array', items: { type: 'string' } },
+          dependsOn: { type: 'array', items: { type: 'string' } },
+          instruction: { type: 'string' },
+          doneCriteria: { type: 'string' },
+          conflictNotes: { type: 'string' },
+        },
+        required: ['taskId', 'objective', 'files', 'dependsOn', 'instruction', 'doneCriteria', 'conflictNotes'],
+      },
+    },
+    integrationSteps: { type: 'string' },
+    testPlan: { type: 'string' },
+  },
+  required: ['needsClarification', 'planSummary', 'parallelTasks', 'integrationSteps', 'testPlan'],
+}
+
+function buildClaudeParallelPlanPrompt(task, context, promptified, research) {
+  return `너는 클로드 계획 담당자야. Antigravity의 병렬 조사 결과를 통합해 Codex가 구현할 코딩 계획을 작성해. 계획은 실제 파일 충돌을 피하면서 독립적으로 수행할 수 있는 작업과 선행 의존성을 명확히 해야 해. 아직 파일을 수정하지 마.
+
+[사용자 원 지시문]
+${task}
+
+[정규화된 프롬프트]
+${promptified.normalizedPrompt}
+
+[완료 조건]
+${JSON.stringify(promptified.acceptanceCriteria)}
+
+[제약]
+${JSON.stringify(promptified.constraints)}
+
+[Antigravity 병렬 조사 결과]
+${JSON.stringify(research)}
+
+정보가 부족해 안전하게 계획할 수 없으면 needsClarification=true와 질문을 최대 3개 적어. 충분하면 needsClarification=false로 하고, parallelTasks를 파일 소유권·dependsOn·충돌 가능성까지 포함해 작성해. 실제 병렬 구현이 안전하지 않은 작업은 억지로 병렬화하지 말고 dependsOn에 표시해. integrationSteps와 testPlan은 Codex가 마지막에 실행할 수 있을 정도로 구체적으로 적어.
+
+JSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","planSummary":"","parallelTasks":[{"taskId":"","objective":"","files":[],"dependsOn":[],"instruction":"","doneCriteria":"","conflictNotes":""}],"integrationSteps":"","testPlan":""}`
+}
+
+async function claudeBuildParallelPlan(task, context, promptified, research) {
+  return agent(buildClaudeParallelPlanPrompt(task, context, promptified, research), {
+    phase: 'FullPlan',
+    label: 'claude-parallel-plan',
+    schema: CLAUDE_PLAN_SCHEMA,
+    agentType: 'general-purpose',
+  })
+}
+
+// ---------- 전체 트랙: Codex 병렬 계획 검토 + 최종 계획 수정 ----------
+
+const PLAN_REVIEW_SCHEMA = {
+  type: 'object',
+  properties: {
+    reviewerFocus: { type: 'string' },
     issues: {
       type: 'array',
       items: {
@@ -409,54 +542,41 @@ const CRITIQUE_SCHEMA = {
         required: ['description'],
       },
     },
+    approvedParts: { type: 'array', items: { type: 'string' } },
     notes: { type: 'string' },
   },
-  required: ['issues'],
+  required: ['reviewerFocus', 'issues', 'approvedParts', 'notes'],
 }
 
-function buildCritiquePrompt(task, context, codexPlan) {
-  return `너는 독립 비평자야. 채점표나 점수는 없어 — 이 계획에서 실제로 문제가 될 만한 버그/공백/결함/오류만 찾아. 다른 비평자의 의견은 안 보여줌(블라인드 — 서로 결과를 보면 앵커링 편향이 생기니까).
+function buildCodexPlanReviewPrompt(task, context, promptified, claudePlan, focus) {
+  return `너는 Codex의 독립 계획 검토자야. 아직 코드를 수정하지 말고, 클로드가 만든 병렬 코딩 계획을 ${focus} 관점에서 검토해. 다른 Codex 검토자의 결과는 보지 않아.
 
 [원 지시문]
 ${task}
 
+[정규화된 프롬프트]
+${promptified.normalizedPrompt}
+
 [저장소 컨텍스트]
 ${context.contextText}
 
-[코덱스가 작성한 실행 계획]
-${codexPlan.plan}
+[클로드 계획]
+${JSON.stringify(claudePlan)}
 
-이 계획을 실행했을 때 실제로 문제가 생길 만한 지점을 issues 배열에 담아(각 항목: description 필수, severity는 자유 텍스트, 예: "critical"/"minor"). 문제가 없으면 빈 배열. notes에 그 외 참고할 점을 자유롭게.
+실제 구현에서 발생할 누락·모순·파일 충돌·잘못된 의존성·테스트 공백만 issues에 적어. 문제가 없으면 빈 배열. approvedParts에는 타당한 부분을 적고, notes에는 검토 근거를 적어.
 
-JSON으로만: {"issues":[{"description":"","severity":""}],"notes":""}`
+JSON으로만 답해: {"reviewerFocus":"${focus}","issues":[{"description":"","severity":""}],"approvedParts":[],"notes":""}`
 }
 
-async function claudeCritiquePlan(task, context, codexPlan) {
-  return agent(buildCritiquePrompt(task, context, codexPlan), {
-    phase: 'FullCritique',
-    label: 'critique-claude',
-    schema: CRITIQUE_SCHEMA,
-    agentType: 'general-purpose',
+async function codexReviewParallelPlan(task, context, promptified, claudePlan, focus, isRetry) {
+  return agent(buildScoreDispatchInstruction('codex', buildCodexPlanReviewPrompt(task, context, promptified, claudePlan, focus), null, 'plan-review'), {
+    phase: 'FullPlanReview',
+    label: isRetry ? `codex-plan-review-${focus}-retry` : `codex-plan-review-${focus}`,
+    schema: PLAN_REVIEW_SCHEMA,
   })
 }
 
-async function antigravityCritiquePlan(task, context, codexPlan, isRetry) {
-  return agent(buildScoreDispatchInstruction('agy', buildCritiquePrompt(task, context, codexPlan), null, 'critique'), {
-    phase: 'FullCritique',
-    label: isRetry ? 'critique-antigravity-retry' : 'critique-antigravity',
-    schema: CRITIQUE_SCHEMA,
-  })
-}
-
-// ---------- 전체 트랙: 3단계 (코덱스 취합+판단+계획 개선, 5+7단계 병합) ----------
-// 사용자가 설명한 흐름에서 "코덱스가 버그/결함을 정리해 클로드에게 전달"(5)과
-// "코덱스가 클로드+안티의 분석을 객관적으로 평가해 개선 후 코딩 시작"(7)은
-// 원래 별개 턴이지만, 클로드의 하네스 반영(6)은 "다음 실행부터" 의미가
-// 있는 것이지 이번 실행 중 코덱스가 자기가 방금 만든 규칙을 다시 읽어야 할
-// 이유는 없다(이미 원본 비평 텍스트를 그대로 받으므로 정보 손실 없음).
-// 그래서 5+7을 한 호출로 병합해 왕복을 줄인다.
-
-const RECONCILE_SCHEMA = {
+const REVISED_PLAN_SCHEMA = {
   type: 'object',
   properties: {
     compiledIssues: {
@@ -473,39 +593,34 @@ const RECONCILE_SCHEMA = {
   required: ['compiledIssues', 'revisedPlan'],
 }
 
-function buildReconcilePrompt(task, context, codexPlan, claudeCritique, antigravityCritique) {
-  return `아래는 네(코덱스)가 작성한 실행 계획과, 클로드+안티그래비티가 각각 독립적으로(서로 안 보고) 비평한 내용이야. 두 비평을 취합하고, 네가 보기에 타당한 지적은 반영해서 계획을 개선해. 타당하지 않다고 판단되는 지적은 disagreements에 왜 받아들이지 않는지 적고 무시해도 돼 — 비평자 말을 무조건 다 따를 필요는 없어, 네가 객관적으로 판단해.
+function buildCodexRevisedPlanPrompt(task, context, promptified, claudePlan, planReviews) {
+  return `너는 실제 코딩을 담당할 Codex야. 클로드의 병렬 코딩 계획과 두 개의 독립적인 Codex 계획 검토 결과를 객관적으로 검토해 최종 구현 계획을 수정해. 아직 이 호출에서는 코드를 수정하지 말고 계획만 반환해.
 
 [원 지시문]
 ${task}
 
+[정규화된 프롬프트]
+${promptified.normalizedPrompt}
+
 [저장소 컨텍스트]
 ${context.contextText}
 
-[네가 작성한 원래 계획]
-${codexPlan.plan}
+[클로드 계획]
+${JSON.stringify(claudePlan)}
 
-[클로드의 비평]
-${JSON.stringify(claudeCritique?.issues || [])}
-${claudeCritique?.notes || ''}
+[Codex 병렬 계획 검토]
+${JSON.stringify(planReviews)}
 
-[안티그래비티의 비평]
-${JSON.stringify(antigravityCritique?.issues || [])}
-${antigravityCritique?.notes || ''}
+compiledIssues에는 두 검토에서 발견된 이슈를 source와 함께 전부 기록해. 타당하지 않은 지적은 disagreements에 이유를 적어. revisedPlan에는 실제 코딩 지시, 병렬 작업 단위, 작업 간 순서, 통합 단계, 테스트 명령과 완료 조건을 빠짐없이 포함해. 검토 결과를 무조건 따르지 말되, 반박 근거를 남겨야 해.
 
-1. compiledIssues에 두 비평에서 나온 이슈들을 (description, source: "claude" 또는 "antigravity") 형태로 전부 합쳐 적어 — 네가 타당하다고 본 것만이 아니라 나온 것 전부 기록해(사용자가 이후 이 기록으로 재발방지 문서를 만들 거야).
-2. disagreements에 네가 반영하지 않기로 한 지적과 그 이유를 적어(없으면 빈 문자열).
-3. revisedPlan에 비평을 반영한 최종 실행 계획을 적어 — 실제로 이 계획대로 코딩할 거야.
-
-JSON으로만: {"compiledIssues":[{"description":"","source":""}],"disagreements":"","revisedPlan":""}`
+JSON으로만 답해: {"compiledIssues":[{"description":"","source":"codex-plan-review"}],"disagreements":"","revisedPlan":""}`
 }
 
-async function codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, harnessFile, isRetry) {
-  const prompt = buildReconcilePrompt(task, context, codexPlan, claudeCritique, antigravityCritique)
-  return agent(buildScoreDispatchInstruction('codex', prompt, harnessFile, 'reconcile'), {
-    phase: 'FullReconcile',
-    label: isRetry ? 'codex-reconcile-retry' : 'codex-reconcile',
-    schema: RECONCILE_SCHEMA,
+async function codexRevisePlan(task, context, promptified, claudePlan, planReviews, harnessFile, isRetry) {
+  return agent(buildScoreDispatchInstruction('codex', buildCodexRevisedPlanPrompt(task, context, promptified, claudePlan, planReviews), harnessFile, 'reconcile'), {
+    phase: 'FullPlanRevise',
+    label: isRetry ? 'codex-revise-plan-retry' : 'codex-revise-plan',
+    schema: REVISED_PLAN_SCHEMA,
   })
 }
 
@@ -538,7 +653,7 @@ ${issuesJson}
 
 JSON으로만: {"appended":true,"rulesAdded":[""]}`,
     {
-      phase: stageLabel === 'pre-execution' ? 'FullReconcile' : 'FullReview',
+      phase: stageLabel.startsWith('pre-execution') ? 'FullPlanRevise' : 'FullCodeReviewSkill',
       label: `harness-append-${stageLabel}`,
       schema: HARNESS_APPEND_SCHEMA,
       agentType: 'general-purpose',
@@ -575,12 +690,24 @@ const CODE_REVIEW_SCHEMA = {
       },
     },
     notes: { type: 'string' },
+    checks: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          name: { type: 'string' },
+          status: { type: 'string', enum: ['passed', 'failed', 'not_run', 'error'] },
+          evidence: { type: 'string' },
+        },
+        required: ['name', 'status'],
+      },
+    },
   },
-  required: ['hasBlockingIssue', 'issues'],
+  required: ['hasBlockingIssue', 'issues', 'checks'],
 }
 
 function buildReviewPrompt(task, context, realDiff) {
-  return `너는 독립 코드 리뷰어야. 점수나 채점표는 없어 — 실제 변경사항(git diff)에서 버그/결함/오류만 찾아. 다른 리뷰어의 의견은 안 보여줌(블라인드).
+  return `너는 code-review 스킬 계약을 수행하는 독립 코드 리뷰어야. 점수는 매기지 않는다. Codex는 1차 리뷰어이고 Antigravity는 독립 승인 검증자다. 실제 변경사항(git diff)에서 correctness/security/robustness/performance/maintainability 문제를 찾고, 다른 리뷰어의 의견은 보지 않는다(블라인드).
 
 [원 작업]
 ${task}
@@ -591,15 +718,16 @@ ${context.contextText}
 [실제 변경사항 — git diff]
 ${realDiff.content}
 
-이 변경에서 실제로 문제가 되는 지점을 issues 배열에 담아(각 항목: description 필수, blocking — 반드시 고쳐야 할 정도면 true, 사소하면 false). 하나라도 blocking=true인 이슈가 있으면 hasBlockingIssue=true, 없으면 false. 문제가 없으면 issues는 빈 배열이고 hasBlockingIssue=false. notes에 그 외 참고할 점.
+1. 가능하면 저장소에서 발견한 결정론적 검사(테스트, 린터, 타입 검사)를 실행하고 checks에 실제 결과와 evidence를 적어. 실행할 명령을 찾지 못하거나 실행하지 못했으면 status=not_run/error로 적고 통과로 가장하지 마.
+2. 실제로 문제가 되는 지점을 issues 배열에 담아(각 항목: description 필수, blocking — 반드시 고쳐야 할 정도면 true, 사소하면 false). 하나라도 blocking=true인 이슈가 있으면 hasBlockingIssue=true, 없으면 false. 문제가 없으면 issues는 빈 배열이고 hasBlockingIssue=false. notes에 그 외 참고할 점.
 
-JSON으로만: {"hasBlockingIssue":false,"issues":[{"description":"","blocking":false}],"notes":""}`
+JSON으로만: {"hasBlockingIssue":false,"issues":[{"description":"","blocking":false}],"notes":"","checks":[{"name":"","status":"passed","evidence":""}]}`
 }
 
 async function claudeReviewDiff(task, context, realDiff) {
   return agent(buildReviewPrompt(task, context, realDiff), {
-    phase: 'FullReview',
-    label: 'review-claude',
+    phase: 'FullCodeReviewSkill',
+    label: 'code-review-skill-claude',
     schema: CODE_REVIEW_SCHEMA,
     agentType: 'general-purpose',
   })
@@ -607,16 +735,16 @@ async function claudeReviewDiff(task, context, realDiff) {
 
 async function codexReviewDiff(task, context, realDiff, isRetry) {
   return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff), null, 'review'), {
-    phase: 'FullReview',
-    label: isRetry ? 'review-codex-retry' : 'review-codex',
+    phase: 'FullCodeReviewSkill',
+    label: isRetry ? 'code-review-skill-codex-retry' : 'code-review-skill-codex',
     schema: CODE_REVIEW_SCHEMA,
   })
 }
 
 async function antigravityReviewDiff(task, context, realDiff, isRetry) {
   return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff), null, 'review'), {
-    phase: 'FullReview',
-    label: isRetry ? 'review-antigravity-retry' : 'review-antigravity',
+    phase: 'FullCodeReviewSkill',
+    label: isRetry ? 'code-review-skill-antigravity-retry' : 'code-review-skill-antigravity',
     schema: CODE_REVIEW_SCHEMA,
   })
 }
@@ -1023,7 +1151,7 @@ async function appendHistory(record, historyFile) {
   const recordJson = JSON.stringify(record)
   await agent(
     `아래 JSON 레코드 한 건을 히스토리 로그 파일에 한 줄(JSONL)로 추가(append)해줘. 기존 파일 내용은 절대 건드리지 말고 끝에 한 줄만 추가해.\n\n1. Bash로 \`mkdir -p $(dirname ${historyFile})\` 실행.\n2. Bash로 \`date -u +%Y-%m-%dT%H:%M:%SZ\` 실행해서 현재 UTC 시각을 얻어.\n3. 아래 JSON에 "timestamp" 필드로 그 시각을 추가한 뒤, 한 줄짜리 JSON 문자열로 만들어서 Bash \`cat >> ${historyFile} << 'HISTEOF'\n(그 JSON 한 줄)\nHISTEOF\` 형태로 안전하게 append 해.\n4. 성공하면 "ok"만 반환해.\n\n원본 JSON (timestamp 필드만 추가하고 나머지는 그대로 유지):\n${recordJson}`,
-    { phase: 'FullReview', label: 'history-append', agentType: 'general-purpose' }
+    { phase: 'FullCodeReviewSkill', label: 'history-append', agentType: 'general-purpose' }
   )
 }
 
@@ -1096,7 +1224,8 @@ log(`티어 판정: ${tier} (예상 파일 ${context.intendedFiles?.length ?? '?
 
 const history = []
 let finalVerdict = null
-let baseline = null // 탈출구 발동 시 경량 트랙 산출물을 여기 보관 — 전체 트랙에서 1~8단계(계획/비평/실행)를 생략하고 바로 코드리뷰로 직행하는 데 씀
+let baseline = null // 탈출구 발동 시 경량 트랙 산출물을 여기 보관 — 전체 트랙에서 사전 계획/조사를 생략하고 바로 코드리뷰로 직행하는 데 씀
+let realDiff = null
 let harnessRulesAddedCount = 0
 
 if (NANO_MODE) {
@@ -1134,7 +1263,7 @@ if (tier === 'light') {
     // dispatchFailed:true 봉투를 그대로 갖고 있는데, 아래 원래 로직은
     // `evalResult?.total ?? 0`으로 이를 조용히 "진짜 0점"으로 취급했다 —
     // MAX_ROUNDS 소진 후 "90점을 못 넘김"이라는 사실과 다른 사유로
-    // needsUserDecision이 뜨는 오분류. FullPlan/FullReconcile/FullCritique
+    // needsUserDecision이 뜨는 오분류. FullPlan/FullPlanRevise/FullResearch
     // 단계는 이미 isDispatchFailure()로 이 구분을 명시적으로 하는데(같은
     // 파일 위쪽 참고), 경량 트랙만 이 처리가 빠져 있었다 — 여기서도 동일하게
     // dispatch 실패와 진짜 낮은 점수를 구분한다.
@@ -1193,105 +1322,140 @@ if (tier === 'light') {
 }
 
 // ---------- 전체 트랙 (직접 진입 또는 경량→전체 탈출구 재분류) ----------
-// 2026-07-27 개정: 채점표 없음. 1~3단계(코덱스 계획→클로드+안티 블라인드
-// 비평→코덱스 취합/개선)를 거쳐 실행하고, 실행 결과를 클로드+안티가 무점수로
-// 듀얼 리뷰한다. 탈출구로 들어온 경우 이미 실제 코드가 있으므로 1~3단계를
-// 생략하고 바로 리뷰로 직행한다.
+// 2026-08-01 개정: 프롬프트화→Antigravity 병렬 조사→Claude 병렬화 계획→
+// Codex 병렬 계획 검토→Codex 최종 계획 수정/구현→code-review 스킬 순서.
+// 탈출구로 들어온 경우 이미 실제 코드가 있으므로 사전 계획/조사를 생략하고
+// code-review 스킬로 직행한다.
 if (tier === 'full' && !finalVerdict) {
-  let realDiff
-
   if (baseline) {
-    log('[전체] 탈출구 경로 — 1~3단계(코덱스 계획/비평/취합) 생략, 코드리뷰로 직행')
+    log('[전체] 탈출구 경로 — 사전 계획/조사 생략, code-review 스킬로 직행')
     realDiff = await gatherRealDiff(cwd)
   } else {
-    log('[전체] 1단계: 코덱스 자체 계획 작성...')
-    const codexPlan = await dispatchWithRetry(
-      (isRetry) => codexOwnPlan(task, context, HARNESS_FILE, isRetry),
-      '코덱스 계획 작성'
-    )
-
-    if (!codexPlan || isDispatchFailure(codexPlan)) {
+    log('[전체] 1단계: 클로드가 사용자 지시문을 실행 프롬프트로 정규화...')
+    const promptified = await claudePromptifyTask(task, context)
+    if (!promptified) {
       finalVerdict = {
         passed: false,
         tier: 'full',
-        error: 'codex_plan_failed',
-        reason: isDispatchFailure(codexPlan)
-          ? `코덱스 자체 계획 작성 단계가 도구 실행/파싱 실패로 1회 재시도 후에도 실패함: ${codexPlan.dispatchFailureReason}. 같은 task로 워크플로우를 재시도할 것.`
-          : '코덱스 자체 계획 작성 단계가 실패함(세이프티 분류기 오류 등 일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+        error: 'promptify_failed',
+        reason: '클로드 프롬프트화 단계가 실패함 — 정규화되지 않은 지시문으로 조사를 시작하지 않도록 중단함. 같은 task로 워크플로우를 재시도할 것.',
       }
-      log('[전체] 1단계: 코덱스 계획 작성 실패 — 재시도 필요')
+      log('[전체] 1단계: 프롬프트화 실패 — 재시도 필요')
       return await finalizeAndReturn()
     }
 
-    if (codexPlan?.needsClarification) {
+    log('[전체] 2단계: Antigravity가 개선 자료를 병렬 조사...')
+    const researchResults = await parallel(
+      RESEARCH_FOCI.map((focus) =>
+        () => dispatchWithRetry(
+          (isRetry) => antigravityResearch(promptified, context, focus, isRetry),
+          `Antigravity 조사(${focus.id})`
+        )
+      )
+    )
+    const failedResearch = researchResults
+      .map((result, index) => (!result || isDispatchFailure(result) ? RESEARCH_FOCI[index].id : null))
+      .filter(Boolean)
+    if (failedResearch.length) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'research_failed',
+        reason: `Antigravity 병렬 조사 실패(${failedResearch.join(', ')}) — 조사 결과 없이 계획을 만들지 않도록 중단함. 같은 task로 워크플로우를 재시도할 것.`,
+      }
+      log(`[전체] 2단계: 병렬 조사 실패(${failedResearch.join(', ')}) — 재시도 필요`)
+      return await finalizeAndReturn()
+    }
+
+    log('[전체] 3단계: 클로드가 병렬 실행 가능한 코딩 계획 수립...')
+    const claudePlan = await claudeBuildParallelPlan(task, context, promptified, researchResults)
+    if (!claudePlan) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'plan_failed',
+        reason: '클로드 병렬 코딩 계획 단계가 실패함 — 계획 없이 Codex를 실행하지 않도록 중단함. 같은 task로 워크플로우를 재시도할 것.',
+      }
+      log('[전체] 3단계: 병렬 계획 실패 — 재시도 필요')
+      return await finalizeAndReturn()
+    }
+
+    if (claudePlan?.needsClarification) {
       finalVerdict = {
         passed: false,
         tier: 'full',
         error: 'needs_clarification',
-        questions: codexPlan.clarifyingQuestions,
-        reason:
-          'Workflow 스크립트는 AskUserQuestion을 직접 못 부름. 호출한 에이전트가 questions를 사용자에게 AskUserQuestion으로 물어보고(필수 최대 3개+선택 최대 3개, 왕복 최대 2회), 답변을 원 task 문자열 끝에 덧붙여서 이 워크플로우를 다시 호출해야 함.',
+        questions: claudePlan.clarifyingQuestions,
+        reason: '클로드가 계획 작성에 필요한 정보를 부족하다고 판단함. 호출한 에이전트가 questions를 사용자에게 물어보고 답변을 원 task에 덧붙여 이 워크플로우를 다시 호출해야 함.',
       }
-      log('[전체] 1단계: 정보 부족 — 역질문 필요')
+      log('[전체] 3단계: 정보 부족 — 역질문 필요')
       return await finalizeAndReturn()
     }
 
-    log('[전체] 2단계: 클로드/안티그래비티 블라인드 비평...')
-    const [claudeCritique, antigravityCritique] = await parallel([
-      () => claudeCritiquePlan(task, context, codexPlan),
-      () => dispatchWithRetry((isRetry) => antigravityCritiquePlan(task, context, codexPlan, isRetry), '안티그래비티 비평'),
+    log('[전체] 4단계: Codex가 계획을 병렬 검토...')
+    const planReviews = await parallel([
+      () => dispatchWithRetry(
+        (isRetry) => codexReviewParallelPlan(task, context, promptified, claudePlan, '아키텍처·의존성·파일 충돌', isRetry),
+        'Codex 계획 검토(아키텍처)'
+      ),
+      () => dispatchWithRetry(
+        (isRetry) => codexReviewParallelPlan(task, context, promptified, claudePlan, '구현 가능성·엣지케이스·테스트', isRetry),
+        'Codex 계획 검토(구현/테스트)'
+      ),
     ])
-
-    // 2026-07-29 수정: 아래 3단계(codexReconcile)로 넘어가는 buildReconcilePrompt는
-    // `claudeCritique?.issues || []` / `antigravityCritique?.issues || []`로 조용히
-    // 빈 배열 폴백한다 — agent()가 실패해 null을 반환하면(세션 한도 초과 등 일시적
-    // 오류) 코덱스는 "클로드/안티그래비티 둘 다 이슈를 못 찾았다"고 오인하고 자기
-    // 계획을 검증 없이 그대로 밀어붙이게 된다. 정확히 같은 버그 클래스가 아래 FullReview
-    // 라운드 루프(codexReview/antigravityReview)에서는 2026-07-28 실측 후 이미 고쳐져
-    // 있었는데, 이 앞단(Critique)에는 그 수정이 전이되지 않았었다 — 여기서도 동일하게
-    // null을 "이슈 없음"이 아니라 "비평 자체가 실패함"으로 명시 처리한다.
-    if (!claudeCritique || !antigravityCritique) {
-      const whichFailed = [!claudeCritique && 'claude', !antigravityCritique && 'antigravity'].filter(Boolean).join(', ')
+    const failedPlanReviews = planReviews.filter((result) => !result || isDispatchFailure(result)).length
+    if (failedPlanReviews) {
       finalVerdict = {
         passed: false,
         tier: 'full',
-        error: 'critique_failed',
-        reason: `클로드/안티그래비티 블라인드 비평 단계(${whichFailed})가 실패함(세션 한도 초과 등 일시적 오류일 가능성 높음) — 비평이 실제로 수행되지 못한 상태이니 코덱스가 "이슈 없음"으로 오인하고 계획을 그대로 진행하면 안 됨. 같은 task로 워크플로우를 재시도할 것.`,
+        error: 'plan_review_failed',
+        reason: `Codex 병렬 계획 검토 ${failedPlanReviews}건이 실패함 — 검토되지 않은 계획으로 실행하지 않도록 중단함. 같은 task로 워크플로우를 재시도할 것.`,
       }
-      log('[전체] 2단계: 블라인드 비평 실패 — 재시도 필요')
+      log(`[전체] 4단계: Codex 계획 검토 실패(${failedPlanReviews}건) — 재시도 필요`)
       return await finalizeAndReturn()
     }
 
-    log('[전체] 3단계: 코덱스 취합+판단+계획 개선...')
+    log('[전체] 5단계: Codex가 검토 결과를 반영해 최종 계획 수정...')
     const reconciled = await dispatchWithRetry(
-      (isRetry) => codexReconcile(task, context, codexPlan, claudeCritique, antigravityCritique, HARNESS_FILE, isRetry),
-      '코덱스 취합'
+      (isRetry) => codexRevisePlan(task, context, promptified, claudePlan, planReviews, HARNESS_FILE, isRetry),
+      'Codex 최종 계획 수정'
     )
 
     if (!reconciled || isDispatchFailure(reconciled)) {
       finalVerdict = {
         passed: false,
         tier: 'full',
-        error: 'codex_reconcile_failed',
+        error: 'codex_plan_revision_failed',
         reason: isDispatchFailure(reconciled)
-          ? `코덱스 취합/계획개선 단계가 도구 실행/파싱 실패로 1회 재시도 후에도 실패함: ${reconciled.dispatchFailureReason}. 같은 task로 워크플로우를 재시도할 것.`
-          : '코덱스 취합/계획개선 단계가 실패함(일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
+          ? `Codex 최종 계획 수정 단계가 도구 실행/파싱 실패로 1회 재시도 후에도 실패함: ${reconciled.dispatchFailureReason}. 같은 task로 워크플로우를 재시도할 것.`
+          : 'Codex 최종 계획 수정 단계가 실패함(일시적 오류일 가능성 높음) — 같은 task로 워크플로우를 재시도할 것.',
       }
-      log('[전체] 3단계: 코덱스 취합 실패 — 재시도 필요')
+      log('[전체] 5단계: Codex 최종 계획 수정 실패 — 재시도 필요')
       return await finalizeAndReturn()
     }
 
-    log('[전체] 하네스 규칙 추가 (사전비평 단계)...')
-    const harnessResultPre = await appendHarnessRules(reconciled?.compiledIssues, 'pre-execution', HARNESS_FILE)
+    log('[전체] 하네스 규칙 추가 (계획 검토 단계)...')
+    const harnessResultPre = await appendHarnessRules(reconciled?.compiledIssues, 'pre-execution-plan-review', HARNESS_FILE)
     harnessRulesAddedCount += harnessResultPre?.rulesAdded?.length || 0
 
-    log('[전체] 실행: 코덱스가 개선된 계획대로 코딩...')
-    await fullExecute(cwd, reconciled?.revisedPlan, context, HARNESS_FILE)
+    log('[전체] 6단계: Codex가 개선된 계획대로 코딩...')
+    const execution = await fullExecute(cwd, reconciled?.revisedPlan, context, HARNESS_FILE)
+    if (!execution || execution.ok === false) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'execution_failed',
+        reason: execution?.message || 'Codex 코딩 실행이 성공 응답을 반환하지 않음 — 코드 리뷰로 성공을 가장하지 않도록 중단함.',
+        needsUserDecision: true,
+      }
+      log('[전체] 6단계: Codex 실행 실패 — 리뷰 단계로 진행하지 않음')
+      return await finalizeAndReturn()
+    }
     realDiff = await gatherRealDiff(cwd)
   }
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    log(`[전체] ${round}라운드: 코덱스/안티그래비티 블라인드 코드리뷰(무점수)...`)
+    log(`[전체] ${round}라운드: code-review 스킬 발동 — Codex/Antigravity 독립 코드리뷰...`)
     const [codexReview, antigravityReview] = await parallel([
       () => codexReviewDiff(task, context, realDiff, false),
       () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry), '안티그래비티 코드리뷰'),
@@ -1327,6 +1491,17 @@ if (tier === 'full' && !finalVerdict) {
       ...(codexReview?.issues || []).map((i) => ({ ...i, source: 'codex' })),
       ...(antigravityReview?.issues || []).map((i) => ({ ...i, source: 'antigravity' })),
     ]
+    const failedChecks = [
+      ...(codexReview.checks || []).map((check) => ({ ...check, source: 'codex' })),
+      ...(antigravityReview.checks || []).map((check) => ({ ...check, source: 'antigravity' })),
+    ].filter((check) => check.status !== 'passed')
+    for (const check of failedChecks) {
+      combinedIssues.push({
+        description: `결정론적 검사 미통과 또는 미실행: ${check.source}/${check.name} (${check.status})${check.evidence ? ` — ${check.evidence}` : ''}`,
+        blocking: true,
+        source: check.source,
+      })
+    }
 
     if (combinedIssues.length) {
       // 탈출구 경로의 1라운드는 클로드(lightExecute)가 쓴 코드에서 나온
@@ -1337,7 +1512,7 @@ if (tier === 'full' && !finalVerdict) {
       harnessRulesAddedCount += harnessResultPost?.rulesAdded?.length || 0
     }
 
-    const passed = !codexReview?.hasBlockingIssue && !antigravityReview?.hasBlockingIssue
+    const passed = !codexReview?.hasBlockingIssue && !antigravityReview?.hasBlockingIssue && failedChecks.length === 0
     if (passed) {
       finalVerdict = { passed: true, tier: 'full', round, wasEscapeHatch: !!baseline }
       log(`[전체] ${round}라운드에서 통과 (블로킹 이슈 없음)`)
@@ -1397,14 +1572,14 @@ async function notifyDiscordEscalation(message, jobType, pendingJobParams) {
     if (!pendingJobParams) {
       await agent(
         `Bash로 정확히 아래 명령을 실행해줘 (실패해도 무시하고 결과만 알려줘):\nbash "${MAC_AGENT_ROOT}/bin/discord-notify.sh" ${JSON.stringify(message)}`,
-        { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose' }
+        { phase: 'FullCodeReviewSkill', label: 'discord-notify', agentType: 'general-purpose' }
       )
       return
     }
     const paramsJson = JSON.stringify(pendingJobParams)
     const result = await agent(
       `1. Bash로 정확히 아래 명령을 실행해서 메시지 id를 얻어(실패하면 빈 문자열일 수 있어):\nbash "${MAC_AGENT_ROOT}/bin/discord-notify.sh" ${JSON.stringify(message)}\n\n2. 1번 출력(메시지 id)이 비어있으면 written=false, reason에 "no message id"라고 채워서 끝내 — pending-job을 쓸 필요 없어.\n3. id가 있으면:\n   a. Bash로 \`mkdir -p "$HOME/.claude/discord-bot/pending"\` 실행.\n   b. Bash로 \`python3 -c "import datetime; print(datetime.datetime.now().isoformat())"\`을 실행해서 현재 로컬시각(naive isoformat)을 얻어 — date -u나 다른 형식 절대 쓰지 마, weekly-report.sh의 pending-job과 형식이 정확히 같아야 discord-bot.py가 파싱한다.\n   c. 아래 [원본 params JSON]을 그대로 \`params\` 필드로 쓰고, \`type\`은 ${JSON.stringify(jobType)}, \`created_at\`은 방금 얻은 시각으로 채운 JSON 객체 하나를 만들어서, Write 툴로 \`$HOME/.claude/discord-bot/pending/<1번에서 얻은 id>.json\`에 저장해(파일 내용은 그 JSON 객체 하나, 다른 텍스트 없이).\n   d. Write가 성공했으면 written=true, messageId에 그 id를 채워서 답해. Write가 실패했으면 written=false, reason에 무엇이 실패했는지 적어.\n\n[원본 params JSON]\n${paramsJson}`,
-      { phase: 'FullReview', label: 'discord-notify', agentType: 'general-purpose', schema: NOTIFY_ESCALATION_SCHEMA }
+      { phase: 'FullCodeReviewSkill', label: 'discord-notify', agentType: 'general-purpose', schema: NOTIFY_ESCALATION_SCHEMA }
     )
     if (!result) {
       log('디스코드 에스컬레이션 알림: 서브에이전트 호출 자체가 실패함(세션/사용 한도 등) — pending-job이 안 만들어졌을 수 있음')

@@ -71,6 +71,19 @@ V2_ENVELOPES = {
     "nano-plan": {
         "steps": [],
     },
+    "research": {
+        "focus": "",
+        "findings": f"[도구 실패] 조사 자체가 실행되지 않음 — {reason}",
+        "evidence": [],
+        "risks": [reason],
+        "testImplications": [],
+    },
+    "plan-review": {
+        "reviewerFocus": "",
+        "issues": [{"description": f"[도구 실패] 계획 검토 자체가 실행되지 않음 — {reason}", "severity": "tooling-failure"}],
+        "approvedParts": [],
+        "notes": reason,
+    },
     # issues를 빈 배열로 두면 "안티그래비티가 검토해서 문제 없다고 함"으로
     # 오독될 수 있음(fail-open) — 대신 실패 자체를 이슈 하나로 넣어서
     # 취합(reconcile) 단계에서 "이 비평은 실행 자체가 안 됐다"는 사실이

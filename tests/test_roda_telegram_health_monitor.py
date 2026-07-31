@@ -1,6 +1,7 @@
 import importlib.util
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -62,8 +63,38 @@ class RodaHealthMonitorTests(unittest.TestCase):
         event = health._usage_event("claude", "rate_limited", line, now=100)
         self.assertEqual(health.classify_line(line), "rate_limited")
         self.assertEqual(event["source"], "structured_error")
+        self.assertEqual(event["authority"], "provider_response")
         self.assertIn("error.type=rate_limit_error", event["evidence"])
         self.assertEqual(len(event["request_id_hash"]), 12)
+
+    def test_provider_structured_fixtures_use_provider_specific_mapping(self):
+        fixtures = (
+            ("claude", '{"error":{"type":"rate_limit_error"},"request_id":"req-claude"}', "rate_limited"),
+            ("codex", '{"type":"usage_limit","message":"usage limit reached"}', "usage_limited"),
+            ("antigravity", '{"status":"RESOURCE_EXHAUSTED","message":"capacity unavailable"}', "capacity_limited"),
+        )
+        for role, line, expected in fixtures:
+            with self.subTest(role=role):
+                self.assertEqual(health.classify_line(line, role=role), expected)
+
+    def test_structured_redactor_recursively_removes_nested_secrets(self):
+        line = '{"error":{"type":"rate_limit_error","details":{"api_key":"nested-secret"}},"metadata":[{"token":"nested-token"}]}'
+        detail = health._safe_detail(line)
+        self.assertNotIn("nested-secret", detail)
+        self.assertNotIn("nested-token", detail)
+
+    def test_arbitrary_json_cannot_be_promoted_to_provider_error(self):
+        line = '{"message":"quota exceeded","metadata":{"accessToken":"raw-token","deploymentSecret":"raw-secret"}}'
+        self.assertIsNone(health._structured_error(line))
+        self.assertIsNone(health.classify_line(line, role="codex"))
+        detail = health._safe_detail(line)
+        self.assertNotIn("raw-token", detail)
+        self.assertNotIn("raw-secret", detail)
+
+    def test_unstructured_usage_event_keeps_local_log_authority(self):
+        event = health._usage_event("codex", "usage_limited", "quota exceeded", now=100)
+        self.assertEqual(event["source"], "stderr")
+        self.assertEqual(event["authority"], "local_log")
 
     def test_usage_event_extracts_exact_retry_after_without_guessing_window(self):
         event = health._usage_event(
@@ -88,6 +119,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
         event = health._usage_event("codex", "rate_limited", "rate limit; resets in 1 hour 30 minutes", now=100)
         self.assertIsNone(event["retry_after_seconds"])
         self.assertEqual(event["recovery_confidence"], "estimated")
+        self.assertEqual(event["authority"], "local_log")
         self.assertIn("1970-01-01T01:31:40", event["reset_at"])
 
     def test_usage_event_prefers_retry_after_and_parses_multiple_windows(self):
@@ -109,6 +141,9 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(event["recovery_confidence"], "unknown")
         self.assertIn("provider 용량 제한", event["message"])
 
+        window_event = health._usage_event("antigravity", "usage_limited", "baseline quota exhausted; weekly window", now=100)
+        self.assertEqual(window_event["authority"], "provider_policy")
+
     def test_state_migration_adds_schema_and_expires_legacy_usage_watch(self):
         original = health.STATE_FILE
         with tempfile.TemporaryDirectory() as td:
@@ -122,6 +157,26 @@ class RodaHealthMonitorTests(unittest.TestCase):
             self.assertGreater(state["usage_watch"]["old"]["expires_at"], 10)
             self.assertIn("metrics", state)
         health.STATE_FILE = original
+
+    def test_unknown_and_parse_failure_metrics_are_recorded(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "x.log"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original_targets = health.TARGETS
+            original_running = health._service_running
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            health._service_running = lambda label: True
+            try:
+                state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}}
+                health.poll_once(state, now=0)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write('provider {"error":{"type":"future_limit_error"}}\n')
+                self.assertEqual(health.poll_once(state, now=1), [])
+                self.assertEqual(state["metrics"]["unknown"], 1)
+                self.assertEqual(state["metrics"]["parse_failures"], 1)
+            finally:
+                health.TARGETS = original_targets
+                health._service_running = original_running
 
     def test_initial_poll_only_establishes_offsets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -378,6 +433,228 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIn("integration_lock(SOURCE_REPO)", source)
         self.assertIn('"merge", "--no-ff"', source)
         self.assertIn('"merge", "--abort"', source)
+
+    def test_retryable_merge_failure_queues_repair_commit_once_with_creation_time(self):
+        event = {
+            "role": "codex",
+            "code": "empty_response",
+            "fingerprint": "repair-fingerprint",
+            "detail": "empty response",
+        }
+        state = {"pending_merges": {}}
+        with tempfile.TemporaryDirectory() as td:
+            codex_bin = Path(td) / "codex"
+            codex_bin.touch()
+            worktree = Path(td) / "repair" / event["fingerprint"]
+            original = {
+                "CODEX_BIN": health.CODEX_BIN,
+                "REPAIR_ROOT": health.REPAIR_ROOT,
+                "repository_lifecycle_lock": health.repository_lifecycle_lock,
+                "CODEX_DIAGNOSIS_ENABLED": health.CODEX_DIAGNOSIS_ENABLED,
+                "AUTO_REPAIR_ENABLED": health.AUTO_REPAIR_ENABLED,
+            }
+
+            def run(command, **_kwargs):
+                if "worktree" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if "exec" in command:
+                    return mock.Mock(
+                        returncode=0,
+                        stdout='{"type":"item.completed","item":{"type":"agent_message","text":"fixed"}}\n',
+                        stderr="",
+                    )
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M bin/example.py\n", stderr="")
+                if "diff" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["add", "-A"] or "commit" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["rev-parse", "HEAD"]:
+                    return mock.Mock(returncode=0, stdout="repair-commit\n", stderr="")
+                raise AssertionError(f"unexpected subprocess command: {command}")
+
+            health.CODEX_BIN = codex_bin
+            health.REPAIR_ROOT = Path(td) / "repair"
+            health.repository_lifecycle_lock = None
+            health.CODEX_DIAGNOSIS_ENABLED = True
+            health.AUTO_REPAIR_ENABLED = True
+            try:
+                with mock.patch.object(health.subprocess, "run", side_effect=run), \
+                        mock.patch.object(health, "_merge_repair_commit_and_restart", return_value="main에 추적 파일 변경이 있어 자동 병합하지 않았습니다."), \
+                        mock.patch.object(health.time, "time", return_value=1700000000):
+                    first = health._run_codex_repair_impl(event, state)
+                    worktree.mkdir(parents=True)
+                    second = health._run_codex_repair_impl(event, state)
+            finally:
+                for name, value in original.items():
+                    setattr(health, name, value)
+
+        self.assertIn("main에 추적 파일 변경", first)
+        self.assertIn("main에 추적 파일 변경", second)
+        self.assertEqual(list(state["pending_merges"]), [event["fingerprint"]])
+        self.assertEqual(state["pending_merges"][event["fingerprint"]]["repair_commit"], "repair-commit")
+        self.assertEqual(state["pending_merges"][event["fingerprint"]]["queued_at"], 1700000000)
+
+    def test_pending_merge_retry_reuses_commit_without_rediagnosis_and_orders_success_followup(self):
+        fingerprint = "queued-fingerprint"
+        state = {
+            "pending_merges": {
+                fingerprint: {
+                    "role": "codex",
+                    "code": "empty_response",
+                    "repair_commit": "saved-commit",
+                    "worktree": "/tmp/repair-worktree",
+                    "summary": "diagnosis summary",
+                    "queued_at": 1700000000,
+                }
+            },
+            "repair_results": {},
+            "recovery_watch": {},
+        }
+        sequence = []
+
+        def merge(**kwargs):
+            sequence.append(("merge", kwargs))
+            return "Codex 자동 수정·main 병합·codex 서비스 재기동 완료."
+
+        with mock.patch.object(health.time, "time", return_value=1700000001), \
+                mock.patch.object(health, "_merge_repair_commit_and_restart", side_effect=merge), \
+                mock.patch.object(health, "_run_codex_repair", side_effect=AssertionError("rediagnosis must not run")), \
+                mock.patch.object(health, "_save_state", side_effect=lambda _state: sequence.append(("save", None))), \
+                mock.patch.object(health, "_send_alert", side_effect=lambda message: sequence.append(("alert", message))):
+            health._retry_pending_merges(state)
+
+        self.assertEqual(state["pending_merges"], {})
+        self.assertEqual(sequence[0][0], "merge")
+        self.assertEqual(sequence[0][1]["repair_commit"], "saved-commit")
+        self.assertEqual([item[0] for item in sequence], ["merge", "save", "alert"])
+        self.assertEqual(state["recovery_watch"][fingerprint]["status"], "awaiting_reprocess")
+        self.assertIn("Codex 자동 수정", state["repair_results"][fingerprint])
+
+    def test_pending_merge_retry_failure_stays_queued_without_followup(self):
+        fingerprint = "blocked-fingerprint"
+        info = {
+            "role": "codex",
+            "code": "empty_response",
+            "repair_commit": "saved-commit",
+            "worktree": "/tmp/repair-worktree",
+            "summary": "diagnosis summary",
+            "queued_at": 1700000000,
+        }
+        state = {"pending_merges": {fingerprint: info}, "repair_results": {}, "recovery_watch": {}}
+        with mock.patch.object(health.time, "time", return_value=1700000001), \
+                mock.patch.object(health, "_merge_repair_commit_and_restart", return_value="Codex 수정은 생성됐지만 main 병합에 실패했습니다: conflict"), \
+                mock.patch.object(health, "_save_state") as save_state, \
+                mock.patch.object(health, "_send_alert") as send_alert:
+            health._retry_pending_merges(state)
+
+        self.assertEqual(state["pending_merges"][fingerprint], info)
+        self.assertEqual(state["recovery_watch"], {})
+        save_state.assert_not_called()
+        send_alert.assert_not_called()
+
+    def test_pending_merge_ttl_removes_item_at_exact_boundary_and_requests_manual_merge(self):
+        fingerprint = "expired-fingerprint"
+        state = {
+            "pending_merges": {
+                fingerprint: {
+                    "role": "codex",
+                    "code": "empty_response",
+                    "repair_commit": "saved-commit",
+                    "worktree": "/tmp/repair-worktree",
+                    "summary": "diagnosis summary",
+                    "queued_at": 1700000000,
+                }
+            },
+            "repair_results": {},
+            "recovery_watch": {},
+        }
+        with mock.patch.object(health.time, "time", return_value=1700000000 + health.PENDING_MERGE_TTL_SECONDS), \
+                mock.patch.object(health, "_merge_repair_commit_and_restart") as merge, \
+                mock.patch.object(health, "_save_state"), \
+                mock.patch.object(health, "_send_alert") as send_alert:
+            health._retry_pending_merges(state)
+
+        merge.assert_not_called()
+        self.assertNotIn(fingerprint, state["pending_merges"])
+        self.assertIn("수동 병합이 필요합니다", state["repair_results"][fingerprint])
+        send_alert.assert_called_once()
+        self.assertIn("saved-commit", send_alert.call_args.args[0])
+
+    def test_merge_failure_never_restarts_but_success_restarts_after_merge(self):
+        original_lock = health.integration_lock
+        health.integration_lock = None
+        try:
+            def run_dirty(command, **_kwargs):
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M tracked.py\n", stderr="")
+                raise AssertionError(f"dirty main should stop before: {command}")
+
+            with mock.patch.object(health.subprocess, "run", side_effect=run_dirty) as run:
+                result = health._merge_repair_commit_and_restart(
+                    role="codex", code="empty_response", repair_commit="saved-commit", fingerprint="fp"
+                )
+            self.assertIn("추적 파일 변경", result)
+            self.assertEqual(run.call_count, 1)
+
+            commands = []
+
+            def run_conflict(command, **_kwargs):
+                commands.append(command)
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["rev-parse", "HEAD"]:
+                    return mock.Mock(returncode=0, stdout="main-head\n", stderr="")
+                if "merge" in command and "--abort" not in command:
+                    return mock.Mock(returncode=1, stdout="", stderr="CONFLICT")
+                if "MERGE_HEAD" in command:
+                    return mock.Mock(returncode=0, stdout="saved-commit\n", stderr="")
+                if "--abort" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected conflict command: {command}")
+
+            with mock.patch.object(health.subprocess, "run", side_effect=run_conflict):
+                result = health._merge_repair_commit_and_restart(
+                    role="codex", code="empty_response", repair_commit="saved-commit", fingerprint="fp"
+                )
+            self.assertIn("병합에 실패했습니다", result)
+            self.assertFalse(any(str(health.RESTART_HELPER) in str(command) for command in commands))
+
+            def run_success(command, **_kwargs):
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["rev-parse", "HEAD"]:
+                    return mock.Mock(returncode=0, stdout="main-head\n", stderr="")
+                if "merge" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if str(health.RESTART_HELPER) in str(command):
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                raise AssertionError(f"unexpected success command: {command}")
+
+            with mock.patch.object(health.subprocess, "run", side_effect=run_success) as run:
+                result = health._merge_repair_commit_and_restart(
+                    role="codex", code="empty_response", repair_commit="saved-commit", fingerprint="fp"
+                )
+            self.assertIn("서비스 재기동 완료", result)
+            self.assertTrue(any(str(health.RESTART_HELPER) in str(call.args[0]) for call in run.call_args_list))
+        finally:
+            health.integration_lock = original_lock
+
+    def test_main_dirty_signal_is_suppressed_for_24_hours_and_fires_at_boundary(self):
+        original_dirty_lines = health._source_repo_tracked_dirty_lines
+        health._source_repo_tracked_dirty_lines = lambda: [" M tracked.py"]
+        try:
+            base = 2 * health.MAIN_DIRTY_ALERT_INTERVAL_SECONDS + 10
+            state = {}
+            first = health._check_main_dirty(state, base)
+            suppressed = health._check_main_dirty(state, base + health.MAIN_DIRTY_ALERT_INTERVAL_SECONDS - 1)
+            boundary = health._check_main_dirty(state, base + health.MAIN_DIRTY_ALERT_INTERVAL_SECONDS)
+        finally:
+            health._source_repo_tracked_dirty_lines = original_dirty_lines
+
+        self.assertEqual(first["code"], "main_dirty")
+        self.assertIsNone(suppressed)
+        self.assertEqual(boundary["code"], "main_dirty")
 
 
 if __name__ == "__main__":

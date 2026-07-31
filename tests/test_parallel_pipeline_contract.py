@@ -1,8 +1,10 @@
 """Pipeline P5: token-free contract tests for the parallel worktree plan."""
 from __future__ import annotations
 
+import json
 import sys
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
@@ -15,10 +17,11 @@ from edge_agent_parallel_executor import (  # noqa: E402
     ParallelExecutor,
     ProviderOutcome,
 )
+import edge_agent_parallel_executor as executor_module  # noqa: E402
 from edge_agent_parallel_integrator import ParallelIntegrator  # noqa: E402
 from edge_agent_parallel_audit import audit  # noqa: E402
 from edge_agent_parallel_pipeline import ParallelPipeline  # noqa: E402
-from edge_agent_parallel_locks import FileReservation, ReservationConflict  # noqa: E402
+from edge_agent_parallel_locks import FileReservation, ReservationConflict, reservation_is_stale  # noqa: E402
 from edge_agent_parallel_worktree import (  # noqa: E402
     ParallelTaskSpec,
     SourceDirtyError,
@@ -87,6 +90,54 @@ class ParallelPipelineContractTests(unittest.TestCase):
         reservation.reserve(task_id="one", files=("src",))
         with self.assertRaises(ReservationConflict):
             reservation.reserve(task_id="two", files=("src/module.py",))
+
+    def test_reservation_heartbeat_refreshes_active_record(self):
+        reservation = FileReservation(self.root, state_root=self.state)
+        record = reservation.reserve(task_id="heartbeat", files=("a.txt",))
+        self.assertIn("heartbeat_at", record)
+        self.assertFalse(reservation_is_stale(record, ttl_seconds=3600))
+        self.assertTrue(reservation.heartbeat("heartbeat"))
+        self.assertFalse(reservation.heartbeat("missing"))
+
+    def test_executor_starts_and_stops_reservation_heartbeat(self):
+        spec = self._spec("heartbeat-executor", "a.txt")
+        self.manager.create(spec)
+        heartbeat_calls = []
+        original_heartbeat = FileReservation.heartbeat
+        original_interval = executor_module.RESERVATION_HEARTBEAT_SECONDS
+
+        def recording_heartbeat(instance, task_id):
+            heartbeat_calls.append(task_id)
+            return original_heartbeat(instance, task_id)
+
+        FileReservation.heartbeat = recording_heartbeat
+        executor_module.RESERVATION_HEARTBEAT_SECONDS = 0.01
+        try:
+            result = ParallelExecutor(self.manager, parallel_enabled=True).execute(
+                spec,
+                lambda worktree, _spec: (
+                    (worktree / "a.txt").write_text("changed\n", encoding="utf-8"),
+                    time.sleep(0.03),
+                    ProviderOutcome(ok=True, output="done"),
+                )[-1],
+            )
+        finally:
+            FileReservation.heartbeat = original_heartbeat
+            executor_module.RESERVATION_HEARTBEAT_SECONDS = original_interval
+        self.assertEqual(result.status, "succeeded")
+        self.assertIn("heartbeat-executor", heartbeat_calls)
+
+    def test_read_only_audit_reports_stale_reservation(self):
+        reservation = FileReservation(self.root, state_root=self.state)
+        reservation.reserve(task_id="stale-task", files=("a.txt",))
+        payload = json.loads(reservation.registry.read_text(encoding="utf-8"))
+        payload[0]["heartbeat_at"] = "2000-01-01T00:00:00+00:00"
+        reservation.registry.write_text(json.dumps(payload), encoding="utf-8")
+        findings = audit(self.manager, self.root, reservation_ttl_seconds=1)
+        stale = [finding for finding in findings if finding.code == "stale_reservation"]
+        self.assertEqual(len(stale), 1)
+        self.assertEqual(stale[0].task_id, "stale-task")
+        self.assertIn("human review required", stale[0].detail)
 
     def test_executor_is_disabled_by_default(self):
         spec = self._spec("disabled", "a.txt")

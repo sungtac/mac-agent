@@ -103,8 +103,9 @@ STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
 # recommended cutting verify-call time specifically rather than the
 # authoring timeout (codex genuinely may need the full budget to code).
 CODEX_VERIFY_CALL_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_CALL_TIMEOUT_SECONDS", "600"))
-WORKTREE_LOCK_RETRIES = max(0, int(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRIES", "5")))
+WORKTREE_LOCK_RETRIES = max(0, int(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRIES", "7")))
 WORKTREE_LOCK_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRY_SECONDS", "1")))
+WORKTREE_LOCK_MAX_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_MAX_RETRY_SECONDS", "8")))
 CHUNK_SIZE = 3900
 MAX_CHUNKS = int(os.environ.get("TELEGRAM_AGENT_MAX_CHUNKS", "15"))
 
@@ -178,7 +179,7 @@ def _provider_workspace(role: str) -> Path:
     return CODEX_WORKSPACE if role == "codex" else WORKSPACE
 
 
-async def _create_task_worktree(task_id: str) -> Path:
+async def _create_task_worktree(task_id: str, *, on_wait=None) -> Path:
     CODEX_TASK_WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     target = CODEX_TASK_WORKTREE_ROOT / task_id
     if target.exists():
@@ -205,11 +206,14 @@ async def _create_task_worktree(task_id: str) -> Path:
                 raise RuntimeError(
                     f"Telegram 작업공간 lifecycle lock을 {attempt + 1}회 시도했지만 확보하지 못했습니다: {exc}"
                 ) from exc
+            if on_wait is not None:
+                await on_wait()
+            delay = min(WORKTREE_LOCK_RETRY_SECONDS * (2**attempt), WORKTREE_LOCK_MAX_RETRY_SECONDS)
             log(
                 f"작업공간 lifecycle lock 대기 중(attempt={attempt + 1}/{WORKTREE_LOCK_RETRIES + 1}); "
-                f"{WORKTREE_LOCK_RETRY_SECONDS:g}초 후 재시도"
+                f"{delay:g}초 후 재시도"
             )
-            await asyncio.sleep(WORKTREE_LOCK_RETRY_SECONDS)
+            await asyncio.sleep(delay)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "git worktree add 실패").strip()
         raise RuntimeError(f"Telegram 작업 worktree 생성 실패: {detail[-500:]}")
@@ -1228,9 +1232,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(f"❌ 공통 세션 초기화 오류: {exc}")
             return
 
+        progress = None
+        try:
+            progress = await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]} 처리 중...")
+        except TelegramError as exc:
+            log(f"progress 메시지 전송 실패(계속 진행): {exc}")
+
+        async def _notify_waiting() -> None:
+            if progress is None:
+                return
+            try:
+                await progress.edit_text(
+                    f"⏳ {ROLE_LABELS[ROLE]} 대기 중... (다른 역할 봇이 워크스페이스 사용 중이라 끝나면 이어서 처리해요)"
+                )
+            except TelegramError:
+                pass
+
         if ROLE in ROLES:
             try:
-                ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id)
+                ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id, on_wait=_notify_waiting)
                 write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
                 write_task_state(
                     role=ROLE,
@@ -1256,22 +1276,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
                 await message.reply_text(f"❌ Codex 작업공간 생성 오류: {exc}")
                 return
-
-        progress = None
-        try:
-            progress = await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]} 처리 중...")
-        except TelegramError as exc:
-            log(f"progress 메시지 전송 실패(계속 진행): {exc}")
-
-        async def _notify_waiting() -> None:
-            if progress is None:
-                return
-            try:
-                await progress.edit_text(
-                    f"⏳ {ROLE_LABELS[ROLE]} 대기 중... (다른 역할 봇이 워크스페이스 사용 중이라 끝나면 이어서 처리해요)"
-                )
-            except TelegramError:
-                pass
 
         # Split so a Telegram-side send/edit failure AFTER a successful
         # provider run can't get mislabeled as "provider execution error."

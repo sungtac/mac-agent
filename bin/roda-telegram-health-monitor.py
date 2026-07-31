@@ -44,7 +44,7 @@ USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SEC
 # docs/roda-parallel-recovery-improvement-plan.md P2.
 PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SECONDS", str(24 * 60 * 60)))
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
-STATE_SCHEMA_VERSION = 2
+STATE_SCHEMA_VERSION = 3
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
@@ -136,6 +136,27 @@ NON_REPAIRABLE_CODES = frozenset({
     "main_dirty",
 })
 RESOURCE_RECOVERY_CODES = frozenset({"usage_limited", "rate_limited", "capacity_limited", "service_overloaded"})
+UNKNOWN_SIGNAL_RE = re.compile(
+    r"provider|quota|usage\s+(?:cap|limit)|resource[_ -]?exhausted|rate[_ -]?limit|"
+    r"429|capacity|overload|unavailable|retry[- _]?after",
+    re.I,
+)
+STRUCTURED_PROVIDER_TYPES = frozenset({
+    "rate_limit_error",
+    "rate_limited",
+    "authentication_error",
+    "permission_error",
+    "unauthorized",
+    "overloaded_error",
+    "service_overloaded",
+    "context_exceeded",
+    "request_too_large",
+    "usage_limit",
+    "usage_limited",
+    "quota_exceeded",
+    "resource_exhausted",
+})
+STRUCTURED_PROVIDER_STATUSES = frozenset({"401", "403", "429", "503", "529", "too_many_requests", "resource_exhausted"})
 USAGE_WINDOW_RE = re.compile(
     r"(?P<window>5\s*[- ]?(?:h|hours?)|five\s+hours?|7\s*[- ]?(?:d|days?)|"
     r"seven\s+days?|weekly|monthly)",
@@ -184,7 +205,13 @@ def _default_state() -> dict:
         "usage_watch": {},
         "pending_merges": {},
         "main_dirty_alerted_at": 0,
-        "metrics": {"classified": {}, "last_event_at": None},
+        "metrics": {
+            "classified": {},
+            "unknown": 0,
+            "parse_failures": 0,
+            "diagnostic_lines": 0,
+            "last_event_at": None,
+        },
     }
 
 
@@ -220,12 +247,23 @@ def _migrate_state(payload: object) -> dict:
             usage["expires_at"] = created_at + USAGE_WATCH_TTL_SECONDS
         usage.setdefault("windows", [])
         usage.setdefault("recovery_confidence", "unknown")
+        usage.setdefault("source", "stderr")
+        usage.setdefault("authority", "local_log")
+        usage.setdefault("evidence", [])
     if not isinstance(state.get("metrics"), dict):
-        state["metrics"] = {"classified": {}, "last_event_at": None}
+        state["metrics"] = {}
     if not isinstance(state["metrics"].get("classified"), dict):
         state["metrics"]["classified"] = {}
+    state["metrics"].setdefault("unknown", 0)
+    state["metrics"].setdefault("parse_failures", 0)
+    state["metrics"].setdefault("diagnostic_lines", 0)
     state["metrics"].setdefault("classified", {})
     state["metrics"].setdefault("last_event_at", None)
+    for key in ("unknown", "parse_failures", "diagnostic_lines"):
+        try:
+            state["metrics"][key] = int(state["metrics"][key])
+        except (TypeError, ValueError):
+            state["metrics"][key] = 0
     return state
 
 
@@ -240,7 +278,7 @@ def _save_state(state: dict) -> None:
     _atomic_write(STATE_FILE, state)
 
 
-def _structured_error(line: str) -> dict | None:
+def _json_object(line: str) -> dict | None:
     decoder = json.JSONDecoder()
     for index, char in enumerate(line):
         if char != "{":
@@ -251,6 +289,25 @@ def _structured_error(line: str) -> dict | None:
             continue
         if isinstance(value, dict):
             return value
+    return None
+
+
+def _structured_error(line: str) -> dict | None:
+    payload = _json_object(line)
+    if not payload:
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict) and any(error.get(key) is not None for key in ("type", "status", "code", "status_code")):
+        return payload
+    error_type = str(payload.get("error_type", "")).lower()
+    top_level_type = str(payload.get("type", "")).lower()
+    status = str(payload.get("status", payload.get("code", payload.get("status_code", "")))).lower()
+    if error_type or top_level_type in STRUCTURED_PROVIDER_TYPES or top_level_type.endswith("_error"):
+        return payload
+    if status in STRUCTURED_PROVIDER_STATUSES:
+        return payload
+    if any(payload.get(key) is not None for key in ("request_id", "requestId", "request-id", "retry_after", "retryAfter", "reset_at", "resetAt")):
+        return payload
     return None
 
 
@@ -267,20 +324,65 @@ def _structured_error_type(payload: dict | None) -> str | None:
     return None
 
 
+def _structured_error_status(payload: dict | None) -> str | None:
+    if not payload:
+        return None
+    error = payload.get("error")
+    if isinstance(error, dict):
+        for key in ("status", "code", "status_code"):
+            if error.get(key) is not None:
+                return str(error[key])
+    for key in ("status", "code", "status_code"):
+        if payload.get(key) is not None:
+            return str(payload[key])
+    return None
+
+
+def _structured_category(payload: dict | None, role: str | None) -> str | None:
+    error_type = (_structured_error_type(payload) or "").lower()
+    status = (_structured_error_status(payload) or "").lower()
+    encoded = json.dumps(payload or {}, ensure_ascii=False).lower()
+    if error_type in {"rate_limit_error", "rate_limited"} or status in {"429", "too_many_requests"}:
+        return "rate_limited"
+    if error_type in {"authentication_error", "permission_error", "unauthorized"} or status in {"401", "403"}:
+        return "auth_error"
+    if error_type in {"overloaded_error", "service_overloaded"} or status in {"529", "503"}:
+        return "service_overloaded"
+    if error_type in {"context_exceeded", "request_too_large"}:
+        return "context_exceeded"
+    if role == "antigravity" and ("resource_exhausted" in encoded or "quota" in encoded):
+        return "usage_limited" if "quota" in encoded or "usage" in encoded else "capacity_limited"
+    if role == "codex" and (error_type in {"usage_limit", "usage_limited", "quota_exceeded"} or re.search(r"usage|quota", encoded)):
+        return "usage_limited"
+    if role == "claude" and "rate_limit" in encoded:
+        return "rate_limited"
+    return None
+
+
+def _authority_for(source: str, confidence: str, reset_source: str | None, windows: list[str]) -> str:
+    if source == "structured_error":
+        return "provider_response"
+    if confidence == "estimated" and reset_source is None and windows:
+        return "provider_policy"
+    return "local_log"
+
+
 def classify_line(line: str, *, role: str | None = None) -> str | None:
     prompt_marker = re.search(r"\btext\s*=", line, re.I)
     provider_prefix = line[:prompt_marker.start()] if prompt_marker else line
     prompt_only = bool(prompt_marker and not FAILURE_CONTEXT_RE.search(provider_prefix))
+    json_payload = _json_object(line) if not prompt_only else None
     payload = _structured_error(line) if not prompt_only else None
-    structured_type = _structured_error_type(payload)
-    if structured_type in {"rate_limit_error", "rate_limited"}:
-        return "rate_limited"
-    if structured_type in {"authentication_error", "permission_error", "unauthorized"}:
-        return "auth_error"
-    if structured_type in {"overloaded_error", "service_overloaded"}:
-        return "service_overloaded"
-    if structured_type in {"context_exceeded", "request_too_large"}:
-        return "context_exceeded"
+    structured_category = _structured_category(payload, role)
+    if structured_category:
+        return structured_category
+    # A JSON object without a provider diagnostic envelope is untrusted input.
+    # Do not let words inside arbitrary user payloads trigger provider alerts;
+    # only a clear error prefix may opt it into regex fallback.
+    if json_payload is not None and payload is None:
+        json_start = line.find("{")
+        if not FAILURE_CONTEXT_RE.search(line[:json_start]):
+            return None
     if prompt_only:
         usage_candidate = None
         rate_candidate = None
@@ -456,6 +558,9 @@ def _usage_details(line: str, *, now: float | None = None) -> dict:
             details["evidence"].append("reset_at")
     if details["reset_at"] is None and details["window"] != "unknown":
         details["recovery_confidence"] = "estimated"
+    details["authority"] = _authority_for(
+        details["source"], details["recovery_confidence"], details["reset_source"], details["windows"]
+    )
     return details
 
 
@@ -509,6 +614,7 @@ def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -
         ),
         "detail": _safe_detail(line),
         "source": details["source"],
+        "authority": details["authority"],
         "evidence": details["evidence"],
         "window": details["window"],
         "windows": details["windows"],
@@ -527,8 +633,41 @@ def _fingerprint(role: str, code: str, line: str) -> str:
     return hashlib.sha256(f"{role}:{code}:{normalized}".encode()).hexdigest()[:16]
 
 
+SENSITIVE_FIELD_RE = re.compile(
+    r"^(?:authorization|cookie|x-api-key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|"
+    r"token|secret|password|credential|private[_ -]?key)$",
+    re.I,
+)
+
+
+def _is_sensitive_field(key: object) -> bool:
+    camel_case = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key))
+    normalized = re.sub(r"[^a-z0-9]+", "_", camel_case.lower()).strip("_")
+    if SENSITIVE_FIELD_RE.match(normalized):
+        return True
+    return bool(re.search(r"(?:^|_)(?:api_key|access_token|refresh_token|private_key|secret|password|credential)$", normalized))
+
+
+def _redact_structured(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            key: "[REDACTED]" if _is_sensitive_field(key) else _redact_structured(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_structured(item) for item in value]
+    return value
+
+
 def _safe_detail(line: str) -> str:
     detail = line.strip()
+    structured = _json_object(detail)
+    if structured is not None:
+        json_start = detail.find("{")
+        prefix = detail[:json_start].strip()
+        detail = " ".join(
+            part for part in (prefix, json.dumps(_redact_structured(structured), ensure_ascii=False, separators=(",", ":"))) if part
+        )
     detail = re.sub(r"https?://\S+", "[URL]", detail)
     detail = re.sub(r"(/Users/|/private/)[^ ]+", "[PATH]", detail)
     detail = re.sub(r"(?i)(authorization[\"']?\s*[:=]\s*[\"']?(?:bearer\s+)?)[^\s,;\"'}]+", r"\1[REDACTED]", detail)
@@ -920,6 +1059,9 @@ def _upsert_usage_watch(state: dict, event: dict, current: float) -> bool:
     if active:
         _, usage = active
         usage["last_seen_at"] = current
+        usage["source"] = event.get("source", usage.get("source", "stderr"))
+        usage["authority"] = event.get("authority", usage.get("authority", "local_log"))
+        usage["evidence"] = list(event.get("evidence", usage.get("evidence", [])))
         if event.get("reset_at"):
             usage["reset_at"] = event["reset_at"]
             usage["reset_source"] = event.get("reset_source")
@@ -942,6 +1084,9 @@ def _upsert_usage_watch(state: dict, event: dict, current: float) -> bool:
         "reset_at": event.get("reset_at"),
         "reset_source": event.get("reset_source"),
         "recovery_confidence": event.get("recovery_confidence"),
+        "source": event.get("source", "stderr"),
+        "authority": event.get("authority", "local_log"),
+        "evidence": list(event.get("evidence", [])),
         "window": event.get("window", "unknown"),
         "windows": list(event.get("windows", [])),
         "expires_at": _usage_watch_expiry(event, current),
@@ -961,7 +1106,7 @@ def _prune_alerted(state: dict, current: float) -> None:
 
 
 def _record_metric(state: dict, code: str, current: float) -> None:
-    metrics = state.setdefault("metrics", {"classified": {}, "last_event_at": None})
+    metrics = state.setdefault("metrics", {})
     classified = metrics.setdefault("classified", {})
     try:
         previous = int(classified.get(code, 0))
@@ -969,6 +1114,18 @@ def _record_metric(state: dict, code: str, current: float) -> None:
         previous = 0
     classified[code] = previous + 1
     metrics["last_event_at"] = datetime.fromtimestamp(current, timezone.utc).isoformat()
+
+
+def _record_diagnostic_observation(state: dict, line: str, role: str, code: str | None) -> None:
+    if not line or re.search(r"\btext\s*=", line, re.I) or not UNKNOWN_SIGNAL_RE.search(line):
+        return
+    metrics = state.setdefault("metrics", {})
+    metrics["diagnostic_lines"] = int(metrics.get("diagnostic_lines", 0) or 0) + 1
+    payload = _structured_error(line)
+    if payload is not None and _structured_category(payload, role) is None:
+        metrics["parse_failures"] = int(metrics.get("parse_failures", 0) or 0) + 1
+    if code is None:
+        metrics["unknown"] = int(metrics.get("unknown", 0) or 0) + 1
 
 
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
@@ -1019,6 +1176,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
             if DONE_RE.search(line) and state["pending"].get(role):
                 state["pending"][role].pop(0)
             code = classify_line(line, role=role)
+            _record_diagnostic_observation(state, line, role, code)
             if code:
                 _record_metric(state, code, current)
                 event = _usage_event(role, code, line, now=current) if code in RESOURCE_RECOVERY_CODES else {
@@ -1029,6 +1187,9 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     "observed_at": datetime.fromtimestamp(current, timezone.utc).isoformat(),
                     "fingerprint": _fingerprint(role, code, line),
                     "source": "stderr",
+                    "authority": "local_log",
+                    "confidence": "unknown",
+                    "evidence": [],
                     "message": f"[Roda 감지] {role} 봇에 {code} 문제가 발생했습니다. 확인이 필요합니다.",
                     "detail": _safe_detail(line),
                 }

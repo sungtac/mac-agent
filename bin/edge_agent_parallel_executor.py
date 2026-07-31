@@ -5,13 +5,21 @@ parallel mode and supply a provider callback; the default remains disabled.
 """
 from __future__ import annotations
 
+import os
 import subprocess
+import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Callable
 
 from edge_agent_parallel_locks import FileReservation, task_lock
 from edge_agent_parallel_worktree import ParallelTaskSpec, WorktreeManager, WorktreeManifest
+
+
+RESERVATION_HEARTBEAT_SECONDS = max(
+    1.0,
+    float(os.environ.get("EDGE_AGENT_RESERVATION_HEARTBEAT_SECONDS", "300")),
+)
 
 
 class ParallelExecutionDisabled(RuntimeError):
@@ -73,6 +81,16 @@ def _unexpected(changed: tuple[str, ...], declared: tuple[str, ...]) -> tuple[st
     return tuple(path for path in changed if not any(overlaps(path, target) for target in declared))
 
 
+def _heartbeat_loop(reservation: FileReservation, task_id: str, stop: threading.Event) -> None:
+    while not stop.wait(RESERVATION_HEARTBEAT_SECONDS):
+        try:
+            reservation.heartbeat(task_id)
+        except (OSError, ValueError):
+            # The provider result remains authoritative; audit will report a
+            # stale reservation if the registry cannot be refreshed.
+            continue
+
+
 class ParallelExecutor:
     def __init__(self, manager: WorktreeManager, *, parallel_enabled: bool = False):
         self.manager = manager
@@ -97,6 +115,14 @@ class ParallelExecutor:
             dependency_keys=spec.dependency_keys,
             owner=spec.owner,
         )
+        heartbeat_stop = threading.Event()
+        heartbeat_thread = threading.Thread(
+            target=_heartbeat_loop,
+            args=(reservation, spec.task_id, heartbeat_stop),
+            name=f"edge-agent-reservation-heartbeat-{spec.task_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
         event_key = f"{spec.task_id}::execution"
         try:
             with task_lock(spec.task_id, state_root=self.manager.state_root):
@@ -150,4 +176,6 @@ class ParallelExecutor:
                     self.manager.update(spec.task_id, state="failed", result=result.to_dict())
                     return result
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=min(RESERVATION_HEARTBEAT_SECONDS, 1.0))
             reservation.release(spec.task_id)
