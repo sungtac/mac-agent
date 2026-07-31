@@ -704,6 +704,19 @@ def _build_verify_prompt(original_request: str, codex_report: str) -> str:
     )
 
 
+# Small first step toward cross-bot calling (2026-07-31): claude has no
+# workspace-write sandbox of its own here (see _run_cli's "claude" branch —
+# no -s/--sandbox flag, just a plain -p call), so a coding task addressed to
+# claude is handed straight to codex, which already runs with
+# workspace-write. Deliberately NOT a verify loop like codex_verify_and_revise
+# — this is the smallest useful step (delegate, relay codex's own report)
+# before building a general "any bot may call any bot" mechanism, which needs
+# its own cycle/depth guards that don't exist yet.
+async def claude_delegates_to_codex(original_prompt: str, message, on_wait=None) -> str:
+    codex_report = await _run_cli("codex", original_prompt, on_wait=on_wait)
+    return f"🔧 (코덱스에게 위임한 결과)\n\n{codex_report}"
+
+
 async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -> str:
     codex_report = original_prompt
     last_claude_verdict = ""
@@ -874,6 +887,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             if ROLE == "codex" and _looks_like_coding_task(text):
                 reply = await codex_verify_and_revise(text, message, on_wait=_notify_waiting)
+            elif ROLE == "claude" and _looks_like_coding_task(text):
+                reply = await claude_delegates_to_codex(text, message, on_wait=_notify_waiting)
             else:
                 reply = await run_provider(text, on_wait=_notify_waiting)
         except Exception as exc:
