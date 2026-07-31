@@ -41,6 +41,7 @@ from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
+from agent_profile import render_agent_profile
 
 
 HOME = Path.home()
@@ -290,6 +291,10 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 
 def _load_identity_and_tone(role: str) -> str:
+    try:
+        return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{render_agent_profile(role)}\n\n"
+    except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
+        log(f"공통 agent profile 로드 실패, 구형 파일로 폴백: {type(exc).__name__}")
     identity_file = SCRIPT_DIR.parent / "config" / f"{role}-identity-and-tone.md"
     if identity_file.exists():
         try:

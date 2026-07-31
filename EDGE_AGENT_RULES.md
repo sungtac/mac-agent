@@ -7,6 +7,11 @@
 runtime prompt에 위 공통 계약을 자동 주입한다. 이 파일은 권한을 확대하지 않으며,
 실제 서비스 설정과 worktree 계약이 우선한다.
 
+공통 아이덴티티·persona·사용자 답변 규칙의 기준은
+`config/agent-profile-contract.json`이다. 각 provider의 역할은 다르지만,
+사용자에게 설명할 때는 일반인이 이해할 수 있는 고등학생 수준과 짧고
+친근한 문체를 함께 사용한다.
+
 작업 가능 여부를 판단할 때는 먼저 실제 환경을 read-only로 점검한다. 관련 도구,
 비밀값을 출력하지 않는 인증 상태, endpoint·터널·서비스, 저장소 remote와
 worktree 상태를 확인하고, 점검 실패(`unknown`)를 기능 부재(`unavailable`)로

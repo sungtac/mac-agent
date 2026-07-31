@@ -91,6 +91,10 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertNotIn("raw-token", detail)
         self.assertNotIn("raw-secret", detail)
 
+        normal_event = '{"request_id":"req-123","message":"completed; usage quota metadata"}'
+        self.assertIsNone(health._structured_error(normal_event))
+        self.assertIsNone(health.classify_line(normal_event, role="codex"))
+
     def test_unstructured_usage_event_keeps_local_log_authority(self):
         event = health._usage_event("codex", "usage_limited", "quota exceeded", now=100)
         self.assertEqual(event["source"], "stderr")

@@ -29,7 +29,7 @@ STATE_JSON="$(jq -n \
   --arg cwd "$CWD" \
   --arg prompt_hash "$PROMPT_HASH" \
   --arg updated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-  '{session_id:$session_id,cwd:$cwd,prompt_hash:$prompt_hash,kind:"coding",status:"gate_required",workflow_passed:false,updated_at:$updated_at}')"
+  '{session_id:$session_id,cwd:$cwd,prompt_hash:$prompt_hash,kind:"coding",status:"gate_required",workflow_passed:false,profile_contract_version:"1.0.0",profile_contract_sha256:"ce44fbdbd9b74da1c75384322499b5648237c9fd116ace3aefe722ae8117c57a",style_version:"plain-high-school-v1",default_profile:"claude.coordinator",updated_at:$updated_at}')"
 
 verify_task_state_write "$SESSION_ID" "$STATE_JSON" || exit 0
 

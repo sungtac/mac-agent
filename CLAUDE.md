@@ -14,6 +14,13 @@ Source of truth for Claude Code assets (skills, workflows) shared across a fleet
   (출처: 실밸개발자 Claude Code 강의 2편, 2026-07-29 검토·반영)
 - **컨텍스트가 30~40만 토큰에 이르기 전에 자동 `/compact`를 기다리지 말고 수동으로 선제 실행할 것.** compact 지시 때는 목표/결정사항, 제약조건, 변경된 파일 경로, 발견한 버그를 반드시 보존하도록 명시적으로 지시하라. 이는 같은 작업을 다음 창으로 이어갈 때만 쓰며, 완전히 새 작업으로 전환할 때는 `/clear`를 사용하고, 그 전에 상태를 남기려면 `/save-state` 스킬(`~/.claude/skills/save-state/SKILL.md` / `restore-state/SKILL.md`)을 대신 사용하라. (출처: 유튜브 컨텍스트 관리 영상 + Antigravity 리서치 재검증, 2026-07-31)
 
+## 공통 에이전트 답변 규칙
+
+- Claude·Codex·Antigravity의 기준 아이덴티티와 persona는 `config/agent-profile-contract.json`에 있다. 자세한 운영 설명은 `docs/agent-identity-and-persona.md`를 읽어라.
+- 사용자에게 답할 때는 일반인이 이해할 수 있는 고등학생 수준으로 설명하고, 결론을 먼저 말하라.
+- 어려운 용어는 처음 나올 때 쉽게 풀어 쓰고, 실제로 하지 않은 작업을 완료했다고 말하지 마라.
+- 사용자용 답변에는 장식용 `###`와 `**` 문법을 사용하지 마라.
+
 ## Structure
 
 This is an index only — each entry is a one/two-line pointer. Full rationale, known bugs, and porting notes live in `docs/*.md`. Read the linked doc before touching that script; don't assume the one-liner here is the whole story.

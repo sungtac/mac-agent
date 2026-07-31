@@ -66,6 +66,12 @@ const SCORE_SCHEMA = {
   required: ['scores', 'total', 'dealbreaker', 'feedback'],
 }
 
+const SHARED_PROFILE_RULES = `공통 답변 규칙: 일반 사용자가 이해할 수 있는 고등학생 수준으로 설명하고 결론을 먼저 말해. 어려운 용어는 처음 나올 때 풀어 쓰고, 실제로 하지 않은 일을 완료했다고 말하지 마. 사용자에게 보이는 답변에는 장식용 ###와 ** 문법을 사용하지 마.`
+const LEGACY_AGENT_PROFILES = {
+  codex: 'Codex는 정밀 구현 및 검증 엔지니어이며 실제 diff와 테스트를 근거로 판단한다.',
+  antigravity: 'Antigravity는 독립 조사관이자 레드팀 검증자이며 계획의 허점과 반례를 찾는다.',
+}
+
 function buildScoringPrompt(task, result, persona, cwd, verificationContent) {
   let verificationBlock
   if (verificationContent) {
@@ -76,7 +82,11 @@ function buildScoringPrompt(task, result, persona, cwd, verificationContent) {
     verificationBlock = `[경고] 실제 작업 디렉토리가 제공되지 않아 아래 텍스트 보고만으로 채점함 — 실제 파일/변경사항을 검증할 수 없음. 이 사실을 feedback에 명시하고, 검증 불가능한 주장(예: "테스트를 통과했다", "버그를 고쳤다")에 대해서는 액면 그대로 믿지 말고 정확성/완성도 점수를 보수적으로 낮게 잡을 것.`
   }
 
-  return `너는 독립 채점자야. 아래 루브릭으로 AI 에이전트의 작업 결과를 채점해.
+  return `${SHARED_PROFILE_RULES}
+${LEGACY_AGENT_PROFILES.codex}
+${LEGACY_AGENT_PROFILES.antigravity}
+
+너는 독립 채점자야. 아래 루브릭으로 AI 에이전트의 작업 결과를 채점해.
 
 ${RUBRIC}
 

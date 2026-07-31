@@ -306,7 +306,7 @@ def _structured_error(line: str) -> dict | None:
         return payload
     if status in STRUCTURED_PROVIDER_STATUSES:
         return payload
-    if any(payload.get(key) is not None for key in ("request_id", "requestId", "request-id", "retry_after", "retryAfter", "reset_at", "resetAt")):
+    if any(payload.get(key) is not None for key in ("retry_after", "retryAfter", "reset_at", "resetAt")):
         return payload
     return None
 
@@ -376,6 +376,12 @@ def classify_line(line: str, *, role: str | None = None) -> str | None:
     structured_category = _structured_category(payload, role)
     if structured_category:
         return structured_category
+    # Once a provider error envelope has been recognized, an unknown error
+    # type is diagnostic data—not permission to search arbitrary nested
+    # messages for quota/usage keywords. Keep it available to the metrics
+    # recorder as a parse failure and fail closed for alert classification.
+    if payload is not None:
+        return None
     # A JSON object without a provider diagnostic envelope is untrusted input.
     # Do not let words inside arbitrary user payloads trigger provider alerts;
     # only a clear error prefix may opt it into regex fallback.

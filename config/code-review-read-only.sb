@@ -4,3 +4,7 @@
 (deny file-write*)
 (allow file-write* (subpath "/tmp"))
 (allow file-write* (subpath "/private/tmp"))
+; Antigravity writes only provider runtime diagnostics here during review.
+; These paths are outside the repository and do not grant repository writes.
+(allow file-write* (subpath "/Users/edge_ai/.gemini/antigravity-cli/log"))
+(allow file-write* (subpath "/Users/edge_ai/.gemini/antigravity-cli/crashes"))

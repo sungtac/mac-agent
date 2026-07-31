@@ -55,6 +55,59 @@ const NANO_EVENT_RECORDER = `${MAC_AGENT_ROOT}/workflows/lib/nano-event-store.js
 const HARNESS_FILE_DEFAULT = `${MAC_AGENT_ROOT}/docs/codex-harness.md`
 const NANO_EVENT_FILE_DEFAULT = `${CLAUDE_HOME}/.claude/nano-gate-events.jsonl`
 
+// This is the self-contained Workflow snapshot of
+// config/agent-profile-contract.json. Workflow scripts cannot import local
+// modules, so the provider prompts carry the small immutable part of the
+// contract directly. Keep the version and wording synchronized with the
+// canonical JSON; source tests check the required role/persona names.
+const AGENT_PROFILE_VERSION = '1.0.0'
+const AGENT_PROFILE_CONTRACT_SHA256 = 'ce44fbdbd9b74da1c75384322499b5648237c9fd116ace3aefe722ae8117c57a'
+const COMMON_RESPONSE_STYLE = `공통 답변 규칙(plain-high-school-v1): 일반 사용자가 이해할 수 있는 고등학생 수준으로 설명하고, 결론을 먼저 말해. 어려운 용어는 처음 나올 때 풀어 쓰고, 짧은 문장과 문단을 사용해. 실제로 하지 않은 일을 완료했다고 말하지 마. 사용자에게 보이는 답변에는 장식용 ###와 ** 문법을 사용하지 마.`
+const WORKFLOW_PROFILE = Object.freeze({
+  claude: {
+    identity: '수석 오케스트레이터이자 아키텍트',
+    personas: {
+      planner: '요구사항, 범위, 완료 조건과 불확실한 부분을 실행 가능한 계획으로 정리해.',
+      coordinator: '작업을 독립 단위로 나누고 파일 충돌과 의존성을 확인해 실행 순서를 정해.',
+      communicator: '여러 에이전트의 결과를 합쳐 일반 사용자가 이해할 수 있는 결론과 다음 조치를 설명해.',
+    },
+  },
+  codex: {
+    identity: '정밀 구현 및 검증 엔지니어',
+    personas: {
+      'plan-reviewer': '계획의 누락, 파일 충돌, 잘못된 의존성, 테스트 공백을 찾아 근거를 적어.',
+      architect: '검토 결과를 반영해 실제 구현 순서, 통합 방법, 테스트와 완료 조건을 확정해.',
+      implementer: '확정된 계획과 허용된 파일 범위 안에서만 수정하고 실제 diff와 테스트를 확인해.',
+      'test-engineer': '작업 결과를 실행 가능한 테스트와 결정론적 검사로 확인하고 실패를 성공으로 포장하지 마.',
+      'code-reviewer': '실제 diff를 correctness, security, robustness, performance, maintainability 관점에서 독립적으로 검토해.',
+    },
+  },
+  antigravity: {
+    identity: '독립 조사관이자 레드팀 검증자',
+    personas: {
+      researcher: '저장소와 공식 자료를 조사하고 확인된 사실, 출처, 구현에 미치는 영향을 구분해 적어.',
+      'red-team': '계획이 실패할 조건과 반례를 적극적으로 찾고, 다른 에이전트의 결론을 전제로 삼지 마.',
+      auditor: '실제 변경사항과 검증 결과를 블라인드로 확인하고, 근거가 없는 통과 판정을 거부해.',
+    },
+  },
+})
+const WORKFLOW_PROFILE_STAGES = Object.freeze({
+  FullPromptify: 'claude.planner',
+  FullResearch: 'antigravity.researcher|antigravity.red-team',
+  FullPlan: 'claude.coordinator',
+  FullPlanReview: 'codex.plan-reviewer',
+  FullPlanRevise: 'codex.architect',
+  FullExecute: 'codex.implementer',
+  FullCodeReviewSkill: 'codex.code-reviewer|antigravity.auditor',
+  Light: 'claude.coordinator|codex.test-engineer',
+})
+
+function workflowProfile(role, persona) {
+  const profile = WORKFLOW_PROFILE[role]
+  if (!profile || !profile.personas[persona]) return `[profile 오류: ${role}/${persona}]`
+  return `[agent profile v${AGENT_PROFILE_VERSION}]\n${COMMON_RESPONSE_STYLE}\n영구 역할: ${profile.identity}\n현재 persona: ${persona}\n현재 역할 지침: ${profile.personas[persona]}`
+}
+
 // score-dispatch.sh는 읽기전용 채점/의견용(codex 또는 agy 모두 --sandbox
 // read-only 기본값). 실제 파일을 쓰는 유일한 지점(전체 트랙 실행 단계)만
 // codex-execute-dispatch.sh(-s workspace-write)를 쓴다 — 절대 섞어 쓰지 말 것.
@@ -326,7 +379,7 @@ const LIGHT_EXEC_SCHEMA = {
 async function lightExecute(task, context, cwd, feedback) {
   const feedbackBlock = feedback ? `\n\n[이전 라운드 코덱스 피드백 — 반영해서 수정해]\n${feedback}` : ''
   return agent(
-    `아래 작업을 실제로 수행해(Edit/Write/Bash 등 필요한 도구 다 써도 됨). 작업 디렉토리: ${cwd}\n\n[작업]\n${task}\n\n[저장소 컨텍스트]\n${context.contextText}${feedbackBlock}\n\n다 하고 나서 한 일을 summary에 간결하게 적어(파일별로 뭘 했는지).`,
+    `${workflowProfile('claude', 'coordinator')}\n\n아래 작업을 실제로 수행해(Edit/Write/Bash 등 필요한 도구 다 써도 됨). 작업 디렉토리: ${cwd}\n\n[작업]\n${task}\n\n[저장소 컨텍스트]\n${context.contextText}${feedbackBlock}\n\n다 하고 나서 한 일을 summary에 간결하게 적어(파일별로 뭘 했는지).`,
     { phase: 'Light', label: 'light-execute', schema: LIGHT_EXEC_SCHEMA, agentType: 'general-purpose' }
   )
 }
@@ -344,7 +397,7 @@ const LIGHT_EVAL_SCHEMA = {
 }
 
 function buildLightEvalPrompt(task, context, summary, realDiff) {
-  return `너는 독립 채점자야. 이건 경량 트랙 작업(파일 5개 이하, 되돌리기 쉬움, 구조·보안·외부공개 영향 없는 작업으로 사전 분류됨)이라 정식 사전 스펙이 없어. 아래 절차로 해:
+  return `${workflowProfile('codex', 'test-engineer')}\n\n너는 독립 채점자야. 이건 경량 트랙 작업(파일 5개 이하, 되돌리기 쉬움, 구조·보안·외부공개 영향 없는 작업으로 사전 분류됨)이라 정식 사전 스펙이 없어. 아래 절차로 해:
 
 1. [원 작업]과 [저장소 컨텍스트]만 보고, 채점 전에 네가 판단하는 완료조건을 completionCriteria에 먼저 명시해(채점표를 사후에 유리하게 짜맞추지 말고, 원 작업 자체에서 합리적으로 도출되는 기준).
 2. [실제 변경사항](git diff — 이게 진실이고, [에이전트 보고]는 참고만)을 그 completionCriteria에 대조해서 100점 만점으로 채점(total).
@@ -388,7 +441,9 @@ const PROMPTIFY_SCHEMA = {
 }
 
 function buildPromptifyPrompt(task, context) {
-  return `너는 작업 오케스트레이터인 클로드야. 사용자의 원 지시문을 조사·계획·구현 에이전트가 오해하지 않도록 실행 가능한 프롬프트로 정규화해. 아직 파일을 수정하지 말고, 사실을 새로 지어내지 마.
+  return `${workflowProfile('claude', 'planner')}
+
+너는 작업 오케스트레이터인 클로드야. 사용자의 원 지시문을 조사·계획·구현 에이전트가 오해하지 않도록 실행 가능한 프롬프트로 정규화해. 아직 파일을 수정하지 말고, 사실을 새로 지어내지 마.
 
 [사용자 원 지시문]
 ${task}
@@ -439,7 +494,10 @@ const RESEARCH_SCHEMA = {
 }
 
 function buildResearchPrompt(promptified, context, focus) {
-  return `너는 Antigravity 조사 에이전트야. 코드를 수정하거나 계획을 확정하지 말고, 아래 작업을 ${focus.label} 관점에서 독립적으로 조사해. 다른 조사 에이전트의 결과는 보지 않아. 저장소 컨텍스트에 없는 사실은 추측하지 말고, 외부 자료를 확인했다면 evidence.source에 출처를 적어.
+  const persona = focus.id === 'risks-tests' ? 'red-team' : 'researcher'
+  return `${workflowProfile('antigravity', persona)}
+
+너는 Antigravity 조사 에이전트야. 코드를 수정하거나 계획을 확정하지 말고, 아래 작업을 ${focus.label} 관점에서 독립적으로 조사해. 다른 조사 에이전트의 결과는 보지 않아. 저장소 컨텍스트에 없는 사실은 추측하지 말고, 외부 자료를 확인했다면 evidence.source에 출처를 적어.
 
 [정규화된 작업 프롬프트]
 ${promptified.normalizedPrompt}
@@ -497,7 +555,9 @@ const CLAUDE_PLAN_SCHEMA = {
 }
 
 function buildClaudeParallelPlanPrompt(task, context, promptified, research) {
-  return `너는 클로드 계획 담당자야. Antigravity의 병렬 조사 결과를 통합해 Codex가 구현할 코딩 계획을 작성해. 계획은 실제 파일 충돌을 피하면서 독립적으로 수행할 수 있는 작업과 선행 의존성을 명확히 해야 해. 아직 파일을 수정하지 마.
+  return `${workflowProfile('claude', 'coordinator')}
+
+너는 클로드 계획 담당자야. Antigravity의 병렬 조사 결과를 통합해 Codex가 구현할 코딩 계획을 작성해. 계획은 실제 파일 충돌을 피하면서 독립적으로 수행할 수 있는 작업과 선행 의존성을 명확히 해야 해. 아직 파일을 수정하지 마.
 
 [사용자 원 지시문]
 ${task}
@@ -549,7 +609,9 @@ const PLAN_REVIEW_SCHEMA = {
 }
 
 function buildCodexPlanReviewPrompt(task, context, promptified, claudePlan, focus) {
-  return `너는 Codex의 독립 계획 검토자야. 아직 코드를 수정하지 말고, 클로드가 만든 병렬 코딩 계획을 ${focus} 관점에서 검토해. 다른 Codex 검토자의 결과는 보지 않아.
+  return `${workflowProfile('codex', 'plan-reviewer')}
+
+너는 Codex의 독립 계획 검토자야. 아직 코드를 수정하지 말고, 클로드가 만든 병렬 코딩 계획을 ${focus} 관점에서 검토해. 다른 Codex 검토자의 결과는 보지 않아.
 
 [원 지시문]
 ${task}
@@ -594,7 +656,9 @@ const REVISED_PLAN_SCHEMA = {
 }
 
 function buildCodexRevisedPlanPrompt(task, context, promptified, claudePlan, planReviews) {
-  return `너는 실제 코딩을 담당할 Codex야. 클로드의 병렬 코딩 계획과 두 개의 독립적인 Codex 계획 검토 결과를 객관적으로 검토해 최종 구현 계획을 수정해. 아직 이 호출에서는 코드를 수정하지 말고 계획만 반환해.
+  return `${workflowProfile('codex', 'architect')}
+
+너는 실제 코딩을 담당할 Codex야. 클로드의 병렬 코딩 계획과 두 개의 독립적인 Codex 계획 검토 결과를 객관적으로 검토해 최종 구현 계획을 수정해. 아직 이 호출에서는 코드를 수정하지 말고 계획만 반환해.
 
 [원 지시문]
 ${task}
@@ -664,7 +728,7 @@ JSON으로만: {"appended":true,"rulesAdded":[""]}`,
 // ---------- 전체 트랙: 실행 (코덱스, 쓰기 가능) ----------
 
 async function fullExecute(cwd, instruction, context, harnessFile) {
-  const prompt = `아래 지시대로 실제로 파일을 수정/생성해줘. 작업 디렉토리: ${cwd}\n\n[저장소 컨텍스트]\n${context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 뭘 했는지 짧게 설명해.`
+  const prompt = `${workflowProfile('codex', 'implementer')}\n\n아래 지시대로 실제로 파일을 수정/생성해줘. 작업 디렉토리: ${cwd}\n\n[저장소 컨텍스트]\n${context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 뭘 했는지 짧게 설명해.`
   return dispatchWithRetry(
     () => agent(buildExecuteDispatchInstruction(cwd, prompt, harnessFile), {
       phase: 'FullExecute',
@@ -706,8 +770,8 @@ const CODE_REVIEW_SCHEMA = {
   required: ['hasBlockingIssue', 'issues', 'checks'],
 }
 
-function buildReviewPrompt(task, context, realDiff) {
-  return `너는 code-review 스킬 계약을 수행하는 독립 코드 리뷰어야. 점수는 매기지 않는다. Codex는 1차 리뷰어이고 Antigravity는 독립 승인 검증자다. 실제 변경사항(git diff)에서 correctness/security/robustness/performance/maintainability 문제를 찾고, 다른 리뷰어의 의견은 보지 않는다(블라인드).
+function buildReviewPrompt(task, context, realDiff, role = 'codex', persona = 'code-reviewer') {
+  return `${workflowProfile(role, persona)}\n\n너는 code-review 스킬 계약을 수행하는 독립 코드 리뷰어야. 점수는 매기지 않는다. Codex는 1차 리뷰어이고 Antigravity는 독립 승인 검증자다. 실제 변경사항(git diff)에서 correctness/security/robustness/performance/maintainability 문제를 찾고, 다른 리뷰어의 의견은 보지 않는다(블라인드).
 
 [원 작업]
 ${task}
@@ -725,7 +789,7 @@ JSON으로만: {"hasBlockingIssue":false,"issues":[{"description":"","blocking":
 }
 
 async function claudeReviewDiff(task, context, realDiff) {
-  return agent(buildReviewPrompt(task, context, realDiff), {
+  return agent(buildReviewPrompt(task, context, realDiff, 'claude', 'communicator'), {
     phase: 'FullCodeReviewSkill',
     label: 'code-review-skill-claude',
     schema: CODE_REVIEW_SCHEMA,
@@ -734,7 +798,7 @@ async function claudeReviewDiff(task, context, realDiff) {
 }
 
 async function codexReviewDiff(task, context, realDiff, isRetry) {
-  return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff), null, 'review'), {
+  return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff, 'codex', 'code-reviewer'), null, 'review'), {
     phase: 'FullCodeReviewSkill',
     label: isRetry ? 'code-review-skill-codex-retry' : 'code-review-skill-codex',
     schema: CODE_REVIEW_SCHEMA,
@@ -742,7 +806,7 @@ async function codexReviewDiff(task, context, realDiff, isRetry) {
 }
 
 async function antigravityReviewDiff(task, context, realDiff, isRetry) {
-  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff), null, 'review'), {
+  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff, 'antigravity', 'auditor'), null, 'review'), {
     phase: 'FullCodeReviewSkill',
     label: isRetry ? 'code-review-skill-antigravity-retry' : 'code-review-skill-antigravity',
     schema: CODE_REVIEW_SCHEMA,
@@ -933,6 +997,7 @@ async function recordNanoEvent(eventFile, event) {
 
 async function nanoLightValidate(task, step, context, realDiff) {
   const prompt = [
+    workflowProfile('codex', 'test-engineer'),
     '너는 나노 스텝의 독립 light 검증자야. 파일을 수정하지 말고, 아래 실제 diff와 완료조건만 검토해. 점수는 매기지 않는다. 변경이 완료조건을 충족하고 명백한 문법/연동 결함이 없으면 hasBlockingIssue=false, 그렇지 않으면 실제 근거와 함께 blocking=true 이슈를 적어. 제공된 diff 밖의 사실은 추측하지 마.',
     '',
     '[원 작업]', task,
@@ -1457,7 +1522,7 @@ if (tier === 'full' && !finalVerdict) {
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     log(`[전체] ${round}라운드: code-review 스킬 발동 — Codex/Antigravity 독립 코드리뷰...`)
     const [codexReview, antigravityReview] = await parallel([
-      () => codexReviewDiff(task, context, realDiff, false),
+      () => dispatchWithRetry((isRetry) => codexReviewDiff(task, context, realDiff, isRetry), 'Codex 코드리뷰'),
       () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry), '안티그래비티 코드리뷰'),
     ])
 
@@ -1469,21 +1534,29 @@ if (tier === 'full' && !finalVerdict) {
     // 패턴은 null도 undefined도 false로 평가돼 "리뷰어가 이슈 없다고 답했다"와
     // "리뷰어 호출 자체가 실패했다"를 구분 못하고 후자를 조용히 통과시켜버렸다
     // — 리뷰가 아예 안 됐는데 통과 판정이 나가는 fail-open 버그. 둘 중
-    // 하나라도 null이면 정상 판정으로 진행하지 말고 즉시 실패로 처리해 재시도.
-    if (!codexReview || !antigravityReview) {
-      const whichFailed = [!codexReview && 'codex', !antigravityReview && 'antigravity'].filter(Boolean).join(', ')
+    // 하나라도 null이거나 dispatchFailed envelope이면 정상 판정으로 진행하지
+    // 말고 즉시 실패로 처리해 재시도.
+    const failedReviews = [
+      ['codex', codexReview],
+      ['antigravity', antigravityReview],
+    ].filter(([, result]) => !result || isDispatchFailure(result))
+    if (failedReviews.length) {
+      const whichFailed = failedReviews.map(([source]) => source).join(', ')
+      const dispatchReasons = failedReviews
+        .map(([source, result]) => result?.dispatchFailureReason ? `${source}: ${result.dispatchFailureReason}` : `${source}: 결과 없음`)
+        .join('; ')
       if (round === MAX_ROUNDS) {
         finalVerdict = {
           passed: false,
           tier: 'full',
           round,
           error: 'code_review_failed',
-          reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 코드리뷰(${whichFailed})가 계속 실패함(세션 한도 초과 등 일시적 오류일 가능성 높음) — 리뷰가 실제로 수행되지 못한 상태이니 통과로 간주하면 안 됨. 사용자에게 물어야 함.`,
+          reason: `전체 트랙 최대 ${MAX_ROUNDS}라운드 안에 코드리뷰(${whichFailed})가 계속 실패함: ${dispatchReasons}(세션 한도 초과 등 일시적 오류일 가능성 높음) — 리뷰가 실제로 수행되지 못한 상태이니 통과로 간주하면 안 됨. 사용자에게 물어야 함.`,
           needsUserDecision: true,
         }
         break
       }
-      log(`[전체] ${round}라운드: 코드리뷰 실패(${whichFailed}) — 통과 처리하지 않고 재시도`)
+      log(`[전체] ${round}라운드: 코드리뷰 실패(${whichFailed}) — ${dispatchReasons}; 통과·자동수정 처리하지 않고 재시도`)
       continue
     }
 
@@ -1670,7 +1743,18 @@ async function finalizeAndReturn() {
     },
     historyFile
   )
-  return { finalVerdict, tier, history, reviewPersistence }
+  return {
+    finalVerdict,
+    tier,
+    history,
+    reviewPersistence,
+    profileContract: {
+      version: AGENT_PROFILE_VERSION,
+      contractSha256: AGENT_PROFILE_CONTRACT_SHA256,
+      style: 'plain-high-school-v1',
+      stages: WORKFLOW_PROFILE_STAGES,
+    },
+  }
 }
 
 return await finalizeAndReturn()

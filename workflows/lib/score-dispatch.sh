@@ -105,6 +105,7 @@ V2_ENVELOPES = {
         "hasBlockingIssue": True,
         "issues": [{"description": reason, "blocking": True}],
         "notes": reason,
+        "checks": [{"name": "review-dispatch", "status": "error", "evidence": reason}],
     },
 }
 envelope = V2_ENVELOPES.get(kind, V2_ENVELOPES["review"])
@@ -149,6 +150,21 @@ truncate_output() {
   printf '%s' "$1" | head -c 2000
 }
 
+check_agy_review_log_dirs() {
+  local log_root="${AGY_LOG_ROOT:-${HOME:-}/.gemini/antigravity-cli}"
+  local directory
+  for directory in "$log_root/log" "$log_root/crashes"; do
+    # Missing directories are left to the provider, which may create them
+    # itself. If they already exist, catch a definite permission/type error
+    # before starting a review process that can only return logging noise.
+    if [ -e "$directory" ] && { [ ! -d "$directory" ] || [ ! -w "$directory" ]; }; then
+      printf '%s' "agy 로그 디렉터리에 쓰기 권한이 없거나 디렉터리가 아님: $directory"
+      return 1
+    fi
+  done
+  return 0
+}
+
 case "$TOOL" in
   codex)
     if [ ! -x "$CODEX_BIN" ]; then
@@ -161,6 +177,10 @@ case "$TOOL" in
   agy)
     if [ ! -x "$AGY_BIN" ]; then
       FAILURE_ENVELOPE "agy 실행파일을 찾을 수 없음: $AGY_BIN (AGY_BIN 환경변수로 경로를 override할 수 있음)"
+      exit 0
+    fi
+    if ! AGY_LOG_PREFLIGHT="$(check_agy_review_log_dirs)"; then
+      FAILURE_ENVELOPE "$AGY_LOG_PREFLIGHT"
       exit 0
     fi
     RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT EDGE_AGENT_PROVIDER_MODE=review "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"

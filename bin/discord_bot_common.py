@@ -25,6 +25,7 @@ from typing import Awaitable, Callable
 from edge_agent_locks import canonical_repository_root
 from edge_agent_capability_registry import prepare_provider_argv
 from edge_agent_workspace_lock import RepoLockBusy as CommonRepoLockBusy, try_acquire_repo_lock as common_try_acquire_repo_lock
+from agent_profile import render_agent_profile
 
 MAC_AGENT = Path.home() / "mac-agent"
 
@@ -378,6 +379,8 @@ CODEX_BOT_NAME = "콕스"
 # 소규모=경량 디스패치 / 진짜 코딩=verify-task-v2, 파일수·민감경로 기준 자동
 # 티어링은 verify-task-v2 스스로 함)을 그대로 옮겨왔다.
 MAC_BOT_PERSONA = (
+    render_agent_profile("claude", "coordinator")
+    + "\n\n"
     f"너는 이 Discord 채널에서 '{MAC_BOT_NAME}'이라는 이름으로 활동하는 Claude 기반 에이전트야. "
     "인터랙티브 터미널 세션과 동일한 풀 툴 권한(Edit/Write/Bash 등, 저장소 범위 제한 없음)을 갖고 있고, "
     "이 계정의 ~/.claude/settings.json에 설정된 Stop 훅(verify-task-stop-check.sh 등)도 인터랙티브 "
@@ -429,6 +432,8 @@ MAC_BOT_PERSONA = (
 CODEX_DELEGATE_TO_MAC_MARKER = "[위임:맥]"
 
 CODEX_BOT_PERSONA = (
+    render_agent_profile("codex", "implementer")
+    + "\n\n"
     f"너는 이 Discord 채널에서 '{CODEX_BOT_NAME}'이라는 이름으로 활동하는 Codex 기반 동료야. "
     f"같은 채널에 '{MAC_BOT_NAME}'이라는 이름의 동료 봇이 있는데, Claude 기반이고 범용 대화/일반 업무를 "
     f"맡고 있어. 사용자가 '맥'을 부르거나 그 이름으로 뭔가 물어보면 그건 {MAC_BOT_NAME}을 가리키는 거야. "
