@@ -53,6 +53,10 @@ ERROR_PATTERNS = (
     ("empty_response", re.compile(r"빈 응답|empty response", re.I)),
     ("execution_error", re.compile(r"실행 오류|실행에 실패|처리 실패|exit=\d+", re.I)),
 )
+# This code was emitted by older monitor versions for an intentional
+# ``stop_running()``/launchd restart cycle. Do not resurrect it from a state
+# file after upgrading to the lifecycle-only handling above.
+IGNORED_RETRY_CODES = frozenset({"polling_stopped"})
 # ``run_polling 종료`` is emitted after the bot deliberately calls
 # ``stop_running()`` (for example after a Conflict burst) so launchd's
 # KeepAlive can restart it. It is a lifecycle message, not proof that the
@@ -222,7 +226,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("repair_results", {})
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
-    alerts.extend(retry_events)
+    alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
     for role, target in TARGETS.items():
         path = Path(target["log"])
         try:
