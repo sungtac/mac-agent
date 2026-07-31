@@ -36,6 +36,7 @@ from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
 from edge_agent_session_bridge import start_session, update_session, bounded_context
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
+from edge_agent_parallel_locks import repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
 
 
@@ -179,12 +180,18 @@ def _create_task_worktree(task_id: str) -> Path:
         return target
     if not (CODEX_SOURCE_REPO / ".git").exists():
         raise RuntimeError(f"Telegram 기준 저장소가 없습니다: {CODEX_SOURCE_REPO}")
-    completed = subprocess.run(
-        ["/usr/bin/git", "-C", str(CODEX_SOURCE_REPO), "worktree", "add", "--detach", str(target), "HEAD"],
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    # Use the same repository lifecycle lock as the provider-neutral
+    # WorktreeManager. Telegram retains its compatibility worktree policy,
+    # but its git worktree mutation must not race terminal/parallel creation.
+    with repository_lifecycle_lock(CODEX_SOURCE_REPO):
+        if target.exists():
+            return target
+        completed = subprocess.run(
+            ["/usr/bin/git", "-C", str(CODEX_SOURCE_REPO), "worktree", "add", "--detach", str(target), "HEAD"],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "git worktree add 실패").strip()
         raise RuntimeError(f"Telegram 작업 worktree 생성 실패: {detail[-500:]}")
