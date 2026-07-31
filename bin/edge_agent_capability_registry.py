@@ -7,6 +7,8 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 
+from edge_agent_capability_preflight import render_prompt
+
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
 CORE_SKILL = "edge-agent-behavior"
@@ -66,7 +68,13 @@ def resolve(prompt: str, *, max_chars: int = 6000, include_core: bool = True) ->
     return CapabilityResolution(tuple(selected), "".join(sections), tuple(omitted))
 
 
-def prepare_provider_argv(provider: str, args: list[str], *, max_chars: int = 6000) -> list[str]:
+def prepare_provider_argv(
+    provider: str,
+    args: list[str],
+    *,
+    max_chars: int = 6000,
+    workdir: str | Path | None = None,
+) -> list[str]:
     """Inject the common context into a known provider prompt argv slot.
 
     Only the prompt value is replaced; provider flags and cwd arguments are
@@ -88,11 +96,14 @@ def prepare_provider_argv(provider: str, args: list[str], *, max_chars: int = 60
     if prompt_index is None:
         return list(args)
     original = args[prompt_index]
+    preflight = render_prompt(workdir)
     context = resolve(original, max_chars=max_chars).context
     if not context:
-        return list(args)
+        context = ""
     prepared = list(args)
-    prepared[prompt_index] = f"{context}\n\n[공통 가능 기능 요청]\n{original}"
+    blocks = [block for block in (preflight, context, "[공통 가능 기능 요청]") if block]
+    envelope = "\n\n".join(blocks)
+    prepared[prompt_index] = f"{envelope}\n{original}"
     return prepared
 
 

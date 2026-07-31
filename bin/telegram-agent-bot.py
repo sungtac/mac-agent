@@ -30,6 +30,7 @@ from telegram.error import Conflict, NetworkError, TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
 from edge_agent_locks import canonical_repository_root
+from edge_agent_capability_preflight import render_prompt
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
 from edge_agent_reflection import write_reflection, write_worktree_metadata
 from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
@@ -209,6 +210,7 @@ def _auth_source(role: str) -> str:
 def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
     skill_context = build_skill_context(prompt)
     skill_block = f"\n{skill_context}\n" if skill_context else ""
+    capability_block = f"\n{render_prompt(_provider_workspace(ROLE))}\n"
     session_block = ""
     if ACTIVE_LOGICAL_SESSION_ID:
         try:
@@ -218,6 +220,7 @@ def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
     context = (
         f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
         "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
+        f"{capability_block}"
         f"{skill_block}"
         f"{session_block}"
     )

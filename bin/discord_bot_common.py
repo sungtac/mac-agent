@@ -626,7 +626,7 @@ async def run_provider_attempt(
     """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
-    args = prepare_provider_argv(provider, args)
+    args = prepare_provider_argv(provider, args, workdir=cwd)
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,

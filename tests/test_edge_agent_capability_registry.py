@@ -27,9 +27,10 @@ class CapabilityRegistryTests(unittest.TestCase):
 
     def test_provider_argv_preserves_flags_and_replaces_only_prompt(self):
         args = ["claude", "-p", "최저가 제품 추천해줘", "--output-format", "text"]
-        prepared = prepare_provider_argv("claude", args)
+        prepared = prepare_provider_argv("claude", args, workdir="/tmp")
         self.assertEqual(prepared[0:2], ["claude", "-p"])
         self.assertIn("product_research", prepared[2])
+        self.assertIn("Capability-first preflight", prepared[2])
         self.assertEqual(prepared[-2:], ["--output-format", "text"])
 
 

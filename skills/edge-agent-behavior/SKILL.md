@@ -22,6 +22,24 @@ description: Provider-neutral behavior contract for safe, goal-driven agent work
 삭제, reset, 외부 전송, 병합 충돌처럼 되돌리기 어렵거나 권한이 필요한 경우에는
 추측하지 말고 중단하거나 사용자 확인을 요청한다.
 
+### Capability-first 원칙
+
+- “할 수 없다”고 말하기 전에 실제 환경을 먼저 점검한다. 관련 실행파일,
+  비밀값을 노출하지 않는 인증 상태, endpoint·터널·서비스, 저장소 remote,
+  worktree 상태를 read-only로 확인한다.
+- 관측 결과는 `available / unavailable / unknown`으로 구분한다. 점검하지
+  못했거나 점검이 실패한 상태(`unknown`)를 기능 부재로 단정하지 않는다.
+- 기능이 실제로 있고 요청 범위 안의 작업이면 가능한 read-only·구현 작업을
+  먼저 진행한다. 사용자에게는 권한·외부 상태·비용·파괴적 변경·추론 불가능한
+  결정을 요청한다.
+- capability 확인은 권한 부여가 아니다. 로그인된 CLI나 공개 endpoint가
+  발견되어도 계정 변경, 외부 전송, 서비스 재시작, 유료 provider 실행은 기존
+  승인 규칙을 따른다.
+
+실행 진입점은 가능한 경우 `bin/edge_agent_capability_preflight.py`의
+read-only 관측을 프롬프트에 주입한다. preflight 자체가 실패하면 상태를
+`unknown`으로 취급하고, 그 사실을 근거로 불가능 판정을 내리지 않는다.
+
 ## 변경 원칙
 
 - 요청을 충족하는 최소 변경만 한다.

@@ -10,6 +10,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 SANDBOX="$ROOT/bin/edge-agent-provider-sandbox.sh"
 CAPABILITY_RESOLVER="$ROOT/bin/edge_agent_capability_registry.py"
+CAPABILITY_PREFLIGHT="$ROOT/bin/edge_agent_capability_preflight.py"
 SESSION_BRIDGE="$ROOT/bin/edge_agent_session_bridge.py"
 
 [ -f "$PROMPT_FILE" ] || { echo "prompt file not found: $PROMPT_FILE" >&2; exit 66; }
@@ -24,7 +25,11 @@ if [ -z "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_STARTED=1
 fi
 
+CAPABILITY_PREFLIGHT_CONTEXT="$(python3 "$CAPABILITY_PREFLIGHT" --workdir "$WORKDIR" --format prompt 2>/dev/null || printf '%s' '[Capability-first preflight unavailable: treat capabilities as unknown and verify before declaring unavailable.]')"
 PROMPT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$(cat "$PROMPT_FILE")")"
+PROMPT="$CAPABILITY_PREFLIGHT_CONTEXT
+
+$PROMPT"
 if [ -n "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_CONTEXT="$(python3 "$SESSION_BRIDGE" context "$EDGE_AGENT_LOGICAL_SESSION_ID")"
   PROMPT="$SESSION_CONTEXT\n\n[터미널 작업 요청]\n$(cat "$PROMPT_FILE")"
