@@ -60,6 +60,43 @@ class RodaHealthMonitorTests(unittest.TestCase):
             health.TARGETS = original_targets
             health._service_running = original_running
 
+    def test_isolated_end_to_end_detection_repair_and_recovery_alert(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            log = root / "x.log"
+            state_file = root / "state.json"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original = {
+                "TARGETS": health.TARGETS,
+                "STATE_FILE": health.STATE_FILE,
+                "_service_running": health._service_running,
+                "_run_codex_repair": health._run_codex_repair,
+                "_send_alert": health._send_alert,
+            }
+            alerts = []
+            repairs = []
+            health.TARGETS = {"x": {"label": "present", "log": log}}
+            health.STATE_FILE = state_file
+            health._service_running = lambda label: True
+            health._run_codex_repair = lambda event: repairs.append(event["code"]) or "Codex 자동 수정·main 병합·x 서비스 재기동 완료."
+            health._send_alert = alerts.append
+            try:
+                state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}, "recovery_watch": {}}
+                health._process_cycle(state)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 실패 빈 응답\n")
+                health._process_cycle(state)
+                self.assertEqual(repairs, ["empty_response"])
+                self.assertEqual(len(alerts), 1)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
+                health._process_cycle(state)
+                self.assertEqual(len(alerts), 2)
+                self.assertIn("재처리 성공", alerts[1])
+            finally:
+                for name, value in original.items():
+                    setattr(health, name, value)
+
     def test_drops_legacy_polling_stopped_retry_without_dropping_real_failures(self):
         original = health.TARGETS
         health.TARGETS = {}
