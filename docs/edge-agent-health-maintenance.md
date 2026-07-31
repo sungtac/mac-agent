@@ -33,3 +33,15 @@ python3 bin/edge-agent-telegram-restart.py antigravity --reason "maintenance"
 
 Roda health monitor는 planned marker가 유효한 동안 감지를 억제하고, marker가
 없는 경우에도 90초 grace period가 지난 뒤에만 `service_down` 자동복구를 시작한다.
+
+Telegram 작업공간 생성은 repository lifecycle lock 충돌 시 기본 5회, 1초
+간격으로 비동기 재시도한다. 환경 변수로 조정할 수 있다.
+
+```text
+TELEGRAM_AGENT_WORKTREE_LOCK_RETRIES
+TELEGRAM_AGENT_WORKTREE_LOCK_RETRY_SECONDS
+```
+
+Provider가 outer handler의 `처리 실패` 로그 전에 종료하더라도 `exit=<code>`와
+`empty response`를 완료 이벤트로 인식해 pending 요청이 불필요하게 no-response
+상태로 남지 않게 한다.
