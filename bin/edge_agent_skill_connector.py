@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
+CORE_SKILL = "edge-agent-behavior"
 TRIGGERS = {
     "quota_resume": ("quota", "rate_limit", "429", "토큰 한도", "재개", "fallback"),
     "product_research": ("추천제품", "제품 추천", "최저가", "가성비", "쿠폰", "가격비교", "구매 링크"),
@@ -22,7 +23,7 @@ def select_skill_ids(prompt: str) -> list[str]:
 
 
 def build_skill_context(prompt: str, *, max_chars: int = 6000) -> str:
-    selected = select_skill_ids(prompt)
+    selected = [CORE_SKILL, *select_skill_ids(prompt)]
     sections: list[str] = []
     remaining = max_chars
     for skill in selected:
@@ -31,6 +32,9 @@ def build_skill_context(prompt: str, *, max_chars: int = 6000) -> str:
             continue
         text = path.read_text(encoding="utf-8")
         chunk = f"\n[Edge Agent skill: {skill}]\n{text}\n"
-        sections.append(chunk[:remaining])
-        remaining -= len(chunk)
+        # Reserve room for request-specific skills even when callers use a
+        # small prompt budget. The core contract is intentionally concise.
+        limit = min(remaining, 700) if skill == CORE_SKILL else remaining
+        sections.append(chunk[:limit])
+        remaining -= min(len(chunk), limit)
     return "".join(sections)

@@ -7,6 +7,11 @@ from edge_agent_skill_connector import build_skill_context, select_skill_ids
 
 
 class SkillConnectorTests(unittest.TestCase):
+    def test_always_includes_provider_neutral_behavior_contract(self):
+        context = build_skill_context("간단한 상태 확인", max_chars=6000)
+        self.assertIn("edge-agent-behavior", context)
+        self.assertIn("Success criteria", context)
+
     def test_selects_domain_skill_without_external_access(self):
         self.assertIn("product_research", select_skill_ids("최저가 제품 추천해줘"))
         self.assertIn("calendar", select_skill_ids("내일 일정 추가"))
