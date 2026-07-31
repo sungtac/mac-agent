@@ -24,6 +24,7 @@ from typing import Awaitable, Callable
 
 from edge_agent_locks import canonical_repository_root
 from edge_agent_capability_registry import prepare_provider_argv
+from edge_agent_workspace_lock import RepoLockBusy as CommonRepoLockBusy, try_acquire_repo_lock as common_try_acquire_repo_lock
 
 MAC_AGENT = Path.home() / "mac-agent"
 
@@ -706,21 +707,11 @@ def try_acquire_repo_lock(resolved_path: str):
         except RepoLockBusy:
             await message.channel.send("다른 실행이 이미 이 저장소를 건드리고 있습니다 — 끝나면 다시 시도해주세요.")
     """
-    REPO_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = _repo_lock_path(resolved_path)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except BlockingIOError:
-        os.close(fd)
-        raise RepoLockBusy(resolved_path)
-    try:
-        yield
-    finally:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        finally:
-            os.close(fd)
+        with common_try_acquire_repo_lock(resolved_path):
+            yield
+    except CommonRepoLockBusy as exc:
+        raise RepoLockBusy(resolved_path) from exc
 
 
 CROSS_BOT_CONTEXT_LIMIT = 20

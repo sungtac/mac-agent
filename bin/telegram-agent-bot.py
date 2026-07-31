@@ -36,6 +36,7 @@ from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
 from edge_agent_session_bridge import start_session, update_session, bounded_context
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
+from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
 
 
 HOME = Path.home()
@@ -606,32 +607,15 @@ def _workspace_lock_path(resolved_path: str) -> Path:
 
 @contextlib.asynccontextmanager
 async def acquire_workspace_lock(resolved_path: str, on_wait=None):
-    _WORKSPACE_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    lock_path = _workspace_lock_path(resolved_path)
-    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-    acquired = False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            acquired = True
-        except BlockingIOError:
-            if on_wait is not None:
-                await on_wait()
-            deadline = time.monotonic() + WORKSPACE_LOCK_WAIT_SECONDS
-            while not acquired:
-                if time.monotonic() >= deadline:
-                    raise WorkspaceLockBusy(resolved_path)
-                await asyncio.sleep(2)
-                try:
-                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    acquired = True
-                except BlockingIOError:
-                    continue
-        yield
-    finally:
-        if acquired:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        os.close(fd)
+        async with acquire_repo_lock(
+            resolved_path,
+            wait_seconds=WORKSPACE_LOCK_WAIT_SECONDS,
+            on_wait=on_wait,
+        ):
+            yield
+    except RepoLockBusy as exc:
+        raise WorkspaceLockBusy(resolved_path) from exc
 
 
 async def _run_cli(
