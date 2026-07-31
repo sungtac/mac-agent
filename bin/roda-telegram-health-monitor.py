@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import json
 import os
 import re
@@ -13,6 +14,11 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+
+try:
+    from edge_agent_parallel_locks import repository_lifecycle_lock
+except ImportError:  # system-Python test loader; launchd uses the repo bin path
+    repository_lifecycle_lock = None
 
 
 HOME = Path.home()
@@ -135,7 +141,7 @@ def _send_alert(text: str) -> None:
                 raise RuntimeError(f"Roda alert send failed: HTTP {response.status}")
 
 
-def _run_codex_repair(event: dict) -> str:
+def _run_codex_repair_impl(event: dict) -> str:
     if not CODEX_DIAGNOSIS_ENABLED:
         return "Codex 자동 진단이 비활성화되어 있습니다."
     if not CODEX_BIN.is_file() or not (SOURCE_REPO / ".git").exists():
@@ -146,12 +152,15 @@ def _run_codex_repair(event: dict) -> str:
     worktree = REPAIR_ROOT / fingerprint
     if not worktree.exists():
         REPAIR_ROOT.mkdir(parents=True, exist_ok=True)
-        created = subprocess.run(
-            ["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "add", "--detach", str(worktree), "HEAD"],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        lifecycle = repository_lifecycle_lock(SOURCE_REPO) if repository_lifecycle_lock else contextlib.nullcontext()
+        with lifecycle:
+            if not worktree.exists():
+                created = subprocess.run(
+                    ["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "add", "--detach", str(worktree), "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
         if created.returncode != 0:
             return "Codex 진단 worktree 생성에 실패했습니다."
     prompt = (
@@ -215,6 +224,50 @@ def _run_codex_repair(event: dict) -> str:
     if restart.returncode != 0:
         return f"Codex 수정 병합 완료, 서비스 재기동 실패: {restart.stderr[-500:]}"
     return f"Codex 자동 수정·main 병합·{event['role']} 서비스 재기동 완료.\n{summary}"
+
+
+def _run_codex_repair(event: dict) -> str:
+    """Run repair and persist one provider-neutral Roda→Codex handoff."""
+    fingerprint = str(event["fingerprint"])
+    session_id = f"sess-roda-{fingerprint}"
+    session_error = ""
+    try:
+        from edge_agent_session_bridge import start_session, update_session
+
+        session_id = start_session(
+            task_id=f"roda-{fingerprint}",
+            channel="internal",
+            provider="codex",
+            owner="roda-health",
+            workspace=str(SOURCE_REPO),
+            worktree=str(REPAIR_ROOT / fingerprint),
+        )
+    except (ImportError, OSError, ValueError) as exc:
+        # Health detection must remain operational on the system Python used
+        # by legacy tests; session persistence is an additive handoff layer.
+        session_error = f"세션 기록 생략: {type(exc).__name__}"
+
+    diagnosis = _run_codex_repair_impl(event)
+    succeeded = _repair_succeeded(diagnosis)
+    try:
+        from edge_agent_session_bridge import update_session
+
+        update_session(
+            session_id,
+            status="succeeded" if succeeded else "failed",
+            summary=diagnosis[-8000:],
+            next_action=("문제 봇 재처리 결과 확인" if succeeded else "Codex 진단·수정 실패 원인 확인"),
+            workspace=str(SOURCE_REPO),
+            worktree=str(REPAIR_ROOT / fingerprint),
+            verification={"repair_succeeded": succeeded, "target_role": event["role"], "detection_code": event["code"]},
+            event_type="roda_repair_completed",
+        )
+    except (ImportError, FileNotFoundError, OSError, ValueError) as exc:
+        session_error = f"세션 갱신 생략: {type(exc).__name__}"
+    suffix = f"\n논리 세션: {session_id}"
+    if session_error:
+        suffix += f" ({session_error})"
+    return diagnosis + suffix
 
 
 def _repair_succeeded(diagnosis: str) -> bool:
