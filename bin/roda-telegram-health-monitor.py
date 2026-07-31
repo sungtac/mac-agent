@@ -217,6 +217,30 @@ def _run_codex_repair(event: dict) -> str:
     return f"Codex 자동 수정·main 병합·{event['role']} 서비스 재기동 완료.\n{summary}"
 
 
+def _repair_succeeded(diagnosis: str) -> bool:
+    return "Codex 자동 수정·main 병합" in diagnosis and "서비스 재기동 완료" in diagnosis
+
+
+def _format_repair_result(event: dict, diagnosis: str) -> str:
+    succeeded = _repair_succeeded(diagnosis)
+    status = "성공" if succeeded else "미완료/실패"
+    message = (
+        f"[Codex 자동복구 결과]\n"
+        f"대상: {event['role']}\n"
+        f"상태: {status}\n"
+        f"감지 코드: {event['code']}\n\n"
+        f"{diagnosis}"
+    )
+    if succeeded:
+        message += (
+            f"\n\n@{BOT_USERNAMES.get(event['role'], event['role'])} "
+            "Codex가 수정한 내용을 확인하고 이전 문제를 다시 처리하세요."
+        )
+    else:
+        message += "\n\n자동 수정이 완료되지 않았으므로 문제 봇에 재처리를 지시하지 않습니다."
+    return message
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -310,9 +334,17 @@ def _process_cycle(state: dict) -> None:
             fingerprint = str(event["fingerprint"])
             diagnosis = state["repair_results"].get(fingerprint)
             if diagnosis is None:
+                try:
+                    _send_alert(
+                        f"{event['message']}\n세부: {event['detail']}\n\n"
+                        "[Codex 자동복구 시작]\n원인 분석과 안전 검증을 진행합니다."
+                    )
+                except Exception as exc:
+                    print(f"Roda detection alert delivery failed: {type(exc).__name__}: {exc}")
+            if diagnosis is None:
                 diagnosis = _run_codex_repair(event)
                 state["repair_results"][fingerprint] = diagnosis
-                if "자동 수정·main 병합" in diagnosis and "서비스 재기동 완료" in diagnosis:
+                if _repair_succeeded(diagnosis):
                     state["recovery_watch"][fingerprint] = {
                         "role": event["role"],
                         "status": "awaiting_reprocess",
@@ -321,12 +353,7 @@ def _process_cycle(state: dict) -> None:
                         "notified": False,
                     }
                 _save_state(state)
-            alert = (
-                f"{event['message']}\n세부: {event['detail']}\n\n"
-                f"[Codex 자동 원인 분석·개선]\n{diagnosis}\n\n"
-                f"@{BOT_USERNAMES.get(event['role'], event['role'])} Codex가 수정한 내용을 확인하고 이전 문제를 다시 처리하세요."
-            )
-            _send_alert(alert)
+            _send_alert(_format_repair_result(event, diagnosis))
         except Exception as exc:
             state.setdefault("delivery_retry", []).append(event)
             _save_state(state)

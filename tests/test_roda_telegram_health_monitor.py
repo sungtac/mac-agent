@@ -87,15 +87,27 @@ class RodaHealthMonitorTests(unittest.TestCase):
                     handle.write("처리 실패 빈 응답\n")
                 health._process_cycle(state)
                 self.assertEqual(repairs, ["empty_response"])
-                self.assertEqual(len(alerts), 1)
+                self.assertEqual(len(alerts), 2)
+                self.assertIn("Codex 자동복구 시작", alerts[0])
+                self.assertIn("Codex 자동복구 결과", alerts[1])
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
                 health._process_cycle(state)
-                self.assertEqual(len(alerts), 2)
-                self.assertIn("재처리 성공", alerts[1])
+                self.assertEqual(len(alerts), 3)
+                self.assertIn("재처리 성공", alerts[2])
             finally:
                 for name, value in original.items():
                     setattr(health, name, value)
+
+    def test_repair_result_only_instructs_reprocess_after_success(self):
+        event = {"role": "claude", "code": "service_down"}
+        failed = health._format_repair_result(event, "Codex 진단 실행 실패: TimeoutExpired")
+        self.assertIn("미완료/실패", failed)
+        self.assertIn("지시하지 않습니다", failed)
+        self.assertNotIn("@edgeai_stk_bot", failed)
+        succeeded = health._format_repair_result(event, "Codex 자동 수정·main 병합·claude 서비스 재기동 완료.")
+        self.assertIn("@edgeai_stk_bot", succeeded)
+        self.assertIn("다시 처리하세요", succeeded)
 
     def test_drops_legacy_polling_stopped_retry_without_dropping_real_failures(self):
         original = health.TARGETS
