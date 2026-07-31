@@ -41,8 +41,8 @@ function eventFor({ taskId, stepId, tier, changedFiles, agents }) {
 
 function reviewersFor(tier) {
   if (tier === 'light') return ['codex']
-  if (tier === 'mid') return ['claude']
-  return ['claude', 'antigravity']
+  if (tier === 'mid') return ['codex']
+  return ['codex', 'antigravity']
 }
 
 test('저위험 파일럿은 light 검증과 단일 이벤트 기록으로 통과한다', () => {
@@ -58,13 +58,13 @@ test('저위험 파일럿은 light 검증과 단일 이벤트 기록으로 통�
 test('경계 파일 수는 mid로 승격되고 통합 검증 담당자가 바뀐다', () => {
   const tier = decideRiskTier({ stepFileCount: 4, cumulativeFileCount: 1 })
   assert.equal(tier, 'mid')
-  assert.deepEqual(reviewersFor(tier), ['claude'])
+  assert.deepEqual(reviewersFor(tier), ['codex'])
 })
 
-test('민감 경로는 full로 승격되고 Claude+Antigravity 이중 검증을 요구한다', () => {
+test('민감 경로는 full로 승격되고 Codex+Antigravity 이중 검증을 요구한다', () => {
   const tier = decideRiskTier({ stepFileCount: 1, cumulativeFileCount: 1, sensitivePath: true })
   assert.equal(tier, 'full')
-  assert.deepEqual(reviewersFor(tier), ['claude', 'antigravity'])
+  assert.deepEqual(reviewersFor(tier), ['codex', 'antigravity'])
 })
 
 test('재시작 파일럿은 통과 이벤트를 발견하고 실행을 건너뛴다', () => {

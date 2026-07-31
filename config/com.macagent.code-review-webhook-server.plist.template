@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.macagent.code-review-webhook-server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/node</string>
+    <string>/Users/edge_ai/mac-agent/bin/code-review-webhook-server.js</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>CODE_REVIEW_WEBHOOK_HOST</key>
+    <string>127.0.0.1</string>
+    <key>CODE_REVIEW_WEBHOOK_PORT</key>
+    <string>8787</string>
+    <key>CODE_REVIEW_WEBHOOK_SECRET_FILE</key>
+    <string>/Users/edge_ai/.edge-agent/secrets/code-review-webhook.secret</string>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>/Users/edge_ai/.edge-agent/logs/code-review-webhook.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/edge_ai/.edge-agent/logs/code-review-webhook.err.log</string>
+</dict>
+</plist>

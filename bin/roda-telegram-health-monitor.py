@@ -77,7 +77,10 @@ IGNORED_RETRY_CODES = frozenset({"polling_stopped"})
 # KeepAlive can restart it. It is a lifecycle message, not proof that the
 # service stayed down; persistent failure is covered by ``service_down``.
 START_RE = re.compile(r"처리 시작")
-DONE_RE = re.compile(r"처리 완료|처리 실패")
+# A provider can terminate before the outer handler gets a chance to emit
+# "처리 실패". The provider exit line is terminal evidence too; otherwise a
+# failed CLI can remain pending until the no-response timeout.
+DONE_RE = re.compile(r"처리 완료|처리 실패|exit=\d+|empty response")
 
 
 def _atomic_write(path: Path, payload: dict) -> None:

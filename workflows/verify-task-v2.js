@@ -17,8 +17,8 @@ export const meta = {
 // 아니라 구현이다. 결정의 "왜"를 다시 읽지 않고 이 파일만 고치지 말 것.
 //
 // 2026-07-27 개정: 전체(full) 트랙이 채점표 기반(안티 스펙+고정/동적 rubric+
-// 90점)에서 하네스 기반 정성 검토(코덱스 자체계획→클로드+안티 블라인드
-// 비평→코덱스 취합/개선→실행→클로드+안티 무점수 듀얼 코드리뷰)로 재설계됨.
+// 90점)에서 하네스 기반 정성 검토(코덱스 자체계획→독립 리뷰어+안티
+// 블라인드 비평→코덱스 취합/개선→실행→코덱스+안티 무점수 듀얼 코드리뷰)로 재설계됨.
 // 경량(light) 트랙은 전혀 안 건드림. docs/verify-task-v2-design.md의
 // "## 개정" 섹션에 왜 바뀌었는지 기록돼 있음 — 여기서 다시 설명 안 함.
 //
@@ -46,6 +46,7 @@ async function preflightCheck() {
 // env override를 시도하면 스크립트 자체가 로드 시점에 죽는다. 경로가 다른
 // 환경에서 필요하면 args로 받아서 써야지 process.env로 받으면 안 된다.
 const MAC_AGENT_ROOT = '/Users/edge_ai/mac-agent'
+const CODE_REVIEW_STORE = MAC_AGENT_ROOT + '/workflows/lib/code-review-store.js'
 const CLAUDE_HOME = '/Users/edge_ai'
 const SCORE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/score-dispatch.sh`
 const CODEX_EXECUTE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/codex-execute-dispatch.sh`
@@ -190,8 +191,9 @@ const REAL_DIFF_SCHEMA = {
     content: { type: 'string' },
     filesChanged: { type: 'array', items: { type: 'string' } },
     sensitivePath: { type: 'boolean' },
+    headSha: { type: 'string' },
   },
-  required: ['content', 'filesChanged', 'sensitivePath'],
+  required: ['content', 'filesChanged', 'sensitivePath', 'headSha'],
 }
 
 // 주의: `git diff HEAD`는 아직 add된 적 없는 untracked 신규 파일을 절대 보여주지
@@ -203,7 +205,7 @@ const REAL_DIFF_SCHEMA = {
 // 상태를 건드리지 않고 읽기만 한다.
 async function gatherRealDiff(cwd) {
   const gathered = await agent(
-    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.\n\n마지막 응답은 반드시 다른 설명 없이 아래 세 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"content":"위 명령의 원문 출력","filesChanged":["실제 변경 경로"],"sensitivePath":false}`,
+    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git rev-parse HEAD ---'; git rev-parse HEAD; echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git rev-parse HEAD의 결과를 headSha 문자열에 넣어. git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.\n\n마지막 응답은 반드시 다른 설명 없이 아래 네 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"content":"위 명령의 원문 출력","filesChanged":["실제 변경 경로"],"sensitivePath":false,"headSha":"현재 HEAD SHA"}`,
     { phase: 'Light', label: 'gather-real-diff', schema: REAL_DIFF_SCHEMA }
   )
   return gathered
@@ -212,6 +214,91 @@ async function gatherRealDiff(cwd) {
 function mechanicalTierViolated(realDiff) {
   const fileCount = (realDiff?.filesChanged || []).length
   return fileCount > 3 || !!realDiff?.sensitivePath
+}
+
+const REVIEW_PERSIST_SCHEMA = {
+  type: 'object',
+  properties: {
+    persisted: { type: 'boolean' },
+    outcome: { type: 'string' },
+    reportPath: { type: 'string' },
+    error: { type: 'string' },
+  },
+  required: ['persisted'],
+}
+
+function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
+  if (!realDiff?.headSha) return null
+  const reviewRounds = history.filter((entry) => entry.codexReview || entry.antigravityReview)
+  const lastRound = reviewRounds[reviewRounds.length - 1] || {}
+  const reviewResults = [
+    ['codex', lastRound.codexReview],
+    ['antigravity', lastRound.antigravityReview],
+  ]
+  const findings = []
+  for (const [source, result] of reviewResults) {
+    for (const [index, issue] of (result?.issues || []).entries()) {
+      findings.push({
+        id: source + '-' + (index + 1),
+        severity: issue.blocking ? 'blocker' : 'medium',
+        category: 'correctness',
+        location: (realDiff.filesChanged || []).join(', ') || 'diff',
+        title: source + ' review finding',
+        evidence: String(issue.description || 'No description provided'),
+        remediation: 'Review and resolve this finding before approval.',
+        verified: source === 'antigravity',
+      })
+    }
+  }
+  const checks = reviewResults.map(([source, result]) => ({
+    name: source + '-review',
+    status: !result ? 'error' : result.hasBlockingIssue ? 'failed' : 'passed',
+  }))
+  checks.push({ name: 'verify-task-v2-verdict', status: verdict?.passed ? 'passed' : 'failed' })
+  const approvalEligible = tier === 'full' &&
+    !!verdict?.passed &&
+    !!lastRound.codexReview &&
+    !!lastRound.antigravityReview &&
+    !lastRound.codexReview.hasBlockingIssue &&
+    !lastRound.antigravityReview.hasBlockingIssue
+  const report = {
+    schema_version: 'edge_agent.code_review_report.v1',
+    review_id: 'verify-task-v2-' + stableNanoTaskId(task, cwd),
+    status: approvalEligible ? 'AI_APPROVED' : verdict?.needsUserDecision ? 'ESCALATED' : 'CHANGES_REQUIRED',
+    target: {
+      scope: 'diff',
+      head_sha: realDiff.headSha,
+      paths: realDiff.filesChanged || [],
+    },
+    findings,
+    checks,
+  }
+  if (approvalEligible) {
+    report.approval = {
+      provider: 'antigravity',
+      reviewed_head_sha: realDiff.headSha,
+      decision_reason: 'Codex review and independent Antigravity verification passed on the same SHA.',
+    }
+  }
+  return report
+}
+
+async function persistReviewReport(report) {
+  if (!report) return { persisted: false, error: 'review report target SHA is missing' }
+  const reportJson = JSON.stringify(report)
+  return agent(
+    [
+      'Bash로 mktemp /tmp/code-review-report-XXXXXX.json 을 실행해 임시 파일 경로를 얻어.',
+      '반드시 Read 툴로 그 임시 파일을 한 번 읽은 뒤 Write 툴로 아래 JSON을 글자 하나 바꾸지 않고 저장해.',
+      'Bash로 node ' + CODE_REVIEW_STORE + ' --record <임시 파일 경로> 를 실행해.',
+      'stdout JSON의 outcome과 reportPath를 그대로 반환하고, 저장이 성공했으면 persisted=true로 답해.',
+      '임시 파일은 마지막에 삭제해. 외부 전송이나 merge는 하지 마.',
+      '',
+      '[리뷰 보고서 JSON]',
+      reportJson,
+    ].join('\n'),
+    { phase: 'FullReview', label: 'persist-code-review-report', schema: REVIEW_PERSIST_SCHEMA, agentType: 'general-purpose' }
+  )
 }
 
 // ---------- 경량 트랙 (2026-07-27 개정에서 손 안 댐 — 그대로 유지) ----------
@@ -473,7 +560,7 @@ async function fullExecute(cwd, instruction, context, harnessFile) {
   )
 }
 
-// ---------- 전체 트랙: 코드 리뷰 (클로드+안티그래비티 블라인드, 무점수) ----------
+// ---------- 전체 트랙: 코드 리뷰 (코덱스+안티그래비티 블라인드, 무점수) ----------
 
 const CODE_REVIEW_SCHEMA = {
   type: 'object',
@@ -515,6 +602,14 @@ async function claudeReviewDiff(task, context, realDiff) {
     label: 'review-claude',
     schema: CODE_REVIEW_SCHEMA,
     agentType: 'general-purpose',
+  })
+}
+
+async function codexReviewDiff(task, context, realDiff, isRetry) {
+  return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff), null, 'review'), {
+    phase: 'FullReview',
+    label: isRetry ? 'review-codex-retry' : 'review-codex',
+    schema: CODE_REVIEW_SCHEMA,
   })
 }
 
@@ -732,20 +827,20 @@ async function nanoLightValidate(task, step, context, realDiff) {
 async function nanoIntegrationValidate(task, context, realDiff, tier) {
   if (tier === 'light') return { ok: true, issues: [], reviewers: ['codex'] }
   if (tier === 'mid') {
-    const review = await claudeReviewDiff(task, context, realDiff)
+    const review = await codexReviewDiff(task, context, realDiff, false)
     if (!review) return { ok: false, reason: 'mid 통합 리뷰어가 결과를 반환하지 않음' }
-    return { ok: !review.hasBlockingIssue, issues: (review.issues || []).map((issue) => ({ ...issue, source: 'claude' })), reviewers: ['claude'] }
+    return { ok: !review.hasBlockingIssue, issues: (review.issues || []).map((issue) => ({ ...issue, source: 'codex' })), reviewers: ['codex'] }
   }
-  const [claudeReview, antigravityReview] = await parallel([
-    () => claudeReviewDiff(task, context, realDiff),
+  const [codexReview, antigravityReview] = await parallel([
+    () => codexReviewDiff(task, context, realDiff, false),
     () => antigravityReviewDiff(task, context, realDiff, false),
   ])
-  if (!claudeReview || !antigravityReview) return { ok: false, reason: 'full 통합 리뷰어 중 하나 이상이 결과를 반환하지 않음' }
+  if (!codexReview || !antigravityReview) return { ok: false, reason: 'full 통합 리뷰어 중 하나 이상이 결과를 반환하지 않음' }
   const issues = [
-    ...(claudeReview.issues || []).map((issue) => ({ ...issue, source: 'claude' })),
+    ...(codexReview.issues || []).map((issue) => ({ ...issue, source: 'codex' })),
     ...(antigravityReview.issues || []).map((issue) => ({ ...issue, source: 'antigravity' })),
   ]
-  return { ok: !claudeReview.hasBlockingIssue && !antigravityReview.hasBlockingIssue, issues, reviewers: ['claude', 'antigravity'] }
+  return { ok: !codexReview.hasBlockingIssue && !antigravityReview.hasBlockingIssue, issues, reviewers: ['codex', 'antigravity'] }
 }
 
 // Workflow 스크립트는 Date.now()/argless new Date()를 못 쓴다(resume 재현성이
@@ -1152,7 +1247,7 @@ if (tier === 'full' && !finalVerdict) {
     // 빈 배열 폴백한다 — agent()가 실패해 null을 반환하면(세션 한도 초과 등 일시적
     // 오류) 코덱스는 "클로드/안티그래비티 둘 다 이슈를 못 찾았다"고 오인하고 자기
     // 계획을 검증 없이 그대로 밀어붙이게 된다. 정확히 같은 버그 클래스가 아래 FullReview
-    // 라운드 루프(claudeReview/antigravityReview)에서는 2026-07-28 실측 후 이미 고쳐져
+    // 라운드 루프(codexReview/antigravityReview)에서는 2026-07-28 실측 후 이미 고쳐져
     // 있었는데, 이 앞단(Critique)에는 그 수정이 전이되지 않았었다 — 여기서도 동일하게
     // null을 "이슈 없음"이 아니라 "비평 자체가 실패함"으로 명시 처리한다.
     if (!claudeCritique || !antigravityCritique) {
@@ -1196,23 +1291,23 @@ if (tier === 'full' && !finalVerdict) {
   }
 
   for (let round = 1; round <= MAX_ROUNDS; round++) {
-    log(`[전체] ${round}라운드: 클로드/안티그래비티 블라인드 코드리뷰(무점수)...`)
-    const [claudeReview, antigravityReview] = await parallel([
-      () => claudeReviewDiff(task, context, realDiff),
+    log(`[전체] ${round}라운드: 코덱스/안티그래비티 블라인드 코드리뷰(무점수)...`)
+    const [codexReview, antigravityReview] = await parallel([
+      () => codexReviewDiff(task, context, realDiff, false),
       () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry), '안티그래비티 코드리뷰'),
     ])
 
-    history.push({ tier: 'full', round, claudeReview, antigravityReview })
+    history.push({ tier: 'full', round, codexReview, antigravityReview })
 
     // 실측(2026-07-28, discord-bot의 verify-task-v2-retry 테스트 중 계정
-    // 세션 한도 초과로 재현됨): claudeReview/antigravityReview 둘 다 agent()가
+    // 세션 한도 초과로 재현됨): codexReview/antigravityReview 둘 다 agent()가
     // null을 반환할 수 있는데(터미널 API 오류 등), 아래 `!x?.hasBlockingIssue`
     // 패턴은 null도 undefined도 false로 평가돼 "리뷰어가 이슈 없다고 답했다"와
     // "리뷰어 호출 자체가 실패했다"를 구분 못하고 후자를 조용히 통과시켜버렸다
     // — 리뷰가 아예 안 됐는데 통과 판정이 나가는 fail-open 버그. 둘 중
     // 하나라도 null이면 정상 판정으로 진행하지 말고 즉시 실패로 처리해 재시도.
-    if (!claudeReview || !antigravityReview) {
-      const whichFailed = [!claudeReview && 'claude', !antigravityReview && 'antigravity'].filter(Boolean).join(', ')
+    if (!codexReview || !antigravityReview) {
+      const whichFailed = [!codexReview && 'codex', !antigravityReview && 'antigravity'].filter(Boolean).join(', ')
       if (round === MAX_ROUNDS) {
         finalVerdict = {
           passed: false,
@@ -1229,7 +1324,7 @@ if (tier === 'full' && !finalVerdict) {
     }
 
     const combinedIssues = [
-      ...(claudeReview?.issues || []).map((i) => ({ ...i, source: 'claude' })),
+      ...(codexReview?.issues || []).map((i) => ({ ...i, source: 'codex' })),
       ...(antigravityReview?.issues || []).map((i) => ({ ...i, source: 'antigravity' })),
     ]
 
@@ -1242,7 +1337,7 @@ if (tier === 'full' && !finalVerdict) {
       harnessRulesAddedCount += harnessResultPost?.rulesAdded?.length || 0
     }
 
-    const passed = !claudeReview?.hasBlockingIssue && !antigravityReview?.hasBlockingIssue
+    const passed = !codexReview?.hasBlockingIssue && !antigravityReview?.hasBlockingIssue
     if (passed) {
       finalVerdict = { passed: true, tier: 'full', round, wasEscapeHatch: !!baseline }
       log(`[전체] ${round}라운드에서 통과 (블로킹 이슈 없음)`)
@@ -1365,6 +1460,21 @@ async function finalizeAndReturn() {
     )
   }
 
+  let reviewPersistence = null
+  if (tier === 'full') {
+    const reviewReport = buildReviewReport(task, cwd, tier, realDiff, finalVerdict, history)
+    reviewPersistence = await persistReviewReport(reviewReport)
+    if (finalVerdict?.passed && !reviewPersistence?.persisted) {
+      finalVerdict = {
+        ...finalVerdict,
+        passed: false,
+        error: 'review_persistence_failed',
+        needsUserDecision: true,
+        reason: '코드 리뷰 결과 저장에 실패하여 AI_APPROVED를 발행하지 않음.',
+      }
+    }
+  }
+
   log('히스토리 저장 중...')
   await appendHistory(
     {
@@ -1381,10 +1491,11 @@ async function finalizeAndReturn() {
       rulesAddedToHarness: tier === 'full' ? harnessRulesAddedCount : null,
       nanoMode: NANO_MODE,
       nanoStepsCompleted: NANO_MODE ? history.length : null,
+      reviewReportPersisted: reviewPersistence?.persisted ?? null,
     },
     historyFile
   )
-  return { finalVerdict, tier, history }
+  return { finalVerdict, tier, history, reviewPersistence }
 }
 
 return await finalizeAndReturn()

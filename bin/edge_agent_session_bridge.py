@@ -80,6 +80,14 @@ def update_session(session_id: str, *, status: str, summary: str = "",
     store.save(session, event_type=event_type, payload={"status": session.status.value})
 
 
+def bind_native_session(logical_session_id: str, *, provider: str, native_session_id: str) -> None:
+    """Bind a provider-native session to the current logical handoff record."""
+    store = _store()
+    session = store.load(logical_session_id)
+    session.bind_native_session(provider, native_session_id)
+    store.save(session, event_type="native_session_bound", payload={"provider": provider})
+
+
 def bounded_context(session_id: str) -> str:
     return _store().bounded_context(session_id)
 

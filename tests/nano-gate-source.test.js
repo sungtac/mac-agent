@@ -44,7 +44,13 @@ test('재시작 시 이미 통과한 step은 재실행하지 않고 재사용한
 test('위험도 결과에 따라 light/mid/full 통합검증이 선택된다', () => {
   assert.match(source, /if \(tier === 'light'\) return \{ ok: true/)
   assert.match(source, /if \(tier === 'mid'\)/)
-  assert.match(source, /return \{ ok: !claudeReview\.hasBlockingIssue && !antigravityReview\.hasBlockingIssue/)
+  assert.match(source, /return \{ ok: !codexReview\.hasBlockingIssue && !antigravityReview\.hasBlockingIssue/)
+})
+
+test('코드 리뷰 역할은 Codex 1차 리뷰와 Antigravity 독립 검증으로 고정된다', () => {
+  assert.match(source, /async function codexReviewDiff\(/)
+  assert.match(source, /buildScoreDispatchInstruction\('codex'/)
+  assert.match(source, /reviewers: \['codex', 'antigravity'\]/)
 })
 
 test('headless Write 계약을 지키도록 임시 dispatch 파일을 먼저 Read한다', () => {
@@ -55,7 +61,13 @@ test('headless Write 계약을 지키도록 임시 dispatch 파일을 먼저 Rea
 
 test('컨텍스트/실제 diff 수집은 모든 StructuredOutput 필드를 명시한다', () => {
   assert.match(source, /\{"cwdExists":true,"contextText":"수집한 사실","intendedFiles":\["예상 경로"\],"sensitivePath":false\}/)
-  assert.match(source, /\{"content":"위 명령의 원문 출력","filesChanged":\["실제 변경 경로"\],"sensitivePath":false\}/)
+  assert.match(source, /\{"content":"위 명령의 원문 출력","filesChanged":\["실제 변경 경로"\],"sensitivePath":false,"headSha":"현재 HEAD SHA"\}/)
+})
+
+test('full 리뷰는 SHA 귀속 보고서를 저장하고 저장 실패 시 승인하지 않는다', () => {
+  assert.match(source, /const CODE_REVIEW_STORE = MAC_AGENT_ROOT/)
+  assert.match(source, /async function persistReviewReport\(report\)/)
+  assert.match(source, /error: 'review_persistence_failed'/)
 })
 
 test('나노 이벤트 기록도 임시 파일 Read 후 Write하고 light 검토 필드를 고정한다', () => {

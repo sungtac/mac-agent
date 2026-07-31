@@ -1,0 +1,10 @@
+{
+  "schema": "edge_agent.code_review_repositories.v1",
+  "repositories": {
+    "sungtac/mac-agent": {
+      "repository_root": "$HOME/mac-agent",
+      "enabled": true,
+      "isolated": true
+    }
+  }
+}

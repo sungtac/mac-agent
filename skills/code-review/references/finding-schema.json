@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://edge-agent.local/schemas/code-review-report.v1.json",
+  "title": "Edge Agent Code Review Report",
+  "type": "object",
+  "required": ["schema_version", "review_id", "status", "target", "findings", "checks"],
+  "properties": {
+    "schema_version": {"const": "edge_agent.code_review_report.v1"},
+    "review_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["REVIEWED", "AI_APPROVED", "CHANGES_REQUIRED", "ESCALATED", "SUPERSEDED"]},
+    "target": {
+      "type": "object",
+      "required": ["scope", "head_sha"],
+      "properties": {
+        "scope": {"enum": ["diff", "files", "module", "repo", "snippet"]},
+        "head_sha": {"type": "string", "minLength": 1},
+        "base_sha": {"type": "string"},
+        "paths": {"type": "array", "items": {"type": "string"}},
+        "source": {"type": "string"}
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "category", "location", "title", "evidence", "remediation"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "severity": {"enum": ["blocker", "high", "medium", "low", "nit"]},
+          "category": {"enum": ["correctness", "security", "performance", "robustness", "maintainability", "tooling", "scope"]},
+          "location": {"type": "string", "minLength": 1},
+          "title": {"type": "string", "minLength": 1},
+          "evidence": {"type": "string", "minLength": 1},
+          "remediation": {"type": "string", "minLength": 1},
+          "confidence": {"enum": ["high", "medium", "low"]},
+          "verified": {"type": "boolean"}
+        }
+      }
+    },
+    "checks": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "status"],
+        "properties": {
+          "name": {"type": "string", "minLength": 1},
+          "status": {"enum": ["passed", "failed", "not_run", "error"]},
+          "evidence_ref": {"type": "string"}
+        }
+      }
+    },
+    "approval": {
+      "type": "object",
+      "required": ["provider", "reviewed_head_sha", "decision_reason"],
+      "properties": {
+        "provider": {"enum": ["antigravity", "claude", "codex"]},
+        "reviewed_head_sha": {"type": "string", "minLength": 1},
+        "decision_reason": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

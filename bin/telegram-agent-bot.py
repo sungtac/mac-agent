@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import json
 import os
 import re
 import signal
@@ -20,6 +21,7 @@ import sys
 import time
 import traceback
 import unicodedata
+import uuid
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,10 +36,10 @@ from edge_agent_capability_preflight import render_prompt
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
 from edge_agent_reflection import write_reflection, write_worktree_metadata
 from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
-from edge_agent_session_bridge import start_session, update_session, bounded_context
+from edge_agent_session_bridge import bind_native_session, start_session, update_session, bounded_context
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
-from edge_agent_parallel_locks import repository_lifecycle_lock
+from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
 
 
@@ -101,6 +103,8 @@ STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
 # recommended cutting verify-call time specifically rather than the
 # authoring timeout (codex genuinely may need the full budget to code).
 CODEX_VERIFY_CALL_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_CALL_TIMEOUT_SECONDS", "600"))
+WORKTREE_LOCK_RETRIES = max(0, int(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRIES", "5")))
+WORKTREE_LOCK_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRY_SECONDS", "1")))
 CHUNK_SIZE = 3900
 MAX_CHUNKS = int(os.environ.get("TELEGRAM_AGENT_MAX_CHUNKS", "15"))
 
@@ -174,7 +178,7 @@ def _provider_workspace(role: str) -> Path:
     return CODEX_WORKSPACE if role == "codex" else WORKSPACE
 
 
-def _create_task_worktree(task_id: str) -> Path:
+async def _create_task_worktree(task_id: str) -> Path:
     CODEX_TASK_WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     target = CODEX_TASK_WORKTREE_ROOT / task_id
     if target.exists():
@@ -184,15 +188,28 @@ def _create_task_worktree(task_id: str) -> Path:
     # Use the same repository lifecycle lock as the provider-neutral
     # WorktreeManager. Telegram retains its compatibility worktree policy,
     # but its git worktree mutation must not race terminal/parallel creation.
-    with repository_lifecycle_lock(CODEX_SOURCE_REPO):
-        if target.exists():
-            return target
-        completed = subprocess.run(
-            ["/usr/bin/git", "-C", str(CODEX_SOURCE_REPO), "worktree", "add", "--detach", str(target), "HEAD"],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
+    for attempt in range(WORKTREE_LOCK_RETRIES + 1):
+        try:
+            with repository_lifecycle_lock(CODEX_SOURCE_REPO):
+                if target.exists():
+                    return target
+                completed = subprocess.run(
+                    ["/usr/bin/git", "-C", str(CODEX_SOURCE_REPO), "worktree", "add", "--detach", str(target), "HEAD"],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+            break
+        except ParallelLockBusy as exc:
+            if attempt >= WORKTREE_LOCK_RETRIES:
+                raise RuntimeError(
+                    f"Telegram 작업공간 lifecycle lock을 {attempt + 1}회 시도했지만 확보하지 못했습니다: {exc}"
+                ) from exc
+            log(
+                f"작업공간 lifecycle lock 대기 중(attempt={attempt + 1}/{WORKTREE_LOCK_RETRIES + 1}); "
+                f"{WORKTREE_LOCK_RETRY_SECONDS:g}초 후 재시도"
+            )
+            await asyncio.sleep(WORKTREE_LOCK_RETRY_SECONDS)
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "git worktree add 실패").strip()
         raise RuntimeError(f"Telegram 작업 worktree 생성 실패: {detail[-500:]}")
@@ -205,6 +222,64 @@ def _auth_source(role: str) -> str:
     if role == "codex":
         return os.environ.get("CODEX_HOME", str(HOME / ".codex"))
     return os.environ.get("GEMINI_DIR", str(HOME / ".gemini"))
+
+
+def _native_session_path(role: str) -> Path:
+    configured = os.environ.get("TELEGRAM_AGENT_NATIVE_SESSION_FILE", "").strip()
+    if configured:
+        return Path(configured).expanduser().resolve()
+    return HOME / ".edge-agent" / "state" / "telegram-native-sessions" / f"{role}.json"
+
+
+def _load_native_session_id(role: str) -> str | None:
+    path = _native_session_path(role)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        value = str(payload.get("session_id", "")).strip()
+        uuid.UUID(value)
+        return value
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _persist_native_session_id(role: str, session_id: str) -> None:
+    path = _native_session_path(role)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            descriptor = -1
+            json.dump(
+                {"schema": "edge_agent.telegram_native_session.v1", "provider": role, "session_id": session_id},
+                stream,
+            )
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, 0o600)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _bounded_cli_diagnostic(stdout: str, stderr: str, limit: int = 1600) -> str:
+    parts = []
+    if stderr:
+        parts.append(f"[stderr]\n{stderr}")
+    if stdout:
+        parts.append(f"[stdout]\n{stdout}")
+    if not parts:
+        return "no diagnostic output"
+    detail = "\n".join(parts)
+    if len(detail) <= limit:
+        return detail
+    return f"{detail[:500]}\n…(생략)…\n{detail[-(limit - 520):]}"
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -349,18 +424,34 @@ def _strip_wake_particle(token: str) -> str:
 
 
 def _wake_roles(text: str) -> set[str]:
-    # Only the first/last token is checked (not a bare substring search) so a
+    # Bare names and grammatical particles are checked only at the edges so a
     # message merely mentioning a bot mid-sentence ("어제 코덱스가 이상했어")
-    # doesn't get misrouted as an address to it.
+    # does not get misrouted as an address to it. Vocative forms are checked
+    # across the whole sentence: "근데 클로드야, ...", "코덱스야 ...", and
+    # "안티야 ..." are direct addresses regardless of where they occur. This
+    # is deliberately role-neutral; every registered agent gets the same
+    # recognition rule.
     tokens = text.strip().split()
     if not tokens:
         return set()
     first = _strip_wake_particle(_strip_wake_punct(tokens[0]))
     last = _strip_wake_particle(_strip_wake_punct(tokens[-1]))
-    return {
+    roles = {
         role for role, words in ROLE_WAKE_WORDS.items()
         if first in words or last in words
     }
+    vocative_particles = ("야", "아", "씨", "님")
+    for raw_token in tokens:
+        token = _strip_wake_punct(raw_token)
+        for particle in vocative_particles:
+            if not token.endswith(particle) or token == particle:
+                continue
+            stem = token[:-len(particle)]
+            roles.update(
+                role for role, words in ROLE_WAKE_WORDS.items()
+                if stem in words
+            )
+    return roles
 
 
 def _entity_substring(entity, text: str) -> str:
@@ -657,6 +748,8 @@ async def _run_cli(
         raise RuntimeError(f"provider executable is missing: {cli_path}")
 
     runtime_prompt, runtime_options = _runtime_prompt_parts(prompt)
+    native_session_id: str | None = None
+    native_session_is_new = False
 
     if role == "claude":
         # "--" isolates `prompt` as a pure positional argument. Without it, a
@@ -665,6 +758,10 @@ async def _run_cli(
         args = [
             str(cli_path), "-p",
         ]
+        native_session_id = _load_native_session_id(role)
+        native_session_is_new = native_session_id is None
+        native_session_id = native_session_id or str(uuid.uuid4())
+        args.extend(["--session-id" if native_session_is_new else "--resume", native_session_id])
         if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
             if runtime_options.get("model") not in (None, "default"):
                 args.extend(["--model", str(runtime_options["model"])])
@@ -763,13 +860,7 @@ async def _run_cli(
     output = (stdout or b"").decode(errors="replace").strip()
     error = (stderr or b"").decode(errors="replace").strip()
     if proc.returncode != 0:
-        # A tail-only slice can cut off the real cause for non-Python CLI
-        # error formats (Python tracebacks put the exception message last,
-        # but codex/agy's own error output doesn't always). Keep both ends.
-        if len(error) > 1600:
-            snippet = f"{error[:500]}\n…(생략)…\n{error[-1000:]}"
-        else:
-            snippet = error
+        snippet = _bounded_cli_diagnostic(output, error)
         log(f"{role} exit={proc.returncode}: {snippet}")
         raise RuntimeError(f"{role} 실행에 실패했습니다. 로그를 확인해 주세요.")
 
@@ -799,6 +890,17 @@ async def _run_cli(
         detail = error or "CLI가 종료됐지만 stdout에 최종 응답을 쓰지 않았습니다."
         log(f"{role} empty response: {detail[-1600:]}")
         raise RuntimeError(f"{role}가 빈 응답을 반환했습니다: {detail[-500:]}")
+    if role == "claude" and native_session_id:
+        if native_session_is_new:
+            try:
+                _persist_native_session_id(role, native_session_id)
+            except OSError as exc:
+                log(f"Claude 네이티브 세션 ID 저장 실패(응답은 유지): {type(exc).__name__}")
+        if ACTIVE_LOGICAL_SESSION_ID:
+            try:
+                bind_native_session(ACTIVE_LOGICAL_SESSION_ID, provider=role, native_session_id=native_session_id)
+            except (FileNotFoundError, OSError, ValueError) as exc:
+                log(f"논리 세션에 Claude 네이티브 세션 연결 실패(응답은 유지): {type(exc).__name__}")
     return output
 
 
@@ -1128,7 +1230,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
         if ROLE in ROLES:
             try:
-                ACTIVE_TASK_WORKSPACE = _create_task_worktree(task_id)
+                ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id)
                 write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
                 write_task_state(
                     role=ROLE,

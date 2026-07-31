@@ -1,0 +1,4 @@
+interface:
+  display_name: "Code Review"
+  short_description: "Provider-neutral code review and approval"
+  default_prompt: "Use $code-review to inspect the requested code scope and produce a verified, severity-ranked review report."
