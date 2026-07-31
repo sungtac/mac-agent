@@ -52,8 +52,11 @@ TARGETS = {
 ERROR_PATTERNS = (
     ("empty_response", re.compile(r"빈 응답|empty response", re.I)),
     ("execution_error", re.compile(r"실행 오류|실행에 실패|처리 실패|exit=\d+", re.I)),
-    ("polling_stopped", re.compile(r"run_polling 종료", re.I)),
 )
+# ``run_polling 종료`` is emitted after the bot deliberately calls
+# ``stop_running()`` (for example after a Conflict burst) so launchd's
+# KeepAlive can restart it. It is a lifecycle message, not proof that the
+# service stayed down; persistent failure is covered by ``service_down``.
 START_RE = re.compile(r"처리 시작")
 DONE_RE = re.compile(r"처리 완료|처리 실패")
 
