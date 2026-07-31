@@ -26,6 +26,13 @@ STATE_FILE = Path(os.environ.get("RODA_GEMMA_HEALTH_STATE_FILE", "~/.edge-agent/
 TOKEN_FILE = Path(os.environ.get("RODA_GEMMA_TOKEN_FILE", "~/.config/roda-gemma/telegram.token")).expanduser()
 POLL_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_POLL_SECONDS", "30"))
 NO_RESPONSE_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_NO_RESPONSE_SECONDS", "300"))
+SERVICE_DOWN_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_SERVICE_DOWN_GRACE_SECONDS", "90"))
+MAINTENANCE_FILE = Path(
+    os.environ.get(
+        "EDGE_AGENT_TELEGRAM_MAINTENANCE_FILE",
+        str(HOME / ".edge-agent" / "state" / "telegram-maintenance.json"),
+    )
+).expanduser()
 RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_RECOVERY_TIMEOUT_SECONDS", "300"))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
@@ -55,6 +62,7 @@ TARGETS = {
         "log": HOME / ".claude/hooks-state/telegram-antigravity/stderr.log",
     },
 }
+RESTART_HELPER = Path(__file__).with_name("edge-agent-telegram-restart.py")
 
 ERROR_PATTERNS = (
     ("empty_response", re.compile(r"빈 응답|empty response", re.I)),
@@ -117,6 +125,23 @@ def _service_running(label: str) -> bool:
         check=False,
     )
     return result.returncode == 0 and "state = running" in result.stdout
+
+
+def _planned_restart_active(role: str, *, now: float | None = None) -> bool:
+    try:
+        payload = json.loads(MAINTENANCE_FILE.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return False
+    roles = payload.get("roles", {}) if isinstance(payload, dict) else {}
+    if not isinstance(roles, dict):
+        return False
+    entry = roles.get(role)
+    if not isinstance(entry, dict):
+        return False
+    try:
+        return float(entry.get("expires_at", 0)) > (time.time() if now is None else now)
+    except (TypeError, ValueError):
+        return False
 
 
 def _send_alert(text: str) -> None:
@@ -220,7 +245,19 @@ def _run_codex_repair_impl(event: dict) -> str:
     if merge.returncode != 0:
         subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--abort"], capture_output=True, text=True, check=False)
         return f"Codex 수정은 생성됐지만 main 병합에 실패했습니다: {merge.stderr[-500:]}"
-    restart = subprocess.run(["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{TARGETS[event['role']]['label']}"], capture_output=True, text=True, check=False)
+    restart = subprocess.run(
+        [
+            sys.executable,
+            str(RESTART_HELPER),
+            event["role"],
+            "--reason",
+            f"Roda repair for {event['code']}",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=360,
+        check=False,
+    )
     if restart.returncode != 0:
         return f"Codex 수정 병합 완료, 서비스 재기동 실패: {restart.stderr[-500:]}"
     return f"Codex 자동 수정·main 병합·{event['role']} 서비스 재기동 완료.\n{summary}"
@@ -303,6 +340,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("delivery_retry", [])
     state.setdefault("repair_results", {})
     state.setdefault("recovery_watch", {})
+    state.setdefault("service_down_since", {})
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
     alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
@@ -345,11 +383,17 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     recovery["started_at"] = current
                 elif recovery.get("status") == "reprocess_started" and DONE_RE.search(line):
                     recovery["status"] = "completed_failure" if "처리 실패" in line else "completed_success"
-        if not _service_running(target["label"]):
-            fingerprint = _fingerprint(role, "service_down", target["label"])
-            if fingerprint not in state["alerted"]:
-                alerts.append({"role": role, "code": "service_down", "fingerprint": fingerprint, "message": f"[Roda 감지] {role} Telegram 봇 프로세스가 실행 중이 아닙니다. 확인이 필요합니다.", "detail": "launchd service is not running"})
-                state["alerted"][fingerprint] = current
+        if _planned_restart_active(role, now=current):
+            state["service_down_since"].pop(role, None)
+        elif not _service_running(target["label"]):
+            first_seen = state["service_down_since"].setdefault(role, current)
+            if current - float(first_seen) >= SERVICE_DOWN_GRACE_SECONDS:
+                fingerprint = _fingerprint(role, "service_down", target["label"])
+                if fingerprint not in state["alerted"]:
+                    alerts.append({"role": role, "code": "service_down", "fingerprint": fingerprint, "message": f"[Roda 감지] {role} Telegram 봇 프로세스가 {SERVICE_DOWN_GRACE_SECONDS}초 이상 실행되지 않았습니다. 확인이 필요합니다.", "detail": "launchd service is not running after grace period"})
+                    state["alerted"][fingerprint] = current
+        else:
+            state["service_down_since"].pop(role, None)
         pending = state["pending"].get(role, [])
         if pending and current - pending[0] >= NO_RESPONSE_SECONDS:
             fingerprint = _fingerprint(role, "no_response", str(int(pending[0])))

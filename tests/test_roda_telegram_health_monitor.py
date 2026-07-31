@@ -131,6 +131,52 @@ class RodaHealthMonitorTests(unittest.TestCase):
         finally:
             health.TARGETS = original
 
+    def test_planned_restart_suppresses_service_down(self):
+        with tempfile.TemporaryDirectory() as td:
+            original = {
+                "TARGETS": health.TARGETS,
+                "MAINTENANCE_FILE": health.MAINTENANCE_FILE,
+                "_service_running": health._service_running,
+            }
+            try:
+                log = Path(td) / "x.log"
+                marker = Path(td) / "maintenance.json"
+                log.write_text("기존 로그\n", encoding="utf-8")
+                marker.write_text('{"version": 1, "roles": {"x": {"expires_at": 200}}}', encoding="utf-8")
+                health.TARGETS = {"x": {"label": "present", "log": log}}
+                health.MAINTENANCE_FILE = marker
+                health._service_running = lambda label: False
+                state = {"initialized": True, "offsets": {"x": len("기존 로그\n".encode())}, "pending": {}, "alerted": {}}
+                alerts = health.poll_once(state, now=100)
+                self.assertEqual(alerts, [])
+                self.assertEqual(state["service_down_since"], {})
+            finally:
+                for name, value in original.items():
+                    setattr(health, name, value)
+
+    def test_service_down_requires_grace_period(self):
+        with tempfile.TemporaryDirectory() as td:
+            original = {
+                "TARGETS": health.TARGETS,
+                "MAINTENANCE_FILE": health.MAINTENANCE_FILE,
+                "_service_running": health._service_running,
+            }
+            try:
+                log = Path(td) / "x.log"
+                marker = Path(td) / "maintenance.json"
+                log.write_text("기존 로그\n", encoding="utf-8")
+                health.TARGETS = {"x": {"label": "present", "log": log}}
+                health.MAINTENANCE_FILE = marker
+                health._service_running = lambda label: False
+                state = {"initialized": True, "offsets": {"x": len("기존 로그\n".encode())}, "pending": {}, "alerted": {}}
+                self.assertEqual(health.poll_once(state, now=100), [])
+                self.assertEqual(health.poll_once(state, now=100 + health.SERVICE_DOWN_GRACE_SECONDS - 1), [])
+                alerts = health.poll_once(state, now=100 + health.SERVICE_DOWN_GRACE_SECONDS)
+                self.assertEqual([event["code"] for event in alerts], ["service_down"])
+            finally:
+                for name, value in original.items():
+                    setattr(health, name, value)
+
 
 if __name__ == "__main__":
     unittest.main()

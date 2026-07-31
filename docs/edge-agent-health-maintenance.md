@@ -19,3 +19,17 @@ python3 bin/edge-agent-health-maintenance.py --json
 ```bash
 python3 bin/edge-agent-health-maintenance.py --json --apply
 ```
+
+## Telegram agent 재시작
+
+Telegram provider를 직접 `launchctl kickstart -k`로 종료하지 않는다. 진행 중인
+요청을 끊고 Roda가 일시적인 `service_down`으로 오판할 수 있다. 표준 경로는
+다음 helper이며, active request drain·planned-restart marker·startup 확인을
+수행한다.
+
+```bash
+python3 bin/edge-agent-telegram-restart.py antigravity --reason "maintenance"
+```
+
+Roda health monitor는 planned marker가 유효한 동안 감지를 억제하고, marker가
+없는 경우에도 90초 grace period가 지난 뒤에만 `service_down` 자동복구를 시작한다.
