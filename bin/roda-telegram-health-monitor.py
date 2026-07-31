@@ -37,6 +37,8 @@ MAINTENANCE_FILE = Path(
     )
 ).expanduser()
 RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_RECOVERY_TIMEOUT_SECONDS", "300"))
+USAGE_WATCH_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_TTL_SECONDS", str(24 * 60 * 60)))
+USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SECONDS", "3600"))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
 AUTO_REPAIR_ENABLED = os.environ.get("RODA_GEMMA_AUTO_REPAIR_ENABLED", "1") == "1"
@@ -76,13 +78,17 @@ ERROR_PATTERNS = (
 # patterns provider-neutral because Claude, Codex and Antigravity expose
 # different wording for the same condition.
 USAGE_LIMIT_RE = re.compile(
-    r"hit your (?:session|usage) limit|usage cap|quota\s*(?:exceeded|reached|exhausted)|"
-    r"resource_exhausted|baseline quota.*(?:reached|exhausted)|사용량\s*(?:제한|한도)|"
+    r"hit your (?:session|usage) limit|(?:usage|session) limit\s*(?:reached|exceeded|exhausted)|"
+    r"you have reached your (?:session|usage) limit|usage cap|quota\s*(?:exceeded|reached|exhausted)|"
+    r"(?:limit|quota)\s*(?:exceeded|reached|exhausted)|resource_exhausted|"
+    r"baseline quota.*(?:reached|exhausted)|사용량\s*(?:제한|한도)|"
     r"쿼터\s*(?:초과|소진)",
     re.I,
 )
 EXPLICIT_USAGE_LIMIT_RE = re.compile(
-    r"hit your (?:session|usage) limit|quota\s*(?:exceeded|reached|exhausted)|resource_exhausted|"
+    r"hit your (?:session|usage) limit|(?:usage|session) limit\s*(?:reached|exceeded|exhausted)|usage cap|"
+    r"you have reached your (?:session|usage) limit|quota\s*(?:exceeded|reached|exhausted)|"
+    r"(?:limit|quota)\s*(?:exceeded|reached|exhausted)|resource_exhausted|"
     r"baseline quota.*(?:reached|exhausted)|사용량\s*(?:제한|한도)|쿼터\s*(?:초과|소진)",
     re.I,
 )
@@ -91,7 +97,12 @@ RATE_LIMIT_RE = re.compile(
     r"\b429\b|retry[- _]?after|throttl",
     re.I,
 )
-FAILURE_CONTEXT_RE = re.compile(r"error|fail|실패|오류|provider|exit\s*=|status code|HTTP", re.I)
+CONTEXT_LIMIT_RE = re.compile(
+    r"context(?: window| length)?\s*(?:limit|exceeded|too long)|maximum context length|"
+    r"context window is full|컨텍스트\s*(?:초과|한도)",
+    re.I,
+)
+FAILURE_CONTEXT_RE = re.compile(r"error|fail|실패|오류|exit\s*=|status code|HTTP", re.I)
 EXPLICIT_RATE_LIMIT_RE = re.compile(
     r"rate[_ -]?limit(?:_error)|rate[_ -]?limit(?:s)?\s+(?:exceeded|reached)|"
     r"too many requests|HTTP\s*429|status code\s*:?\s*429|\b429\b",
@@ -100,12 +111,18 @@ EXPLICIT_RATE_LIMIT_RE = re.compile(
 NON_REPAIRABLE_CODES = frozenset({"usage_limited", "rate_limited", "context_exceeded", "auth_error"})
 USAGE_RECOVERY_CODES = frozenset({"usage_limited", "rate_limited"})
 USAGE_WINDOW_RE = re.compile(
-    r"(?P<window>5\s*(?:h|hours?)|7\s*(?:d|days?)|weekly|monthly)",
+    r"(?P<window>5\s*[- ]?(?:h|hours?)|five\s+hours?|7\s*[- ]?(?:d|days?)|"
+    r"seven\s+days?|weekly|monthly)",
     re.I,
 )
 RESET_AFTER_RE = re.compile(
-    r"(?:retry[- _]?after|resets?\s+in)\D*(?P<amount>\d+(?:\.\d+)?)\s*"
-    r"(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?",
+    r"(?:retry[- _]?after|resets?\s+in)\s*[:=]?\s*"
+    r"(?P<duration>\d+(?:\.\d+)?\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?"
+    r"(?:\s*(?:(?:and|,)\s*)?\d+(?:\.\d+)?\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?){0,3})",
+    re.I,
+)
+DURATION_PART_RE = re.compile(
+    r"(?P<amount>\d+(?:\.\d+)?)\s*(?P<unit>seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)?",
     re.I,
 )
 RESET_AT_RE = re.compile(
@@ -140,7 +157,16 @@ def _load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}, "recovery_watch": {}}
+        return {
+            "initialized": False,
+            "offsets": {},
+            "pending": {},
+            "alerted": {},
+            "delivery_retry": [],
+            "repair_results": {},
+            "recovery_watch": {},
+            "usage_watch": {},
+        }
 
 
 def _save_state(state: dict) -> None:
@@ -156,10 +182,12 @@ def classify_line(line: str) -> str | None:
     else:
         usage_candidate = USAGE_LIMIT_RE.search(line)
         rate_candidate = RATE_LIMIT_RE.search(line)
-    if usage_candidate and (EXPLICIT_USAGE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
-        return "usage_limited"
+    if CONTEXT_LIMIT_RE.search(line) and not (prompt_marker and not FAILURE_CONTEXT_RE.search(provider_prefix)):
+        return "context_exceeded"
     if rate_candidate and (EXPLICIT_RATE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
         return "rate_limited"
+    if usage_candidate and (EXPLICIT_USAGE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
+        return "usage_limited"
     for code, pattern in ERROR_PATTERNS:
         if pattern.search(line):
             return code
@@ -176,6 +204,36 @@ def _duration_seconds(amount: str, unit: str | None) -> float:
     return value
 
 
+def _parse_duration(text: str) -> float | None:
+    parts = list(DURATION_PART_RE.finditer(text))
+    if not parts:
+        return None
+    consumed = "".join(match.group(0) for match in parts)
+    if re.sub(r"[\s,]+|and", "", consumed.lower()) != re.sub(r"[\s,]+|and", "", text.lower()):
+        return None
+    return sum(_duration_seconds(match.group("amount"), match.group("unit")) for match in parts)
+
+
+def _normalize_window(value: str) -> str:
+    normalized = re.sub(r"\s+", " ", value.strip().lower())
+    if normalized in {"weekly", "monthly"}:
+        return normalized
+    if normalized.startswith("five") or normalized.startswith("5"):
+        return "5h"
+    if normalized.startswith("seven") or normalized.startswith("7"):
+        return "7d"
+    return normalized.replace(" ", "")
+
+
+def _windows_in(line: str) -> list[str]:
+    windows: list[str] = []
+    for match in USAGE_WINDOW_RE.finditer(line):
+        window = _normalize_window(match.group("window"))
+        if window not in windows:
+            windows.append(window)
+    return windows
+
+
 def _format_reset_at(value: str | None) -> str | None:
     if not value:
         return None
@@ -190,14 +248,28 @@ def _format_reset_at(value: str | None) -> str | None:
 
 def _usage_details(line: str, *, now: float | None = None) -> dict:
     observed = datetime.now(timezone.utc) if now is None else datetime.fromtimestamp(now, timezone.utc)
-    window_match = USAGE_WINDOW_RE.search(line)
+    windows = _windows_in(line)
     details = {
-        "window": window_match.group("window").lower().replace(" ", "") if window_match else "unknown",
+        "window": windows[0] if windows else "unknown",
+        "windows": windows,
         "reset_at": None,
         "reset_source": None,
+        "retry_after_seconds": None,
         "recovery_confidence": "unknown",
     }
-    reset_at_match = RESET_AT_RE.search(line)
+    reset_after_match = RESET_AFTER_RE.search(line)
+    if reset_after_match:
+        seconds = _parse_duration(reset_after_match.group("duration"))
+        if seconds is not None:
+            details.update({
+                "reset_at": (observed + timedelta(seconds=seconds)).isoformat(),
+                "reset_source": "provider_retry_after" if "retry" in reset_after_match.group(0).lower() else "provider_reset_in",
+                "retry_after_seconds": (int(seconds) if seconds.is_integer() else seconds)
+                if "retry" in reset_after_match.group(0).lower()
+                else None,
+                "recovery_confidence": "exact" if "retry" in reset_after_match.group(0).lower() else "estimated",
+            })
+    reset_at_match = RESET_AT_RE.search(line) if details["reset_at"] is None else None
     if reset_at_match:
         try:
             parsed = datetime.fromisoformat(reset_at_match.group("value").replace("Z", "+00:00"))
@@ -210,18 +282,23 @@ def _usage_details(line: str, *, now: float | None = None) -> dict:
             })
         except ValueError:
             pass
-    if details["reset_at"] is None:
-        reset_after_match = RESET_AFTER_RE.search(line)
-        if reset_after_match:
-            seconds = _duration_seconds(reset_after_match.group("amount"), reset_after_match.group("unit"))
-            details.update({
-                "reset_at": (observed + timedelta(seconds=seconds)).isoformat(),
-                "reset_source": "provider_retry_after" if "retry" in reset_after_match.group(0).lower() else "provider_reset_in",
-                "recovery_confidence": "exact" if "retry" in reset_after_match.group(0).lower() else "estimated",
-            })
     if details["reset_at"] is None and details["window"] != "unknown":
         details["recovery_confidence"] = "estimated"
     return details
+
+
+def _request_id_hash(line: str) -> str | None:
+    match = re.search(r"(?:request[_ -]?id|x-request-id)\s*[:=]\s*([A-Za-z0-9._-]+)", line, re.I)
+    if not match:
+        return None
+    return hashlib.sha256(match.group(1).encode()).hexdigest()[:12]
+
+
+def _candidate_alternatives(role: str) -> str:
+    candidates = [name for name in TARGETS if name != role]
+    if not candidates:
+        return "없음"
+    return ", ".join(candidates) + " (가용성 미확인)"
 
 
 def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -> dict:
@@ -233,26 +310,30 @@ def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -
         recovery = f"회복 창: {details['window']} (정확한 시각 확인 불가)"
     else:
         recovery = "회복 시각: provider 정보 없음"
-    alternatives = {
-        "claude": "Codex, Antigravity",
-        "codex": "Claude, Antigravity",
-        "antigravity": "Claude, Codex",
-    }.get(role, "다른 provider")
+    source = "structured_error" if re.search(r"(?:error\.)?type\s*[:=]|request[_ -]?id\s*[:=]", line, re.I) else "stderr"
     return {
         "kind": "provider_usage",
+        "provider": role,
+        "category": code,
         "role": role,
         "code": code,
+        "observed_at": datetime.fromtimestamp(now if now is not None else time.time(), timezone.utc).isoformat(),
         "fingerprint": _fingerprint(role, code, line),
         "message": (
             f"[Roda 사용량 제한 감지] {role} provider의 사용량 제한 상태입니다.\n"
             f"유형: {code}\n{recovery}\n"
-            f"대체 provider: {alternatives}\n자동 Codex 복구: 실행하지 않음"
+            f"대체 후보: {_candidate_alternatives(role)}\n자동 Codex 복구: 실행하지 않음"
         ),
         "detail": _safe_detail(line),
+        "source": source,
         "window": details["window"],
+        "windows": details["windows"],
         "reset_at": details["reset_at"],
         "reset_source": details["reset_source"],
+        "retry_after_seconds": details["retry_after_seconds"],
         "recovery_confidence": details["recovery_confidence"],
+        "confidence": details["recovery_confidence"],
+        "request_id_hash": _request_id_hash(line),
         "auto_repair": "blocked",
     }
 
@@ -263,8 +344,16 @@ def _fingerprint(role: str, code: str, line: str) -> str:
 
 
 def _safe_detail(line: str) -> str:
-    detail = re.sub(r"https?://\S+", "[URL]", line.strip())
+    detail = line.strip()
+    detail = re.sub(r"https?://\S+", "[URL]", detail)
     detail = re.sub(r"(/Users/|/private/)[^ ]+", "[PATH]", detail)
+    detail = re.sub(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+", r"\1[REDACTED]", detail)
+    detail = re.sub(
+        r"(?i)((?:x-api-key|api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|secret|password|cookie)\s*[:=]\s*)[^\s,;]+",
+        r"\1[REDACTED]",
+        detail,
+    )
+    detail = re.sub(r"\b(?:sk-[A-Za-z0-9_-]{16,}|AIza[A-Za-z0-9_-]{20,}|gh[pousr]_[A-Za-z0-9_]{20,})\b", "[REDACTED]", detail)
     return detail[-240:]
 
 
@@ -491,6 +580,82 @@ def _format_repair_result(event: dict, diagnosis: str) -> str:
     return message
 
 
+def _usage_watch_expiry(event: dict, created_at: float) -> float:
+    reset_at = event.get("reset_at")
+    if reset_at:
+        try:
+            reset_timestamp = datetime.fromisoformat(str(reset_at).replace("Z", "+00:00")).timestamp()
+            return max(created_at + USAGE_WATCH_TTL_SECONDS, reset_timestamp + USAGE_WATCH_GRACE_SECONDS)
+        except (TypeError, ValueError, OverflowError):
+            pass
+    return created_at + USAGE_WATCH_TTL_SECONDS
+
+
+def _expire_usage_watches(state: dict, current: float) -> None:
+    for usage in state.get("usage_watch", {}).values():
+        if usage.get("status") in {"waiting_for_probe", "probe_started"}:
+            try:
+                expired = current >= float(usage.get("expires_at", float(usage.get("created_at", current)) + USAGE_WATCH_TTL_SECONDS))
+            except (TypeError, ValueError):
+                expired = True
+            if expired:
+                usage["status"] = "expired"
+                usage["expired_at"] = current
+
+
+def _active_usage_watch(state: dict, role: str) -> tuple[str, dict] | None:
+    candidates = [
+        (fingerprint, usage)
+        for fingerprint, usage in state.get("usage_watch", {}).items()
+        if usage.get("role") == role and usage.get("status") in {"waiting_for_probe", "probe_started"}
+    ]
+    if not candidates:
+        return None
+    def created_at(item: tuple[str, dict]) -> float:
+        try:
+            return float(item[1].get("created_at", 0))
+        except (TypeError, ValueError):
+            return 0.0
+
+    return max(candidates, key=created_at)
+
+
+def _upsert_usage_watch(state: dict, event: dict, current: float) -> bool:
+    role = event["role"]
+    active = _active_usage_watch(state, role)
+    if active:
+        _, usage = active
+        usage["last_seen_at"] = current
+        if event.get("reset_at"):
+            usage["reset_at"] = event["reset_at"]
+            usage["reset_source"] = event.get("reset_source")
+            usage["recovery_confidence"] = event.get("recovery_confidence")
+            try:
+                created_at = float(usage.get("created_at", current))
+            except (TypeError, ValueError):
+                created_at = current
+            usage["expires_at"] = _usage_watch_expiry(event, created_at)
+        for window in event.get("windows", []):
+            if window not in usage.setdefault("windows", []):
+                usage["windows"].append(window)
+        return False
+    fingerprint = event["fingerprint"]
+    state["usage_watch"][fingerprint] = {
+        "role": role,
+        "status": "waiting_for_probe",
+        "created_at": current,
+        "last_seen_at": current,
+        "reset_at": event.get("reset_at"),
+        "reset_source": event.get("reset_source"),
+        "recovery_confidence": event.get("recovery_confidence"),
+        "window": event.get("window", "unknown"),
+        "windows": list(event.get("windows", [])),
+        "expires_at": _usage_watch_expiry(event, current),
+        "notified": False,
+    }
+    return True
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -502,6 +667,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("recovery_watch", {})
     state.setdefault("usage_watch", {})
     state.setdefault("service_down_since", {})
+    _expire_usage_watches(state, current)
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
     alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
@@ -540,17 +706,16 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     "detail": _safe_detail(line),
                 }
                 fingerprint = event["fingerprint"]
-                if fingerprint not in state["alerted"]:
+                if code in USAGE_RECOVERY_CODES:
+                    created = _upsert_usage_watch(state, event, current)
+                    if created and fingerprint in state["alerted"]:
+                        state["alerted"].pop(fingerprint, None)
+                    if created and fingerprint not in state["alerted"]:
+                        alerts.append(event)
+                        state["alerted"][fingerprint] = current
+                elif fingerprint not in state["alerted"]:
                     alerts.append(event)
                     state["alerted"][fingerprint] = current
-                    if code in USAGE_RECOVERY_CODES:
-                        state["usage_watch"][fingerprint] = {
-                            "role": role,
-                            "status": "waiting_for_probe",
-                            "created_at": current,
-                            "reset_at": event.get("reset_at"),
-                            "notified": False,
-                        }
             for recovery in state["recovery_watch"].values():
                 if recovery.get("role") != role or recovery.get("status") in {"completed_success", "completed_failure", "timeout"}:
                     continue
@@ -559,23 +724,29 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     recovery["started_at"] = current
                 elif recovery.get("status") == "reprocess_started" and DONE_RE.search(line):
                     recovery["status"] = "completed_failure" if "처리 실패" in line else "completed_success"
-            for fingerprint, usage in state["usage_watch"].items():
-                if usage.get("role") != role or usage.get("status") in {"completed_success", "completed_failure"}:
-                    continue
+            active_usage = _active_usage_watch(state, role)
+            if active_usage:
+                fingerprint, usage = active_usage
                 if usage.get("status") == "waiting_for_probe" and START_RE.search(line):
                     usage["status"] = "probe_started"
                     usage["started_at"] = current
-                elif usage.get("status") == "probe_started" and re.search(r"처리 완료", line):
-                    usage["status"] = "completed_success"
-                    usage["completed_at"] = current
-                    alerts.append({
-                        "kind": "usage_recovery",
-                        "role": role,
-                        "code": "usage_recovered",
-                        "fingerprint": f"usage-recovery:{fingerprint}",
-                        "message": f"[Roda 사용량 회복 확인] {role} provider가 제한 이후 요청을 정상 완료했습니다.",
-                        "detail": f"원래 감지={fingerprint}",
-                    })
+                elif usage.get("status") == "probe_started" and DONE_RE.search(line):
+                    if re.search(r"처리 완료", line):
+                        usage["status"] = "completed_success"
+                        usage["completed_at"] = current
+                        if not usage.get("notified"):
+                            alerts.append({
+                                "kind": "usage_recovery",
+                                "role": role,
+                                "code": "usage_recovered",
+                                "fingerprint": f"usage-recovery:{fingerprint}",
+                                "message": f"[Roda 사용량 회복 확인] {role} provider가 제한 이후 요청을 정상 완료했습니다.",
+                                "detail": f"원래 감지={fingerprint}",
+                            })
+                            usage["notified"] = True
+                    else:
+                        usage["status"] = "probe_failed"
+                        usage["completed_at"] = current
         if _planned_restart_active(role, now=current):
             state["service_down_since"].pop(role, None)
         elif not _service_running(target["label"]):

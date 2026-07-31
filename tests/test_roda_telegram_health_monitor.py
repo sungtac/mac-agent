@@ -23,6 +23,24 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNone(health.classify_line("[codex] run_polling 종료 — 프로세스 재시작을 위해 종료합니다."))
         self.assertNotIn("https://", health._safe_detail("error https://secret.example/x"))
 
+    def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
+        self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
+        self.assertEqual(health.classify_line("[codex] you have reached your usage limit"), "usage_limited")
+        self.assertEqual(health.classify_line("usage cap"), "usage_limited")
+        self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: limit exceeded"), "usage_limited")
+        self.assertEqual(health.classify_line("[codex] rate limit exceeded"), "rate_limited")
+        self.assertEqual(health.classify_line("[claude] maximum context length exceeded"), "context_exceeded")
+        self.assertIsNone(health.classify_line("text='please explain why the usage limit reached'"))
+        self.assertIsNone(health.classify_line("provider=codex text='what does usage cap mean?'"))
+
+    def test_safe_detail_redacts_credentials_and_request_id_is_hashed(self):
+        line = "provider error Authorization: Bearer secret-token token=abc123 api_key=sk-live-value request_id=req-123"
+        detail = health._safe_detail(line)
+        self.assertNotIn("secret-token", detail)
+        self.assertNotIn("abc123", detail)
+        self.assertNotIn("sk-live-value", detail)
+        self.assertEqual(len(health._request_id_hash(line)), 12)
+
     def test_usage_event_extracts_exact_retry_after_without_guessing_window(self):
         event = health._usage_event(
             "claude",
@@ -41,6 +59,24 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNone(event["reset_at"])
         self.assertEqual(event["recovery_confidence"], "estimated")
         self.assertIn("정확한 시각 확인 불가", event["message"])
+
+    def test_usage_event_parses_compound_reset_duration(self):
+        event = health._usage_event("codex", "rate_limited", "rate limit; resets in 1 hour 30 minutes", now=100)
+        self.assertIsNone(event["retry_after_seconds"])
+        self.assertEqual(event["recovery_confidence"], "estimated")
+        self.assertIn("1970-01-01T01:31:40", event["reset_at"])
+
+    def test_usage_event_prefers_retry_after_and_parses_multiple_windows(self):
+        event = health._usage_event(
+            "antigravity",
+            "usage_limited",
+            "RESOURCE_EXHAUSTED retry-after: 60; 5-hour window and weekly limit exceeded",
+            now=100,
+        )
+        self.assertEqual(event["reset_source"], "provider_retry_after")
+        self.assertEqual(event["windows"], ["5h", "weekly"])
+        self.assertEqual(event["confidence"], "exact")
+        self.assertIn("가용성 미확인", event["message"])
 
     def test_initial_poll_only_establishes_offsets(self):
         with tempfile.TemporaryDirectory() as td:
@@ -177,6 +213,38 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 alerts = health.poll_once(state, now=102)
                 self.assertEqual([event["code"] for event in alerts], ["usage_recovered"])
                 self.assertEqual(next(iter(state["usage_watch"].values()))["status"], "completed_success")
+            finally:
+                health.TARGETS = original_targets
+                health._service_running = original_running
+
+    def test_usage_watch_coalesces_repeated_limits_and_expires(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "x.log"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original_targets = health.TARGETS
+            original_running = health._service_running
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            health._service_running = lambda label: True
+            try:
+                state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "repair_results": {}, "recovery_watch": {}}
+                health.poll_once(state, now=0)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("provider error quota exceeded; weekly window\n")
+                self.assertEqual([event["code"] for event in health.poll_once(state, now=1)], ["usage_limited"])
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("provider error usage limit reached; weekly window\n")
+                self.assertEqual(health.poll_once(state, now=2), [])
+                self.assertEqual(len([item for item in state["usage_watch"].values() if item["status"] == "waiting_for_probe"]), 1)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
+                self.assertEqual([event["code"] for event in health.poll_once(state, now=3)], ["usage_recovered"])
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("provider error quota exhausted; weekly window\n")
+                health.poll_once(state, now=4)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 시작 chat=stale\n처리 완료 chat=stale duration=1s\n")
+                self.assertEqual(health.poll_once(state, now=4 + health.USAGE_WATCH_TTL_SECONDS + 1), [])
+                self.assertTrue(any(item["status"] == "expired" for item in state["usage_watch"].values()))
             finally:
                 health.TARGETS = original_targets
                 health._service_running = original_running
