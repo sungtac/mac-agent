@@ -207,6 +207,20 @@ def _auth_source(role: str) -> str:
     return os.environ.get("GEMINI_DIR", str(HOME / ".gemini"))
 
 
+SCRIPT_DIR = Path(__file__).resolve().parent
+
+
+def _load_identity_and_tone(role: str) -> str:
+    identity_file = SCRIPT_DIR.parent / "config" / f"{role}-identity-and-tone.md"
+    if identity_file.exists():
+        try:
+            content = identity_file.read_text(encoding="utf-8").strip()
+            return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{content}\n\n"
+        except Exception as exc:
+            log(f"아이덴티티 및 톤앤매너 규칙 로드 실패: {exc}")
+    return ""
+
+
 def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
     skill_context = build_skill_context(prompt)
     skill_block = f"\n{skill_context}\n" if skill_context else ""
@@ -217,9 +231,11 @@ def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
             session_block = f"\n{bounded_context(ACTIVE_LOGICAL_SESSION_ID)}\n"
         except (FileNotFoundError, ValueError) as exc:
             log(f"공유 세션 컨텍스트 로드 실패(계속 진행): {exc}")
+    identity_block = _load_identity_and_tone(ROLE)
     context = (
         f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
         "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
+        f"{identity_block}"
         f"{capability_block}"
         f"{skill_block}"
         f"{session_block}"
