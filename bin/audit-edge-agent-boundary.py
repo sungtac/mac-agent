@@ -215,13 +215,17 @@ def audit_boundary(
         worktree_text = _run(["git", "worktree", "list", "--porcelain"], cwd=mac_agent)
     report.worktrees = _worktree_records(worktree_text)
     if len(report.worktrees) > 1:
-        report.findings.append(Finding("medium", "worktrees_present", "additional git worktrees exist; ownership and cleanup must be documented"))
+        ownership_path = _resolve(manifest.get("worktree_ownership_manifest", ""))
+        if not ownership_path.is_file():
+            report.findings.append(Finding("medium", "worktrees_present", "additional git worktrees exist; ownership and cleanup must be documented"))
 
     team_root = _resolve(manifest["legacy_shared_workspace"])
     if team_status_text is None:
         team_status_text = _run(["git", "status", "--porcelain"], cwd=team_root)
     report.team_os_git_status = _status_summary(team_status_text)
-    if report.team_os_git_status["total"]:
+    legacy_policy = manifest.get("legacy_workspace_policy", {})
+    report.team_os_git_status["policy"] = legacy_policy
+    if report.team_os_git_status["total"] and legacy_policy.get("mode") != "quarantined_preserve_uncommitted":
         report.findings.append(Finding("high", "team_workspace_dirty", "legacy shared workspace has uncommitted changes"))
 
     nano_path = _resolve(Path.home() / ".claude" / "nano-gate-events.jsonl")

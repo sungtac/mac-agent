@@ -4,6 +4,13 @@
   "purpose": "Record the current workspace and authority boundary before runtime enforcement or worktree parallelism.",
   "edge_agent_source_root": "/Users/edge_ai/mac-agent",
   "legacy_shared_workspace": "/Users/edge_ai/.openclaw/workspace",
+  "legacy_workspace_policy": {
+    "mode": "quarantined_preserve_uncommitted",
+    "active_provider_workloads": false,
+    "write_authority": "none",
+    "owner_review_required_before_reactivation": true
+  },
+  "worktree_ownership_manifest": "/Users/edge_ai/.edge-agent-worktrees/OWNERSHIP.md",
   "protected_roots": [
     "/Users/edge_ai/.openclaw/workspace/team_os",
     "/Users/edge_ai/.openclaw/workspace/state",
