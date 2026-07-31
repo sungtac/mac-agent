@@ -33,23 +33,16 @@
 
 ## 개선 계획 (우선순위순)
 
-### P0 — 즉시 (수동, 5분)
-main의 추적 변경 커밋/스태시 처리. 이게 남아있는 한 P1 이하를 구현해도 검증이 안 된다.
-```
-cd /Users/edge_ai/mac-agent
-git add bin/roda-telegram-health-monitor.py tests/test_roda_telegram_health_monitor.py
-git commit -m "..."   # 또는 git stash — 사용자 확인 필요, 내용이 이전 세션 미완성 작업이라 판단 필요
-```
+### P0 — [완료 2026-08-01] main의 추적 변경 커밋
+usage-limit 정규식 확장 패치(테스트 18개 통과 확인 후) 커밋 `4aa6cda`로 정리. main이 다시 깨끗해져 이후 자동복구 병합이 막히지 않게 됨.
 
-### P1 — main 청결도를 1급 헬스 신호로 승격
-`roda-telegram-health-monitor.py`에 새 감지 항목 추가: 폴링 사이클마다 `git -C SOURCE_REPO status --porcelain`에 추적 변경이 있으면 `code="main_dirty"` 알림을 (스팸 방지를 위해) 1회/일 정도로 발송. "자동복구가 막혀있다"는 사실을 사람이 놓치지 않게 한다. G4 재발 방지.
+### P1 — [완료 2026-08-01] main 청결도를 1급 헬스 신호로 승격
+`_check_main_dirty` + `_source_repo_tracked_dirty_lines`(테스트 격리용으로 분리) 추가. 폴링마다 추적 변경 있으면 `code="main_dirty"` 알림을 1회/`MAIN_DIRTY_ALERT_INTERVAL_SECONDS`(기본 24h)로 발송, `NON_REPAIRABLE_CODES`에 편입(코덱스가 자동으로 고칠 수 없는 사람 판단 영역이므로). 커밋 `e59b90b`.
 
-### P2 — 실패한 복구를 재시도 큐로 전환
-`_run_codex_repair_impl`이 G3 경로(main dirty / merge conflict)로 실패하면:
-- `state["pending_merges"][fingerprint] = {"worktree": ..., "repair_commit": ..., "role": ..., "queued_at": ...}` 형태로 상태 파일에 기록.
-- 다음 폴링 사이클마다(또는 별도의 가벼운 체크) main이 깨끗해졌는지 확인 → 깨끗하면 그 저장된 `repair_commit`으로 병합만 재시도 (재진단 불필요, 이미 만든 커밋 재사용).
-- 성공하면 그때 서비스 재기동 + "재처리하세요" 알림. TTL(예: 24h) 지나면 큐에서 빼고 "수동 병합 필요: worktree=<path>, commit=<hash>" 알림으로 전환.
-- 이렇게 하면 G3의 "병합 실패=끝"이 "병합 실패=대기열, 조건 충족시 자동 재개"로 바뀐다.
+### P2 — [완료 2026-08-01] 실패한 복구를 재시도 큐로 전환
+`_merge_repair_commit_and_restart`로 병합·재기동 로직을 분리하고, `_run_codex_repair_impl`이 G3 경로(main dirty / merge conflict, `_is_retryable_merge_failure`로 판별)로 실패하면 `state["pending_merges"][fingerprint]`에 `{worktree, repair_commit, role, code, summary, queued_at}`를 기록. `_retry_pending_merges`가 매 폴링 사이클(`_process_cycle` 시작 시) 큐를 훑어 재진단 없이 저장된 커밋으로 병합만 재시도하고, 성공 시 서비스 재기동+`recovery_watch` 등록+"재처리하세요" 알림, `PENDING_MERGE_TTL_SECONDS`(기본 24h) 경과 시 "수동 병합 필요: worktree=..., commit=..." 알림으로 큐에서 제외. 재시도 중에는 스팸 방지를 위해 실패해도 알림 없이 조용히 대기. 커밋 `e59b90b`, 테스트 21/21 통과.
+
+병합 도중 이 두 파일을 동시에 고치던 별도 codex 세션의 변경(용량/과부하 분류, 구조화 오류 우선, 상태 스키마 버전/마이그레이션, 알림 보존기간, 코드별 메트릭)도 같은 커밋에 함께 정리됨 — 우연히 같은 저장소에서 겹쳐 작업하다 발견한 사례라 [[edge_agent_parallel_recovery_gaps]] 계열 문제(락 스코프가 아니라 "터미널에서 같은 파일을 직접 편집하는" 종류의 동시성)로 별도 기록할 가치가 있음.
 
 ### P3 — 락 재시도 파라미터 현실화 + 대기 가시성
 `WORKTREE_LOCK_RETRIES`/`WORKTREE_LOCK_RETRY_SECONDS` 기본값을 상향 조정(예: 지수 백오프로 총 30~60초)하고, 재시도 중임을 이미 있는 `_notify_waiting` 패턴처럼 사용자에게 진행 상태로 보여준다(현재는 로그에만 남고 Telegram 사용자는 그냥 기다림). 5초 만에 포기하고 락 파일 경로를 그대로 노출하는 대신, 최소한 "다른 작업 처리 중, 잠시 후 재시도"로 사용자 경험 개선.
