@@ -16,6 +16,23 @@ class SkillIntegrationContractTests(unittest.TestCase):
         self.assertNotIn(".openclaw", text)
         self.assertIn("EDGE_AGENT_RUNTIME_ROOT", text)
 
+    def test_migrated_skill_manifests_are_present(self):
+        expected = {
+            "command-registry": ROOT / "skills" / "command-registry" / "SKILL.md",
+            "harness-memory": ROOT / "skills" / "harness-memory" / "SKILL.md",
+            "hermes_runtime": ROOT / "skills" / "hermes_runtime" / "SKILL.md",
+            "quota_resume": ROOT / "skills" / "quota_resume" / "SKILL.md",
+            "product_research": ROOT / "skills" / "product_research" / "SKILL.md",
+            "calendar": ROOT / "skills" / "calendar" / "SKILL.md",
+            "roda_public_search": ROOT / "skills" / "roda_public_search" / "SKILL.md",
+        }
+        for name, path in expected.items():
+            self.assertTrue(path.is_file(), name)
+
+    def test_helper_code_has_no_legacy_workspace_dependency(self):
+        for path in (ROOT / "skills").rglob("*.py"):
+            self.assertNotIn(".openclaw/workspace", path.read_text(encoding="utf-8"), str(path))
+
 
 if __name__ == "__main__":
     unittest.main()
