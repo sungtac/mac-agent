@@ -70,7 +70,7 @@ def _load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}}
+        return {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}}
 
 
 def _save_state(state: dict) -> None:
@@ -215,6 +215,11 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("offsets", {})
     state.setdefault("pending", {})
     state.setdefault("alerted", {})
+    state.setdefault("delivery_retry", [])
+    state.setdefault("repair_results", {})
+    retry_events = list(state["delivery_retry"])
+    state["delivery_retry"] = []
+    alerts.extend(retry_events)
     for role, target in TARGETS.items():
         path = Path(target["log"])
         try:
@@ -266,7 +271,12 @@ def _process_cycle(state: dict) -> None:
     _save_state(state)
     for event in alerts:
         try:
-            diagnosis = _run_codex_repair(event)
+            fingerprint = str(event["fingerprint"])
+            diagnosis = state["repair_results"].get(fingerprint)
+            if diagnosis is None:
+                diagnosis = _run_codex_repair(event)
+                state["repair_results"][fingerprint] = diagnosis
+                _save_state(state)
             alert = (
                 f"{event['message']}\n세부: {event['detail']}\n\n"
                 f"[Codex 자동 원인 분석·개선]\n{diagnosis}\n\n"
@@ -274,6 +284,8 @@ def _process_cycle(state: dict) -> None:
             )
             _send_alert(alert)
         except Exception as exc:
+            state.setdefault("delivery_retry", []).append(event)
+            _save_state(state)
             print(f"Roda health alert delivery failed: {type(exc).__name__}: {exc}")
 
 
