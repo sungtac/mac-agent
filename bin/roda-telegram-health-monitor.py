@@ -20,6 +20,7 @@ STATE_FILE = Path(os.environ.get("RODA_GEMMA_HEALTH_STATE_FILE", "~/.edge-agent/
 TOKEN_FILE = Path(os.environ.get("RODA_GEMMA_TOKEN_FILE", "~/.config/roda-gemma/telegram.token")).expanduser()
 POLL_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_POLL_SECONDS", "30"))
 NO_RESPONSE_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_NO_RESPONSE_SECONDS", "300"))
+RECOVERY_TIMEOUT_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_RECOVERY_TIMEOUT_SECONDS", "300"))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
 AUTO_REPAIR_ENABLED = os.environ.get("RODA_GEMMA_AUTO_REPAIR_ENABLED", "1") == "1"
@@ -77,7 +78,7 @@ def _load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}}
+        return {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}, "recovery_watch": {}}
 
 
 def _save_state(state: dict) -> None:
@@ -224,6 +225,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("alerted", {})
     state.setdefault("delivery_retry", [])
     state.setdefault("repair_results", {})
+    state.setdefault("recovery_watch", {})
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
     alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
@@ -258,6 +260,14 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                 if fingerprint not in state["alerted"]:
                     alerts.append({"role": role, "code": code, "fingerprint": fingerprint, "message": f"[Roda 감지] {role} 봇에 {code} 문제가 발생했습니다. 확인이 필요합니다.", "detail": _safe_detail(line)})
                     state["alerted"][fingerprint] = current
+            for recovery in state["recovery_watch"].values():
+                if recovery.get("role") != role or recovery.get("status") in {"completed_success", "completed_failure", "timeout"}:
+                    continue
+                if START_RE.search(line):
+                    recovery["status"] = "reprocess_started"
+                    recovery["started_at"] = current
+                elif recovery.get("status") == "reprocess_started" and DONE_RE.search(line):
+                    recovery["status"] = "completed_failure" if "처리 실패" in line else "completed_success"
         if not _service_running(target["label"]):
             fingerprint = _fingerprint(role, "service_down", target["label"])
             if fingerprint not in state["alerted"]:
@@ -269,6 +279,22 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
             if fingerprint not in state["alerted"]:
                 alerts.append({"role": role, "code": "no_response", "fingerprint": fingerprint, "message": f"[Roda 감지] {role} 봇이 요청을 시작했지만 {NO_RESPONSE_SECONDS}초 내 완료·오류 기록이 없습니다. 확인이 필요합니다.", "detail": f"no completion/error event for {NO_RESPONSE_SECONDS}s"})
                 state["alerted"][fingerprint] = current
+    for recovery_fingerprint, recovery in state["recovery_watch"].items():
+        if recovery.get("status") in {"awaiting_reprocess", "reprocess_started"} and current >= float(recovery["deadline"]):
+            recovery["status"] = "timeout"
+        if recovery.get("status") in {"completed_success", "completed_failure", "timeout"} and not recovery.get("notified"):
+            status = recovery["status"]
+            label = {"completed_success": "재처리 성공", "completed_failure": "재처리 실패", "timeout": "재처리 확인 시간 초과"}[status]
+            alerts.append({
+                "kind": "recovery_result",
+                "role": recovery["role"],
+                "code": status,
+                "fingerprint": f"recovery:{recovery_fingerprint}:{status}",
+                "message": f"[Roda 복구 확인] {recovery['role']} 봇 {label}",
+                "detail": f"recovery fingerprint={recovery_fingerprint}",
+                "recovery_fingerprint": recovery_fingerprint,
+            })
+            recovery["notified"] = True
     state["initialized"] = True
     return alerts
 
@@ -278,11 +304,22 @@ def _process_cycle(state: dict) -> None:
     _save_state(state)
     for event in alerts:
         try:
+            if event.get("kind") == "recovery_result":
+                _send_alert(f"{event['message']}\n세부: {event['detail']}")
+                continue
             fingerprint = str(event["fingerprint"])
             diagnosis = state["repair_results"].get(fingerprint)
             if diagnosis is None:
                 diagnosis = _run_codex_repair(event)
                 state["repair_results"][fingerprint] = diagnosis
+                if "자동 수정·main 병합" in diagnosis and "서비스 재기동 완료" in diagnosis:
+                    state["recovery_watch"][fingerprint] = {
+                        "role": event["role"],
+                        "status": "awaiting_reprocess",
+                        "created_at": time.time(),
+                        "deadline": time.time() + RECOVERY_TIMEOUT_SECONDS,
+                        "notified": False,
+                    }
                 _save_state(state)
             alert = (
                 f"{event['message']}\n세부: {event['detail']}\n\n"

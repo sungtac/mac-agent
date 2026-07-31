@@ -27,6 +27,39 @@ class RodaHealthMonitorTests(unittest.TestCase):
             self.assertTrue(state["initialized"])
             health.TARGETS = original
 
+    def test_recovery_watch_reports_reprocess_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "x.log"
+            log.write_text("기존 로그\n", encoding="utf-8")
+            original_targets = health.TARGETS
+            original_running = health._service_running
+            health.TARGETS = {"x": {"label": "present", "log": log}}
+            health._service_running = lambda label: True
+            state = {
+                "initialized": False,
+                "offsets": {},
+                "pending": {},
+                "alerted": {},
+                "delivery_retry": [],
+                "repair_results": {},
+                "recovery_watch": {
+                    "abc123": {
+                        "role": "x",
+                        "status": "awaiting_reprocess",
+                        "deadline": 9999,
+                        "notified": False,
+                    }
+                },
+            }
+            health.poll_once(state, now=100)
+            with log.open("a", encoding="utf-8") as handle:
+                handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
+            alerts = health.poll_once(state, now=101)
+            self.assertEqual(state["recovery_watch"]["abc123"]["status"], "completed_success")
+            self.assertEqual(alerts[0]["kind"], "recovery_result")
+            health.TARGETS = original_targets
+            health._service_running = original_running
+
     def test_drops_legacy_polling_stopped_retry_without_dropping_real_failures(self):
         original = health.TARGETS
         health.TARGETS = {}
