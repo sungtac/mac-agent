@@ -31,6 +31,7 @@
 ## 구성 요소
 
 - `workflows/lib/coach-headroom.sh` — `coach --json`에서 클로드 5시간창/코덱스 7일창 잔여율을 `"<claude_pct> <codex_pct>"` 한 줄로 뽑는 공용 헬퍼. `route-dispatch.sh`·`usage-advisor.sh` 둘 다 이걸 재사용(중복 제거). 안티그래비티는 여기서 안 다룸 — `coach`가 애초에 안티그래비티 사용량을 못 봄.
+- `usage-advisor.sh`는 live `coach` 값이 `0 0`으로 반환될 때 1시간 이내의 로컬 provider usage snapshot을 advisory fallback으로 사용할 수 있다. 이 fallback은 라우팅 참고용이며 usage preflight gate의 live 실행 허가를 대체하지 않는다.
 - `workflows/lib/usage-advisor.sh` — Rule 1의 결정론적 비교. 동률이거나 클로드 값을 못 읽으면(0) 코덱스 우선 — 코덱스는 실제로 사용량이 보이고 대체로 여유(96%+ 관찰됨)라, 불확실한 클로드 쪽보다 안전한 기본값.
 - `workflows/lib/route-dispatch.sh` — Rule B 트리거 지점. 안티그래비티 우선 시도(`score-dispatch.sh` 위에 얹지 않고 독립 구현 — score-dispatch.sh는 JSON 채점용이라 일반 텍스트 응답을 "파싱 실패"로 오판해서 항상 코덱스로 폴백하는 버그가 실제로 났었음, 테스트 중 발견·수정), 실패/rate-limit 신호 시 코덱스 폴백.
 - `discord-bot.py` 자유채팅 폴백 — Claude가 quota로 막힐 때 Antigravity를 먼저 시도하고, 결과가 usable하지 않을 때만 Codex 7일창 게이트 후 실행한다. Antigravity는 `coach` 수치가 신뢰되지 않아 결과 기반으로만 판정한다. 공통 실행/분류 계약은 `discord_bot_common.py`의 `ProviderResult`/`run_provider_attempt`/`run_provider_fallback_chain`이다.

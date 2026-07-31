@@ -41,6 +41,7 @@ from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, is
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
 CODEX_EXECUTE_DISPATCH_SH = MAC_AGENT / "workflows" / "lib" / "codex-execute-dispatch.sh"
 CODEX_BIN = Path("/opt/homebrew/bin/codex")  # absolute, not bare `codex` — same PATH-under-launchd gotcha as every other subprocess binary in this repo
+PROVIDER_SANDBOX = Path(__file__).resolve().with_name("edge-agent-provider-sandbox.sh")
 # 2026-07-30, 콕스→맥 위임(CODEX_DELEGATE_TO_MAC_MARKER)용 — 콕스 자신의
 # 샌드박스 밖(이 파일, 즉 codex-bot.py 자신의 호스트 레벨 프로세스)에서
 # 직접 부른다. discord-bot.py도 똑같은 절대경로를 자기 파일에 따로 갖고
@@ -779,7 +780,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             # 반복 기록돼 있었다(사용자가 매번 `!코덱스대화초기화`로 우회).
             # resume은 이미 확립된 스레드를 이어가는 것뿐이라 git 저장소
             # 경계를 새로 검증할 필요가 없다는 점에서 안전한 우회.
-            args = [str(CODEX_BIN), "exec", "resume", existing_thread_id, "--skip-git-repo-check", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "--", prompt_text]
+            args = [str(PROVIDER_SANDBOX), str(CODEX_BIN), "exec", "resume", existing_thread_id, "--skip-git-repo-check", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "--", prompt_text]
             # Previously only sent on a brand-new thread (else branch
             # below) — a resume turn computed dirty_note above but threw
             # it away, so the "uncommitted changes already present"
@@ -797,7 +798,7 @@ async def _codex_chat_turn_locked(message: discord.Message, alias: str, text: st
             # 쌓여서 노이즈가 된다. 새 스레드 첫 턴에만 넣고, 그 뒤로는
             # exec resume이 이어받는 스레드 자체 기억에 맡긴다.
             new_thread_prompt_text = f"{CODEX_BOT_PERSONA}\n\n{prompt_text}"
-            args = [str(CODEX_BIN), "exec", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "-s", "workspace-write", "-C", str(cwd), "--", new_thread_prompt_text]
+            args = [str(PROVIDER_SANDBOX), str(CODEX_BIN), "exec", *CODEX_CHAT_REASONING_EFFORT_ARGS, "--json", "-s", "workspace-write", "-C", str(cwd), "--", new_thread_prompt_text]
             await message.channel.send(f"`{alias}` 코덱스 대화를 새로 시작합니다.{dirty_note}")
 
         proc = await asyncio.create_subprocess_exec(
@@ -920,7 +921,7 @@ async def _delegate_to_claude(message: discord.Message, task: str) -> None:
 
     try:
         proc = await asyncio.create_subprocess_exec(
-            str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text",
+            str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text",
             "--append-system-prompt", MAC_BOT_PERSONA,
             env=SUBPROCESS_ENV,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,

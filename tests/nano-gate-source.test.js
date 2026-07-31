@@ -17,7 +17,7 @@ test('나노 스텝 순서는 조회→실행→light→위험도/통합→기�
   const body = source.slice(source.indexOf('async function runNanoGate'))
   const positions = [
     body.indexOf('const existing = await checkNanoEvent'),
-    body.indexOf('const execution = await fullExecute'),
+    body.search(/(?:const|let) execution = await fullExecute/),
     body.indexOf('const lightReview = await nanoLightValidate'),
     body.indexOf('const tier = decideNanoRiskTier'),
     body.indexOf('const integration = await nanoIntegrationValidate'),
@@ -61,4 +61,10 @@ test('컨텍스트/실제 diff 수집은 모든 StructuredOutput 필드를 명�
 test('나노 이벤트 기록도 임시 파일 Read 후 Write하고 light 검토 필드를 고정한다', () => {
   assert.match(source, /반드시 Read 툴로 그 빈 임시 파일을 한 번 읽은 뒤 Write/)
   assert.match(source, /마지막 응답은 반드시 다른 설명 없이 아래 세 키를 모두 포함한 JSON 객체 하나여야 해\(필드 누락 금지\)/)
+})
+
+test('일반 트랙도 코딩 파일은 경량으로 우회하지 않는다', () => {
+  assert.match(source, /function standardFileTier\(filePath\)/)
+  assert.match(source, /const hasCodeFile = fileTiers\.includes\('mid'\)/)
+  assert.match(source, /!hasFullFile && !hasCodeFile/)
 })

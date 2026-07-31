@@ -21,6 +21,7 @@ PROMPT_FILE="${1:?usage: route-dispatch.sh <prompt-file>}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=provider-bin.sh
 . "$SCRIPT_DIR/provider-bin.sh"
+PROVIDER_SANDBOX="$SCRIPT_DIR/../../bin/edge-agent-provider-sandbox.sh"
 
 AGY_BIN="${AGY_BIN:-}"
 CODEX_BIN="${CODEX_BIN:-}"
@@ -44,7 +45,7 @@ fi
 if [ -z "$AGY_BIN" ] || [ ! -x "$AGY_BIN" ]; then
   AGY_OUTPUT=""
 else
-  AGY_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$AGY_BIN" -p "$(cat "$PROMPT_FILE")" 2>&1)"
+  AGY_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$(cat "$PROMPT_FILE")" 2>&1)"
 fi
 # Phrase match alone false-positives when agy's own LEGITIMATE answer
 # happens to discuss rate limiting as its actual subject (e.g. the prompt
@@ -75,4 +76,4 @@ if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
   echo "route-dispatch: codex 실행파일을 찾을 수 없음(CODEX_BIN override 또는 Homebrew 경로 확인)" >&2
   exit 1
 fi
-"$CODEX_BIN" exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1
+"$PROVIDER_SANDBOX" "$CODEX_BIN" exec --skip-git-repo-check "$(cat "$PROMPT_FILE")" 2>&1

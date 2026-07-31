@@ -40,6 +40,7 @@ usage_gate_check, _kill_process_group) rather than duplicating those.
 import asyncio
 import datetime
 import json
+import os
 import re
 import sys
 import uuid
@@ -47,7 +48,7 @@ from pathlib import Path
 
 import discord
 
-from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, usage_headroom_advice, should_prefer_codex, run_provider_attempt, run_provider_fallback_chain, format_provider_fallback_failure, load_provider_context, save_provider_context, clear_provider_context, format_provider_context, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN
+from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_check, usage_headroom_advice, should_prefer_codex, run_provider_attempt, run_provider_fallback_chain, format_provider_fallback_failure, load_provider_context, save_provider_context, clear_provider_context, _kill_process_group, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, MAC_BOT_PERSONA, QUOTA_LIMIT_PATTERN, atomic_write_json
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
@@ -64,6 +65,7 @@ WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
 VERIFY_TASK_V2_JS = MAC_AGENT / "workflows" / "verify-task-v2.js"
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
+PROVIDER_SANDBOX = MAC_AGENT / "bin" / "edge-agent-provider-sandbox.sh"
 ANTIGRAVITY_BIN = Path.home() / ".local" / "bin" / "agy"
 VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # full-track verify-task-v2 round-trips codex/antigravity several times
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
@@ -385,7 +387,7 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
     try:
         with try_acquire_repo_lock(str(Path(cwd).resolve())):
             proc = await asyncio.create_subprocess_exec(
-                str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+                str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
                 env=verify_task_v2_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -539,7 +541,7 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
     try:
         with try_acquire_repo_lock(str(Path(cwd).resolve())):
             proc = await asyncio.create_subprocess_exec(
-                str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
+                str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
                 env=verify_task_v2_env,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -585,9 +587,8 @@ async def send_and_requeue(message: discord.Message, text: str, job_type: str, p
     was ever hit live.
     """
     sent = await message.channel.send(text)
-    PENDING_DIR.mkdir(parents=True, exist_ok=True)
     job = {"type": job_type, "created_at": datetime.datetime.now().isoformat(), "params": params}
-    (PENDING_DIR / f"{sent.id}.json").write_text(json.dumps(job, ensure_ascii=False))
+    atomic_write_json(PENDING_DIR / f"{sent.id}.json", job)
 
 
 async def handle_pending_reply(message: discord.Message) -> bool:
@@ -989,7 +990,7 @@ async def handle_free_chat(message: discord.Message):
         # 새 스레드 때만 넣음 — 코덱스는 이게 시스템프롬프트가 아니라
         # 대화 본문 자체라 매턴 반복하면 노이즈로 쌓이기 때문, 그 차이는
         # discord_bot_common.py의 두 상수 주석 참고).
-        args = [str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text", "--append-system-prompt", MAC_BOT_PERSONA]
+        args = [str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt_text, "--output-format", "text", "--append-system-prompt", MAC_BOT_PERSONA]
         args += ["--session-id", session_id] if is_new_session else ["--resume", session_id]
 
         global FREE_CHAT_CURRENT_PROC
@@ -1124,7 +1125,7 @@ async def _fallback_to_provider_chain(message: discord.Message, text: str) -> No
             return await run_provider_attempt(
                 "codex",
                 [
-                    str(CODEX_BIN), "exec", "-s", "read-only",
+                    str(PROVIDER_SANDBOX), str(CODEX_BIN), "exec", "-s", "read-only",
                     "-C", str(FREE_CHAT_CWD), "--skip-git-repo-check", "--", prompt_text,
                 ],
                 CODEX_FALLBACK_TIMEOUT_SECONDS,

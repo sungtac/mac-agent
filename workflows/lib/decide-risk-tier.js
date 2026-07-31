@@ -26,8 +26,65 @@ const SENSITIVE_PATH_PATTERNS = [
   /(^|\/)README\.md$/,
 ]
 
+const FULL_RISK_FILE_PATTERNS = [
+  /(^|\/)(auth|authentication|authorization|routing|router|security|permissions?)(\/|\.|$)/i,
+  /(^|\/)(config|configuration|deploy|deployment|infra|infrastructure|migrations?)(\/|\.|$)/i,
+  /(^|\/)(Dockerfile|docker-compose(?:\..+)?|Makefile|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
+  /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|requirements\.txt)$/i,
+]
+
+const MID_RISK_CODE_EXTENSIONS = new Set([
+  '.c', '.cc', '.cpp', '.cs', '.go', '.java', '.js', '.jsx', '.mjs', '.py',
+  '.rb', '.rs', '.sh', '.swift', '.ts', '.tsx', '.vue',
+])
+
+const LIGHT_RISK_FILE_PATTERNS = [
+  /(^|\/)(test|tests|__tests__|fixtures?|snapshots?)(\/|\.|$)/i,
+  /\.(md|mdx|txt|rst|adoc)$/i,
+]
+
 function isSensitivePath(path) {
   return SENSITIVE_PATH_PATTERNS.some((re) => re.test(path))
+}
+
+function classifyFileRisk(filePath) {
+  const normalized = String(filePath || '').replaceAll('\\', '/')
+  if (!normalized) return 'light'
+  if (isSensitivePath(normalized) || FULL_RISK_FILE_PATTERNS.some((re) => re.test(normalized))) return 'full'
+  if (LIGHT_RISK_FILE_PATTERNS.some((re) => re.test(normalized))) return 'light'
+  const extension = normalized.includes('.') ? `.${normalized.split('.').pop().toLowerCase()}` : ''
+  if (MID_RISK_CODE_EXTENSIONS.has(extension)) return 'mid'
+  return 'light'
+}
+
+function classifyChangedFiles(files) {
+  const normalizedFiles = Array.isArray(files) ? files.filter((file) => typeof file === 'string' && file.length > 0) : []
+  const classifications = normalizedFiles.map((file) => ({ file, tier: classifyFileRisk(file) }))
+  const tier = classifications.some((item) => item.tier === 'full')
+    ? 'full'
+    : classifications.some((item) => item.tier === 'mid')
+      ? 'mid'
+      : 'light'
+  return { tier, files: classifications }
+}
+
+function topLevelPath(filePath) {
+  return String(filePath || '').replaceAll('\\', '/').split('/')[0] || ''
+}
+
+function detectDependencyBoundary(changedFiles, dependencyEdges = []) {
+  const files = new Set(Array.isArray(changedFiles) ? changedFiles : [])
+  if (!files.size) return false
+
+  // Caller-provided static import edges are authoritative when available.
+  if (Array.isArray(dependencyEdges) && dependencyEdges.some((edge) => {
+    if (!Array.isArray(edge) || edge.length < 2) return false
+    return files.has(edge[0]) && files.has(edge[1]) && topLevelPath(edge[0]) !== topLevelPath(edge[1])
+  })) return true
+
+  const hasManifest = [...files].some((file) => /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|requirements\.txt)$/.test(file))
+  const hasSource = [...files].some((file) => classifyFileRisk(file) === 'mid')
+  return hasManifest && hasSource
 }
 
 // 누적 파일 수 임계값 3은 기존 verify-task-v2.js의 decideTier()(파일수≤3 →
@@ -77,6 +134,8 @@ function decideRiskTier(input) {
     dependencyBoundaryCrossed = false,
     remainingTokenPct,
     providerHeadroom,
+    changedFiles,
+    dependencyEdges,
   } = input || {}
 
   // providerHeadroom이 있으면 양쪽 중 더 부족한 provider를 기준으로 한다.
@@ -84,8 +143,10 @@ function decideRiskTier(input) {
   const lowestHeadroom = lowestProviderHeadroom(providerHeadroom)
   const tokenPct = lowestHeadroom ?? validPercentage(remainingTokenPct)
 
-  if (sensitivePath) return 'full'
-  if (dependencyBoundaryCrossed) return 'mid'
+  const fileClassification = classifyChangedFiles(changedFiles)
+  if (sensitivePath || fileClassification.tier === 'full') return 'full'
+  if (fileClassification.tier === 'mid') return 'mid'
+  if (dependencyBoundaryCrossed || detectDependencyBoundary(changedFiles, dependencyEdges)) return 'mid'
   if (cumulativeFileCount > CUMULATIVE_FILE_THRESHOLD) return 'mid'
   if (stepFileCount > STEP_FILE_THRESHOLD) return 'mid'
   if (tokenPct !== undefined && tokenPct <= LOW_TOKEN_PCT_THRESHOLD) return 'mid'
@@ -97,6 +158,13 @@ module.exports = {
   validPercentage,
   lowestProviderHeadroom,
   isSensitivePath,
+  classifyFileRisk,
+  classifyChangedFiles,
+  detectDependencyBoundary,
+  topLevelPath,
+  FULL_RISK_FILE_PATTERNS,
+  MID_RISK_CODE_EXTENSIONS,
+  LIGHT_RISK_FILE_PATTERNS,
   SENSITIVE_PATH_PATTERNS,
   CUMULATIVE_FILE_THRESHOLD,
   STEP_FILE_THRESHOLD,

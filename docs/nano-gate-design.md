@@ -16,11 +16,32 @@
 2026-07-30 실 provider 파일럿 재시도: 동일한 격리 저장소에서 일반 실행은 다시 `ENOTFOUND`로 실패했다. 네트워크 권한 승인 후 재시도는 API 연결 뒤 장시간 응답하지 않아 제한적으로 중단했으며, `pilot.py`·이벤트 원장 모두 변경되지 않았다. 이번 결과는 provider/세션 실행 완료가 확인되지 않은 `provider_timeout_or_hang`으로 기록하고, 성공 표본이나 코드 결함 표본으로 집계하지 않는다.
 
 2026-07-30 이식성 보강: `MAC_AGENT_ROOT`/`HOME` 기반 기본 경로와 `CODEX_BIN`/`AGY_BIN` override를 추가하고, score·write·route 디스패처가 공통 실행파일 resolver를 사용하도록 정리했다. 기본값은 기존 머신에서 유지되며, `$HOME/.local/bin`, Apple Silicon/Intel Homebrew 경로, `PATH` 순서로 탐색한다.
-2026-07-30 파일럿 watchdog 보강: `bin/run-nano-provider-pilot.sh`를 추가했다. 실제 `claude -p`를 기본 1회·300초 제한으로 실행하고, `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`으로 Workflow 완료 전 백그라운드 분리를 막으며, 정지 시 종료/자식 정리, quota/session-limit 즉시 중단, 출력 로그와 이벤트 원장 바이트 변화 보고를 수행한다. fake CLI 테스트로 성공·hang·quota 비재시도를 검증한다. 이 래퍼는 Workflow 내부 게이트가 아니라 실제 provider 파일럿의 외부 실행 경계다.
+2026-07-30 파일럿 watchdog 보강: `bin/run-nano-provider-pilot.sh`를 추가했다. 실제 `claude -p`를 기본 1회·600초 제한으로 실행하고, `CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0`으로 Workflow 완료 전 백그라운드 분리를 막으며, 정지 시 재귀적 자식 정리, quota/session-limit 즉시 중단, 출력 로그와 이벤트 원장 바이트 변화 보고를 수행한다. Claude가 Workflow를 백그라운드로 넘겼다고 반환하는 경우도 성공으로 오인하지 않는다. fake CLI 테스트로 성공·hang·quota·detached 비재시도를 검증한다. 이 래퍼는 Workflow 내부 게이트가 아니라 실제 provider 파일럿의 외부 실행 경계다.
+2026-07-31 파일럿 안정화: 외부 러너의 이벤트 파일·cwd와 프롬프트 내부 Workflow 인자의 불일치를 provider 실행 전에 차단한다. Workflow 실행 응답이 성공이어도 실제 git diff가 없으면 나노 단계에서 1회 교정 실행하고, Codex dispatcher의 실행 실패는 구조화된 `dispatchFailed`로 표시해 1회 재시도한다. 따라서 provider의 자기보고, 잘못된 이벤트 경로, 조용한 no-op을 각각 독립적으로 신뢰하지 않는다.
+2026-07-31 Codex 실행 감사: `codex-execute-dispatch.sh`는 실행 결과를 `~/.claude/edge-agent/codex-execute-events.jsonl`에 구조화해 기록한다. 대상 cwd, 종료코드, 소요시간, 성공/실패 상태와 출력 끝부분을 남기되 인증 헤더·토큰·비밀번호·이메일은 마스킹한다. 이 로그는 Codex 자기보고를 성공 증거로 쓰기 위한 것이 아니라, no-op·권한·인증·실행 오류의 원인을 사후 판별하기 위한 진단 원장이다.
+사용량 사전조회가 실패하거나 `coach` 데이터가 확인되지 않으면 실제 파일럿을 시작하지 않는 보호 모드를 추가했다(`NANO_PILOT_REQUIRE_USAGE_DATA=1`, 기본값). 테스트용 fake provider는 명시적으로 `0`으로 끌 수 있다.
+파일럿 종료 후에는 `NANO_USAGE_SNAPSHOT_SCRIPT`를 설정한 경우 사용량 snapshot을 한 번 기록한다. snapshot 실패는 작업 성공·실패 판정을 덮어쓰지 않고 `usage_snapshot=unavailable`로만 보고한다.
+또한 외부 `claude` 프로세스가 exit 0이어도 Workflow 최종 JSON에 `passed:false` 또는 `nano_*` 오류가 있으면 `workflow_failed`로 분류한다. 프로세스 성공과 작업 성공을 동일시하지 않는다.
 2026-07-30 watchdog 실측: 사용량 사전 게이트는 `PROCEED`였지만 실제 격리 파일럿은 120초 제한에서 `status=timeout`, `exit=124`로 종료됐다. debug 로그에는 Workflow가 시작된 뒤 완료 응답 없이 중단됐고, 종료 시 MCP 자식 프로세스가 정리된 사실이 남았다. `pilot.py`와 `events.jsonl`은 변경되지 않았다. 따라서 기존의 무기한 정지 문제는 bounded failure로 바뀌었지만, provider 성공 표본은 여전히 0건이다.
 2026-07-30 provider 계약 수정 및 재실측: 실제 로그에서 (a) headless Workflow 임시 파일을 `Read` 없이 `Write`하던 지시, (b) `gatherContext`/`gatherRealDiff`가 StructuredOutput 필드를 누락할 수 있던 프롬프트를 발견해 수정했다. 수정 후 명시적 단일 나노 스텝이 실제 Codex 실행까지 도달했고 `pilot.py`에 `cube()`가 반영됐다. 그러나 300초 시점에 최종 light 검증/이벤트 기록 전 중단되어 `events-explicit.jsonl`은 생성되지 않았고, scratch 저장소에는 부분 변경이 남았다. 이는 provider 실행·코드 수정 성공의 증거이지 나노 게이트 통과 증거가 아니며, 성공 표본으로 집계하지 않는다.
 2026-07-30 이벤트 기록 계약 수정: `recordNanoEvent`에도 임시 파일 선행 Read 지시를 추가하고, nano light 검토 응답에 `hasBlockingIssue`/`issues`/`notes` 세 필드 템플릿을 명시했다. 최종 clean 파일럿은 이 단계까지 도달했으나 Claude API가 `429 This request would exceed your account's rate limit`을 반환해 중단했다. clean scratch의 `pilot.py`와 이벤트 원장은 변경되지 않았으며, 성공 표본은 여전히 0건이다. 현재 남은 운영 작업은 rate limit 회복 후 새 clean scratch에서 한 번 성공 이벤트를 확인하는 것이다.
 2026-07-30 실 provider 파일럿 성공: 동일 clean scratch(`/private/tmp/nano-provider-pilot-final-20260730`)에서 `bin/run-nano-provider-pilot.sh`를 `NANO_PILOT_TIMEOUT_SECONDS=580`으로(기존 300초는 코드 실행+검증+이벤트 기록을 다 채우기엔 부족해 두 차례 그 경계에서 시간 초과했다), 세션 자체에 종속되지 않도록 `nohup ... & disown`으로 분리해서 실행했다(Bash 툴의 `run_in_background`로 띄운 이전 두 번의 시도는 이 세션을 호스팅하는 상위 프로세스가 재시작되며 자식까지 함께 죽었다 — `agy` 백그라운딩 때와 동일한 계열의 문제). `status=success`, `exit=0`, 소요시간 265초로 `cube-implementation-1` 스텝이 완료됐고 `events.jsonl`에 `status:"passed"`, `verificationTier:"light"` 이벤트가 정상 기록됐다(idempotencyKey `real-provider-pilot-final-explicit-20260730::cube-implementation-1`). `pilot.py`에 `cube(value)`가 반영되고 `square(value)`는 그대로 유지됐다. 이것으로 4단계 실 provider 파일럿 성공 표본 1건이 확보됐다. 남은 것은 5단계(임계값 조정)뿐이며, 이번 단일 표본만으로는 분석기(20건/10건/10건 조건)를 충족하지 못하므로 표본은 계속 누적한다.
+
+## 파일 기반 위험도 분류
+
+나노 게이트는 변경 파일을 먼저 기계적으로 분류한 뒤 기존 변경량·의존성·잔여
+사용량 신호와 결합한다. 파일 분류만으로 병렬 실행을 허용하지는 않는다.
+
+- `light`: 테스트·fixture·snapshot·일반 문서
+- `mid`: 일반 소스 코드(`.js`, `.ts`, `.py`, `.go`, `.rs` 등)
+- `full`: 인증·권한·보안·라우팅·설정·배포·인프라·마이그레이션·의존성 선언 파일
+- 목록에 여러 티어가 섞이면 가장 높은 티어를 적용한다.
+- package manifest와 소스 코드가 함께 바뀌거나, 명시된 정적 dependency edge가
+  서로 다른 최상위 경계를 가로지르면 `mid` 이상으로 올린다.
+
+이 기준은 `workflows/lib/decide-risk-tier.js`와 `verify-task-v2.js`에 동기화되어
+있다. 파일명 규칙은 정적 안전장치이며, Claude의 작업 의도 설명만으로 티어를
+낮출 수 없다.
 
 ## 배경 — 사용자 원 제안
 

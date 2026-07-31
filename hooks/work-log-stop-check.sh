@@ -45,14 +45,29 @@ write_pending_job() {
   [ -z "$msg_id" ] && return 0
   mkdir -p "$PENDING_DIR"
   python3 -c "
-import json, sys, datetime
+import json, sys, datetime, os, tempfile
 job = {
     'type': 'work-log-retry',
     'created_at': datetime.datetime.now().isoformat(),
     'params': {'session_id': sys.argv[1], 'transcript_path': sys.argv[2]},
 }
-with open(sys.argv[3], 'w') as f:
-    json.dump(job, f)
+target = sys.argv[3]
+directory = os.path.dirname(target)
+fd, temporary = tempfile.mkstemp(prefix='.' + os.path.basename(target) + '.', dir=directory)
+try:
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(job, f, separators=(',', ':'))
+        f.write('\\n')
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(temporary, target)
+except Exception:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
 " "$SESSION_ID" "$TRANSCRIPT_PATH" "$PENDING_DIR/${msg_id}.json"
 }
 

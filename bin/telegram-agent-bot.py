@@ -15,6 +15,7 @@ import hashlib
 import os
 import re
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -28,11 +29,36 @@ from telegram.constants import ChatType, MessageEntityType
 from telegram.error import Conflict, NetworkError, TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from edge_agent_locks import canonical_repository_root
+from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
+from edge_agent_reflection import write_reflection, write_worktree_metadata
+from edge_agent_state import write_task_state
+
 
 HOME = Path.home()
+PROVIDER_SANDBOX = Path(__file__).resolve().with_name("edge-agent-provider-sandbox.sh")
 WORKSPACE = Path(
-    os.environ.get("TELEGRAM_AGENT_WORKSPACE", str(HOME / ".openclaw" / "workspace"))
+    os.environ.get("TELEGRAM_AGENT_WORKSPACE", str(HOME / ".edge-agent-worktrees" / "telegram-bootstrap"))
 ).expanduser().resolve()
+CODEX_WORKSPACE = Path(
+    os.environ.get(
+        "TELEGRAM_AGENT_CODEX_WORKSPACE",
+        str(HOME / ".edge-agent-worktrees" / "telegram-bootstrap"),
+    )
+).expanduser().resolve()
+CODEX_SOURCE_REPO = Path(
+    os.environ.get("TELEGRAM_AGENT_SOURCE_REPO", str(HOME / "mac-agent"))
+).expanduser().resolve()
+CODEX_TASK_WORKTREE_ROOT = Path(
+    os.environ.get(
+        "TELEGRAM_CODEX_TASK_WORKTREE_ROOT",
+        str(HOME / ".edge-agent-worktrees" / "telegram-tasks"),
+    )
+).expanduser().resolve()
+RUNTIME_CONTRACT = Path(
+    os.environ.get("EDGE_AGENT_RUNTIME_CONTRACT", str(HOME / ".edge-agent" / "EDGE_AGENT.md"))
+).expanduser().resolve()
+ACTIVE_TASK_WORKSPACE: Path | None = None
 ROLE = os.environ.get("TELEGRAM_AGENT_ROLE", "").strip().lower()
 TOKEN_FILE = Path(
     os.environ.get(
@@ -119,6 +145,7 @@ if not TOKEN:
 
 ENV = {
     **os.environ,
+    "HOME": str(HOME),
     "PATH": f"/opt/homebrew/bin:{HOME / '.local' / 'bin'}:{os.environ.get('PATH', '/usr/bin:/bin')}",
 }
 
@@ -126,6 +153,47 @@ ENV = {
 def log(message: str) -> None:
     timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     print(f"[{timestamp}] [{ROLE}] {message}", file=sys.stderr, flush=True)
+
+
+def _provider_workspace(role: str) -> Path:
+    if ACTIVE_TASK_WORKSPACE is not None:
+        return ACTIVE_TASK_WORKSPACE
+    return CODEX_WORKSPACE if role == "codex" else WORKSPACE
+
+
+def _create_task_worktree(task_id: str) -> Path:
+    CODEX_TASK_WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
+    target = CODEX_TASK_WORKTREE_ROOT / task_id
+    if target.exists():
+        return target
+    if not (CODEX_SOURCE_REPO / ".git").exists():
+        raise RuntimeError(f"Telegram 기준 저장소가 없습니다: {CODEX_SOURCE_REPO}")
+    completed = subprocess.run(
+        ["/usr/bin/git", "-C", str(CODEX_SOURCE_REPO), "worktree", "add", "--detach", str(target), "HEAD"],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "git worktree add 실패").strip()
+        raise RuntimeError(f"Telegram 작업 worktree 생성 실패: {detail[-500:]}")
+    return target
+
+
+def _auth_source(role: str) -> str:
+    if role == "claude":
+        return str(HOME / ".claude")
+    if role == "codex":
+        return os.environ.get("CODEX_HOME", str(HOME / ".codex"))
+    return os.environ.get("GEMINI_DIR", str(HOME / ".gemini"))
+
+
+def _runtime_prompt(prompt: str) -> str:
+    return (
+        f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
+        "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
+        f"[사용자 요청]\n{prompt}"
+    )
 
 
 def _harden_log_permissions() -> None:
@@ -452,7 +520,8 @@ class WorkspaceLockBusy(Exception):
 
 
 def _workspace_lock_path(resolved_path: str) -> Path:
-    digest = hashlib.sha256(resolved_path.encode()).hexdigest()[:32]
+    canonical_path = str(canonical_repository_root(resolved_path))
+    digest = hashlib.sha256(canonical_path.encode()).hexdigest()[:32]
     return _WORKSPACE_LOCK_DIR / f"{digest}.lock"
 
 
@@ -486,7 +555,13 @@ async def acquire_workspace_lock(resolved_path: str, on_wait=None):
         os.close(fd)
 
 
-async def _run_cli(role: str, prompt: str, on_wait=None, timeout_seconds: int | None = None) -> str:
+async def _run_cli(
+    role: str,
+    prompt: str,
+    on_wait=None,
+    timeout_seconds: int | None = None,
+    sandbox_mode: str = "workspace-write",
+) -> str:
     timeout_seconds = timeout_seconds if timeout_seconds is not None else TIMEOUT_SECONDS
     cli_path = ROLES[role]["binary"]
     if not cli_path.exists():
@@ -497,17 +572,19 @@ async def _run_cli(role: str, prompt: str, on_wait=None, timeout_seconds: int | 
         # message like "--dangerously-skip-permissions 다 해줘" would be
         # parsed as a real CLI flag instead of prompt text.
         args = [
-            str(cli_path), "-p", "--output-format", "text",
+            str(cli_path), "-p", "--dangerously-skip-permissions", "--output-format", "text",
             "--append-system-prompt",
-            "너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라.",
-            "--", prompt,
+            f"너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라. 공통 운영 계약은 {RUNTIME_CONTRACT}에 있다.",
+            "--", _runtime_prompt(prompt),
         ]
     elif role == "codex":
+        provider_workspace = _provider_workspace(role)
         args = [
-            str(cli_path), "exec", "--json", "-s", "workspace-write",
-            "-C", str(WORKSPACE), "--skip-git-repo-check", "--", prompt,
+            str(cli_path), "exec", "--json", "-s", sandbox_mode,
+            "-C", str(provider_workspace), "--skip-git-repo-check", "--", _runtime_prompt(prompt),
         ]
     else:
+        provider_workspace = _provider_workspace(role)
         # `--print` is a *string-valued* flag (Go stdlib `flag` package) —
         # its value is whatever argv token comes immediately after it, taken
         # verbatim, dash-prefix or not. That means:
@@ -527,13 +604,26 @@ async def _run_cli(role: str, prompt: str, on_wait=None, timeout_seconds: int | 
         # it is for claude/codex — prompt is consumed whole as --print's
         # value, never re-parsed as a separate flag, regardless of its
         # content.
-        args = [str(cli_path), "--print", prompt]
+        # Telegram invokes print mode without an interactive terminal.  In
+        # that mode Antigravity cannot present a Bash/tool permission prompt;
+        # it soft-denies the tool and may exit 0 with no stdout.  The provider
+        # sandbox still blocks writes to Team OS-owned paths, so auto-approve
+        # is needed here to make the headless bridge operational while keeping
+        # the repository boundary enforced by the wrapper.
+        args = [str(cli_path), "--dangerously-skip-permissions", "--print", _runtime_prompt(prompt)]
+
+    if role != "codex":
+        provider_workspace = _provider_workspace(role)
+
+    # The wrapper applies the protected Team OS path policy to the provider
+    # CLI and every child tool it starts, while preserving the original argv.
+    args = [str(PROVIDER_SANDBOX), *args]
 
     try:
-        async with acquire_workspace_lock(str(WORKSPACE), on_wait=on_wait):
+        async with acquire_workspace_lock(str(provider_workspace), on_wait=on_wait):
             proc = await asyncio.create_subprocess_exec(
                 *args,
-                cwd=str(WORKSPACE),
+                cwd=str(provider_workspace),
                 env=ENV,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
@@ -604,12 +694,25 @@ async def _run_cli(role: str, prompt: str, on_wait=None, timeout_seconds: int | 
             output = candidates[-1].strip()
 
     if not output:
-        raise RuntimeError(f"{role}가 빈 응답을 반환했습니다.")
+        detail = error or "CLI가 종료됐지만 stdout에 최종 응답을 쓰지 않았습니다."
+        log(f"{role} empty response: {detail[-1600:]}")
+        raise RuntimeError(f"{role}가 빈 응답을 반환했습니다: {detail[-500:]}")
     return output
 
 
 async def run_provider(prompt: str, on_wait=None) -> str:
     return await _run_cli(ROLE, prompt, on_wait=on_wait)
+
+
+async def generate_coding_plan(prompt: str, on_wait=None) -> str:
+    plan_prompt = (
+        "코드를 수정하지 말고 읽기 전용으로 조사하라. 아래 코딩 요청에 대해 "
+        "실행 가능한 계획만 작성하라. 계획에는 목표, 범위, 변경 예정 파일, "
+        "나노 작업, 검증 명령, 위험과 롤백 방법을 포함하라. 확인하지 않은 "
+        "파일·명령·테스트 결과를 완료된 것처럼 말하지 말라.\n\n"
+        f"[코딩 요청]\n{prompt}"
+    )
+    return await _run_cli(ROLE, plan_prompt, on_wait=on_wait, sandbox_mode="read-only")
 
 
 # --- Codex-authors / Claude+Antigravity-verify loop ------------------------
@@ -676,6 +779,7 @@ def _looks_like_coding_task(text: str) -> bool:
 
 
 _VERDICT_MARKER = re.compile(r"RESULT:\s*(PASS|FAIL)", re.IGNORECASE)
+_UNAVAILABLE_MARKER = re.compile(r"(session limit|rate limit|quota|not logged|인증|사용 한도|세션 한도)", re.IGNORECASE)
 
 
 def _parse_verdict(verdict_text: str) -> bool | None:
@@ -690,11 +794,32 @@ def _parse_verdict(verdict_text: str) -> bool | None:
     return match.group(1).upper() == "PASS"
 
 
+def _provider_unavailable(text: str) -> bool:
+    return bool(_UNAVAILABLE_MARKER.search(text or ""))
+
+
+def _static_verify(workspace: Path) -> str:
+    """Minimal non-provider fallback; never claims semantic correctness."""
+    try:
+        result = subprocess.run(
+            ["/usr/bin/git", "-C", str(workspace), "diff", "--check"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"정적 검증 실행 오류: {exc}"
+    if result.returncode == 0:
+        return "git diff --check 통과 (의미적 검증은 아님)"
+    return f"git diff --check 실패: {(result.stdout or result.stderr).strip()[-500:]}"
+
+
 def _build_verify_prompt(original_request: str, codex_report: str) -> str:
     return (
         "너는 이 Telegram 단체방에서 코덱스가 방금 수행한 코드 작업을 객관적이고 "
         "냉정하게 검증하는 역할이다. 코덱스의 자체 보고를 그대로 믿지 말고, 실제 "
-        f"워크스페이스({WORKSPACE}) 파일을 직접 열어 확인하라 — git 저장소면 git diff/log로 "
+        f"워크스페이스({_provider_workspace('codex')}) 파일을 직접 열어 확인하라 — git 저장소면 git diff/log로 "
         "실제 변경사항을 확인하고, 아니라면 관련 파일을 직접 읽어서 확인하라.\n\n"
         f"[원래 요청]\n{original_request}\n\n"
         f"[코덱스 자체 보고]\n{codex_report}\n\n"
@@ -747,18 +872,22 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
             log(f"라운드 진행상황 전송 실패(계속 진행): {exc}")
 
         verify_prompt = _build_verify_prompt(original_prompt, codex_report)
+        claude_available = True
         try:
             claude_verdict = await _run_cli(
                 "claude", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
             )
         except Exception as exc:
-            claude_verdict = f"RESULT: FAIL\n(클로드 검증 실행 오류: {exc})"
+            claude_available = False
+            claude_verdict = f"RESULT: UNAVAILABLE\n(클로드 검증을 사용할 수 없음: {exc})"
+        antigravity_available = True
         try:
             agy_verdict = await _run_cli(
                 "antigravity", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
             )
         except Exception as exc:
-            agy_verdict = f"RESULT: FAIL\n(안티그래비티 검증 실행 오류: {exc})"
+            antigravity_available = False
+            agy_verdict = f"RESULT: UNAVAILABLE\n(안티그래비티 검증을 사용할 수 없음: {exc})"
         last_claude_verdict, last_agy_verdict = claude_verdict, agy_verdict
 
         try:
@@ -771,6 +900,18 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
 
         if _parse_verdict(claude_verdict) and _parse_verdict(agy_verdict):
             return f"✅ 라운드{round_num}에서 클로드·안티그래비티 검증 통과.\n\n{codex_report}"
+
+        if (_parse_verdict(claude_verdict) and not antigravity_available) or (
+            _parse_verdict(agy_verdict) and not claude_available
+        ):
+            static_result = _static_verify(_provider_workspace("codex"))
+            return (
+                f"⚠️ 부분 검증만 완료되었습니다 (라운드{round_num}).\n"
+                "한 provider를 사용할 수 없어 독립 검증 합의는 성립하지 않았습니다.\n\n"
+                f"[정적 검증] {static_result}\n"
+                f"[클로드] {claude_verdict}\n\n[안티그래비티] {agy_verdict}\n\n"
+                f"[최종 코덱스 작업]\n{codex_report}"
+            )
 
     return (
         f"⚠️ {CODEX_VERIFY_MAX_ROUNDS}라운드까지 재수정했지만 클로드·안티그래비티 검증 "
@@ -857,9 +998,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     async with _BUSY_LOCK:
+        global ACTIVE_TASK_WORKSPACE
         user_id = message.from_user.id if message.from_user else "?"
         started = time.monotonic()
         log(f"처리 시작 chat={message.chat_id} user={user_id} text={text[:80]!r}")
+        task_id = write_task_state(
+            role=ROLE,
+            chat_id=message.chat_id,
+            text=text,
+            status="started",
+            workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+            auth_source=_auth_source(ROLE),
+        )
+
+        if ROLE in ROLES:
+            try:
+                ACTIVE_TASK_WORKSPACE = _create_task_worktree(task_id)
+                write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
+                write_task_state(
+                    role=ROLE,
+                    chat_id=message.chat_id,
+                    text=text,
+                    status="started",
+                    task_id=task_id,
+                    workspace=str(ACTIVE_TASK_WORKSPACE),
+                    auth_source=_auth_source(ROLE),
+                )
+            except Exception as exc:
+                ACTIVE_TASK_WORKSPACE = None
+                write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
+                await message.reply_text(f"❌ Codex 작업공간 생성 오류: {exc}")
+                return
 
         progress = None
         try:
@@ -885,14 +1054,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # "❌ ... 실행 오류" — the task had actually succeeded. Caught in
         # round-6 independent review, 2026-07-31.
         try:
-            if ROLE == "codex" and _looks_like_coding_task(text):
-                reply = await codex_verify_and_revise(text, message, on_wait=_notify_waiting)
+            if ROLE == "codex" and is_approval(text):
+                pending = load_pending(message.chat_id)
+                if pending is None:
+                    raise RuntimeError("승인 대기 중인 계획이 없습니다. 먼저 코딩 요청을 보내세요.")
+                clear_pending(message.chat_id)
+                reply = await codex_verify_and_revise(str(pending["request"]), message, on_wait=_notify_waiting)
+            elif ROLE == "codex" and _looks_like_coding_task(text):
+                plan = await generate_coding_plan(text, on_wait=_notify_waiting)
+                save_pending(
+                    chat_id=message.chat_id,
+                    task_id=task_id,
+                    request=text,
+                    plan=plan,
+                    workspace=str(ACTIVE_TASK_WORKSPACE or CODEX_WORKSPACE),
+                )
+                reply = (
+                    "📋 실행 계획을 만들었습니다. 아직 코드는 수정하지 않았습니다.\n\n"
+                    f"{plan}\n\n"
+                    "계획을 검토한 뒤 `실행 승인`이라고 보내면 구현을 시작합니다."
+                )
             elif ROLE == "claude" and _looks_like_coding_task(text):
                 reply = await claude_delegates_to_codex(text, message, on_wait=_notify_waiting)
             else:
                 reply = await run_provider(text, on_wait=_notify_waiting)
         except Exception as exc:
             log(f"처리 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
+            write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
+            write_reflection(
+                task_id=task_id,
+                role=ROLE,
+                workspace=str(ACTIVE_TASK_WORKSPACE or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
+                status="failed",
+                error=str(exc),
+            )
+            ACTIVE_TASK_WORKSPACE = None
             error_text = f"❌ {ROLE_LABELS[ROLE]} 실행 오류: {exc}"
             try:
                 if progress is not None:
@@ -914,12 +1110,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     await progress.edit_text(chunk)
                 else:
                     await message.reply_text(chunk)
+            write_task_state(
+                role=ROLE,
+                chat_id=message.chat_id,
+                text=text,
+                status="completed",
+                task_id=task_id,
+                response_preview=reply[:1000],
+            )
+            write_reflection(
+                task_id=task_id,
+                role=ROLE,
+                workspace=str(ACTIVE_TASK_WORKSPACE or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
+                status="completed",
+                response_preview=reply,
+            )
+            ACTIVE_TASK_WORKSPACE = None
             log(f"처리 완료 chat={message.chat_id} duration={time.monotonic() - started:.1f}s truncated={truncated}")
         except TelegramError as exc:
             # Provider already succeeded — do NOT show the "실행 오류"
             # error text here, that would misreport a delivery problem as a
             # task failure. Just log it; the user sees a stuck "⏳ 처리
             # 중..." message, which at least doesn't claim something false.
+            ACTIVE_TASK_WORKSPACE = None
             log(f"provider 성공했으나 텔레그램 전송 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
 
 
@@ -972,7 +1185,7 @@ def _acquire_singleton_lock() -> None:
 
 def main() -> None:
     _harden_log_permissions()
-    log(f"Starting direct Telegram {ROLE} bot; workspace={WORKSPACE}; cli={CLI}")
+    log(f"Starting direct Telegram {ROLE} bot; workspace={(CODEX_WORKSPACE if ROLE == 'codex' else WORKSPACE)}; cli={CLI}")
     _acquire_singleton_lock()
     # Python 3.14 removed asyncio.get_event_loop()'s implicit loop creation,
     # which Application.run_polling() still relies on internally — without

@@ -5,6 +5,9 @@ const {
   isSensitivePath,
   validPercentage,
   lowestProviderHeadroom,
+  classifyFileRisk,
+  classifyChangedFiles,
+  detectDependencyBoundary,
 } = require('../workflows/lib/decide-risk-tier.js')
 
 test('빈 입력/기본값은 light', () => {
@@ -90,4 +93,50 @@ test('isSensitivePath: .github/workflows, .env, secrets, README 등 매칭', () 
   assert.equal(isSensitivePath('config/secrets.yml'), true)
   assert.equal(isSensitivePath('README.md'), true)
   assert.equal(isSensitivePath('src/utils/helpers.js'), false)
+})
+
+test('파일 위험도 분류: 일반 코드 mid, 테스트·문서 light, 민감·운영 파일 full', () => {
+  assert.equal(classifyFileRisk('src/service.ts'), 'mid')
+  assert.equal(classifyFileRisk('tests/service.test.ts'), 'light')
+  assert.equal(classifyFileRisk('docs/guide.md'), 'light')
+  assert.equal(classifyFileRisk('src/auth/login.py'), 'full')
+  assert.equal(classifyFileRisk('config/production.yaml'), 'full')
+  assert.equal(classifyFileRisk('.github/workflows/ci.yml'), 'full')
+})
+
+test('파일 목록은 가장 높은 위험도를 선택한다', () => {
+  assert.deepEqual(classifyChangedFiles(['tests/a.test.ts', 'src/a.ts']), {
+    tier: 'mid',
+    files: [
+      { file: 'tests/a.test.ts', tier: 'light' },
+      { file: 'src/a.ts', tier: 'mid' },
+    ],
+  })
+  assert.equal(classifyChangedFiles(['docs/a.md', 'config/settings.json']).tier, 'full')
+  assert.equal(classifyChangedFiles([]).tier, 'light')
+})
+
+test('변경 파일 분류는 기존 수치·토큰 규칙보다 낮추지 않는다', () => {
+  assert.equal(decideRiskTier({ changedFiles: ['src/a.ts'], stepFileCount: 1 }), 'mid')
+  assert.equal(decideRiskTier({ changedFiles: ['config/a.yml'], remainingTokenPct: 100 }), 'full')
+  assert.equal(decideRiskTier({ changedFiles: ['tests/a.test.ts'], remainingTokenPct: 100 }), 'light')
+})
+
+test('명시적 의존성 edge가 서로 다른 경계를 가로지르면 mid로 승격', () => {
+  assert.equal(
+    detectDependencyBoundary(['src/a.ts', 'workflows/a.js'], [['src/a.ts', 'workflows/a.js']]),
+    true
+  )
+  assert.equal(
+    decideRiskTier({
+      changedFiles: ['src/a.ts', 'workflows/a.js'],
+      dependencyEdges: [['src/a.ts', 'workflows/a.js']],
+    }),
+    'mid'
+  )
+})
+
+test('manifest와 소스 코드 동시 변경은 정적 의존성 경계로 mid', () => {
+  assert.equal(detectDependencyBoundary(['package.json', 'src/index.js']), true)
+  assert.equal(detectDependencyBoundary(['src/a.js', 'src/b.js']), false)
 })

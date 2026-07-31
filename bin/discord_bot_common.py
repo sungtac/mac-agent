@@ -18,8 +18,11 @@ import json
 import os
 import re
 import signal
+import tempfile
 from pathlib import Path
 from typing import Awaitable, Callable
+
+from edge_agent_locks import canonical_repository_root
 
 MAC_AGENT = Path.home() / "mac-agent"
 
@@ -77,6 +80,27 @@ def parse_headroom_advice(output: str) -> HeadroomAdvice:
     return HeadroomAdvice(
         match.group(1).lower(), claude_pct, codex_pct, raw,
     )
+
+
+def atomic_write_json(path: Path, payload: dict) -> None:
+    """Write one JSON object via same-directory temp file + atomic replace."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_name, path)
+    except Exception:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def should_prefer_codex(advice: HeadroomAdvice, minimum_margin_pct: int = 20) -> bool:
@@ -645,14 +669,16 @@ def _repo_lock_path(resolved_path: str) -> Path:
     # A hash, not the raw path, as the filename — resolved repo paths can be
     # long/contain characters awkward for a filename, and a hash keeps the
     # lock directory flat and collision-free without needing to sanitize.
-    digest = hashlib.sha256(resolved_path.encode()).hexdigest()[:32]
+    canonical_path = str(canonical_repository_root(resolved_path))
+    digest = hashlib.sha256(canonical_path.encode()).hexdigest()[:32]
     return REPO_LOCK_DIR / f"{digest}.lock"
 
 
 @contextlib.contextmanager
 def try_acquire_repo_lock(resolved_path: str):
-    """Cross-process, non-blocking file lock keyed by a repo's resolved
-    absolute path (2026-07-30, added in the same integration audit that
+    """Cross-process, non-blocking file lock keyed by a repo's canonical
+    common root (2026-07-31, worktree-safe contract implementation; added
+    in the same integration audit that
     fixed the !코덱스 double-fire bug).
 
     `CODEX_DISPATCH_LOCKS` (codex-bot.py's own asyncio.Lock dict) only
@@ -666,7 +692,7 @@ def try_acquire_repo_lock(resolved_path: str):
     never queue/wait" semantics the in-process locks already use.
 
     Uses `flock(2)` via a plain lock file under `REPO_LOCK_DIR`, one per
-    resolved path (hashed filename). Non-blocking (`LOCK_NB`): raises
+    canonical repository root (hashed filename). Non-blocking (`LOCK_NB`): raises
     `RepoLockBusy` immediately if any other process — this one's sibling
     coroutine included, though callers should keep using the cheaper
     in-process `asyncio.Lock` as the first check for that case — already

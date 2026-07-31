@@ -12,6 +12,7 @@ Source of truth for Claude Code assets (skills, workflows) shared across a fleet
   바꿔서 그 시점 이후 전체가 캐시 미스로 재계산된다(캐시 TTL 5분 — 프리픽스가 달라지면
   이전 캐시는 재사용 불가). 수정·전환은 항상 세션 경계(새 세션 시작 시)에서만.
   (출처: 실밸개발자 Claude Code 강의 2편, 2026-07-29 검토·반영)
+- **컨텍스트가 30~40만 토큰에 이르기 전에 자동 `/compact`를 기다리지 말고 수동으로 선제 실행할 것.** compact 지시 때는 목표/결정사항, 제약조건, 변경된 파일 경로, 발견한 버그를 반드시 보존하도록 명시적으로 지시하라. 이는 같은 작업을 다음 창으로 이어갈 때만 쓰며, 완전히 새 작업으로 전환할 때는 `/clear`를 사용하고, 그 전에 상태를 남기려면 `/save-state` 스킬(`~/.claude/skills/save-state/SKILL.md` / `restore-state/SKILL.md`)을 대신 사용하라. (출처: 유튜브 컨텍스트 관리 영상 + Antigravity 리서치 재검증, 2026-07-31)
 
 ## Structure
 

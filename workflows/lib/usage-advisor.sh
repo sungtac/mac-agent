@@ -26,11 +26,42 @@ set -uo pipefail
 # the file, `read` gets nothing, and the `${CLAUDE_PCT:-0}`/`${CODEX_PCT:-0}`
 # fallbacks below quietly turn that into "always prefer codex" with no error
 # at all — the worst kind of failure (wrong answer, no signal).
-COACH_HEADROOM="$(dirname "$0")/coach-headroom.sh"
+COACH_HEADROOM="${EDGE_AGENT_COACH_HEADROOM:-$(dirname "$0")/coach-headroom.sh}"
+SNAPSHOT_READER="$(dirname "$0")/../../bin/read-provider-usage-snapshot.py"
+SNAPSHOT_FILE="${EDGE_AGENT_USAGE_SNAPSHOT_FILE:-$HOME/.claude/provider-usage-snapshots.jsonl}"
+SNAPSHOT_MAX_AGE_SECONDS="${EDGE_AGENT_USAGE_SNAPSHOT_MAX_AGE_SECONDS:-3600}"
 
 read -r CLAUDE_PCT CODEX_PCT < <(bash "$COACH_HEADROOM")
 CLAUDE_PCT="${CLAUDE_PCT:-0}"
 CODEX_PCT="${CODEX_PCT:-0}"
+
+# coach-headroom.sh uses 0 0 for unavailable data. In that case, a recent
+# local snapshot may improve routing advice. This is advisory only: the
+# usage preflight gate still requires confirmed live data before a pilot.
+if [ "$CLAUDE_PCT" -eq 0 ] && [ "$CODEX_PCT" -eq 0 ] && [ -f "$SNAPSHOT_FILE" ] && [ -f "$SNAPSHOT_READER" ]; then
+  read -r SNAPSHOT_STATUS SNAPSHOT_CLAUDE SNAPSHOT_CODEX < <(
+    python3 - "$SNAPSHOT_READER" "$SNAPSHOT_FILE" "$SNAPSHOT_MAX_AGE_SECONDS" <<'PY'
+import json
+import subprocess
+import sys
+
+reader, snapshot, max_age = sys.argv[1:]
+try:
+    raw = subprocess.check_output([sys.executable, reader, '--input', snapshot, '--max-age-seconds', max_age], text=True)
+    data = json.loads(raw)
+    providers = data.get('snapshot', {}).get('providers', {})
+    claude = providers.get('claude', {}).get('windows', {}).get('5h', {}).get('left_pct', 0)
+    codex = providers.get('codex', {}).get('windows', {}).get('7d', {}).get('left_pct', 0)
+    print(data.get('status', 'invalid'), int(claude), int(codex))
+except Exception:
+    print('invalid 0 0')
+PY
+  )
+  if [ "${SNAPSHOT_STATUS:-}" = "fresh" ]; then
+    CLAUDE_PCT="${SNAPSHOT_CLAUDE:-0}"
+    CODEX_PCT="${SNAPSHOT_CODEX:-0}"
+  fi
+fi
 
 if [ "$CLAUDE_PCT" -gt "$CODEX_PCT" ]; then
   echo "PREFER: claude (claude:${CLAUDE_PCT}% codex:${CODEX_PCT}%)"

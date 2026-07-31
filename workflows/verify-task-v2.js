@@ -143,6 +143,28 @@ function isSensitivePath(path) {
   return SENSITIVE_PATH_PATTERNS.some((re) => re.test(path))
 }
 
+const STANDARD_FULL_FILE_PATTERNS = [
+  /(^|\/)(auth|authentication|authorization|routing|router|security|permissions?)(\/|\.|$)/i,
+  /(^|\/)(config|configuration|deploy|deployment|infra|infrastructure|migrations?)(\/|\.|$)/i,
+  /(^|\/)(Dockerfile|docker-compose(?:\..+)?|Makefile|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
+  /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|requirements\.txt)$/i,
+]
+const STANDARD_CODE_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cs', '.go', '.java', '.js', '.jsx', '.mjs', '.py', '.rb', '.rs', '.sh', '.swift', '.ts', '.tsx', '.vue'])
+const STANDARD_LIGHT_FILE_PATTERNS = [
+  /(^|\/)(test|tests|__tests__|fixtures?|snapshots?)(\/|\.|$)/i,
+  /\.(md|mdx|txt|rst|adoc)$/i,
+]
+
+function standardFileTier(filePath) {
+  const normalized = String(filePath || '').replaceAll('\\', '/')
+  if (!normalized) return 'light'
+  if (isSensitivePath(normalized) || STANDARD_FULL_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) return 'full'
+  if (STANDARD_LIGHT_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) return 'light'
+  const dot = normalized.lastIndexOf('.')
+  const extension = dot >= 0 ? normalized.slice(dot).toLowerCase() : ''
+  return STANDARD_CODE_EXTENSIONS.has(extension) ? 'mid' : 'light'
+}
+
 async function gatherContext(cwd, task) {
   const gathered = await agent(
     `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n0. 먼저 Bash로 \`[ -d ${JSON.stringify(cwd)} ] && echo EXISTS || echo MISSING\`을 실행해. "MISSING"이면 cwdExists=false로 하고, contextText에는 그 사실만 짧게 적고, intendedFiles는 빈 배열, sensitivePath는 false로 채워서 즉시 끝내 — 존재하지 않는 디렉토리에서 아래 1~7번을 시도하지 마(git 명령이 엉뚱한 디렉토리에서 실행되거나 에러 텍스트가 진짜 컨텍스트인 것처럼 섞여 들어감).\n1. cwdExists=true로 하고, Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.\n\n마지막 응답은 반드시 다른 설명 없이 아래 네 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"cwdExists":true,"contextText":"수집한 사실","intendedFiles":["예상 경로"],"sensitivePath":false}`,
@@ -154,7 +176,10 @@ async function gatherContext(cwd, task) {
 function decideTier(context) {
   const fileCount = (context?.intendedFiles || []).length
   const sensitive = !!context?.sensitivePath
-  return fileCount <= 3 && !sensitive ? 'light' : 'full'
+  const fileTiers = (context?.intendedFiles || []).map(standardFileTier)
+  const hasFullFile = fileTiers.includes('full')
+  const hasCodeFile = fileTiers.includes('mid')
+  return fileCount <= 3 && !sensitive && !hasFullFile && !hasCodeFile ? 'light' : 'full'
 }
 
 // ---------- 사후 검증용 실제 diff 수집 (verify-task.js와 동일 패턴) ----------
@@ -438,11 +463,14 @@ JSON으로만: {"appended":true,"rulesAdded":[""]}`,
 
 async function fullExecute(cwd, instruction, context, harnessFile) {
   const prompt = `아래 지시대로 실제로 파일을 수정/생성해줘. 작업 디렉토리: ${cwd}\n\n[저장소 컨텍스트]\n${context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 뭘 했는지 짧게 설명해.`
-  return agent(buildExecuteDispatchInstruction(cwd, prompt, harnessFile), {
-    phase: 'FullExecute',
-    label: 'full-execute',
-    schema: EXECUTE_ENVELOPE_SCHEMA,
-  })
+  return dispatchWithRetry(
+    () => agent(buildExecuteDispatchInstruction(cwd, prompt, harnessFile), {
+      phase: 'FullExecute',
+      label: 'full-execute',
+      schema: EXECUTE_ENVELOPE_SCHEMA,
+    }),
+    'full-execute'
+  )
 }
 
 // ---------- 전체 트랙: 코드 리뷰 (클로드+안티그래비티 블라인드, 무점수) ----------
@@ -617,15 +645,48 @@ function lowestNanoHeadroom(providerHeadroom) {
   return values.length ? Math.min(...values) : undefined
 }
 
+// decide-risk-tier.js의 파일 분류 기준과 동기화한다(Workflow 샌드박스는
+// 외부 모듈을 import할 수 없어 의도적으로 인라인 복제).
+const NANO_FULL_FILE_PATTERNS = [
+  /(^|\/)(auth|authentication|authorization|routing|router|security|permissions?)(\/|\.|$)/i,
+  /(^|\/)(config|configuration|deploy|deployment|infra|infrastructure|migrations?)(\/|\.|$)/i,
+  /(^|\/)(Dockerfile|docker-compose(?:\..+)?|Makefile|package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/i,
+  /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|requirements\.txt)$/i,
+]
+const NANO_MID_CODE_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cs', '.go', '.java', '.js', '.jsx', '.mjs', '.py', '.rb', '.rs', '.sh', '.swift', '.ts', '.tsx', '.vue'])
+const NANO_LIGHT_FILE_PATTERNS = [
+  /(^|\/)(test|tests|__tests__|fixtures?|snapshots?)(\/|\.|$)/i,
+  /\.(md|mdx|txt|rst|adoc)$/i,
+]
+function classifyNanoFile(filePath) {
+  const normalized = String(filePath || '').replaceAll('\\', '/')
+  if (!normalized) return 'light'
+  if (isSensitivePath(normalized) || NANO_FULL_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) return 'full'
+  if (NANO_LIGHT_FILE_PATTERNS.some((pattern) => pattern.test(normalized))) return 'light'
+  const dot = normalized.lastIndexOf('.')
+  const extension = dot >= 0 ? normalized.slice(dot).toLowerCase() : ''
+  return NANO_MID_CODE_EXTENSIONS.has(extension) ? 'mid' : 'light'
+}
+
+function detectNanoDependencyBoundary(changedFiles, dependencyEdges = []) {
+  const files = new Set(Array.isArray(changedFiles) ? changedFiles : [])
+  const topLevel = (file) => String(file || '').replaceAll('\\', '/').split('/')[0] || ''
+  if (Array.isArray(dependencyEdges) && dependencyEdges.some((edge) => Array.isArray(edge) && edge.length >= 2 && files.has(edge[0]) && files.has(edge[1]) && topLevel(edge[0]) !== topLevel(edge[1]))) return true
+  const hasManifest = [...files].some((file) => /(^|\/)(package\.json|pyproject\.toml|Cargo\.toml|go\.mod|requirements\.txt)$/.test(file))
+  return hasManifest && [...files].some((file) => classifyNanoFile(file) === 'mid')
+}
+
 // Workflow 샌드박스에서는 외부 모듈을 import할 수 없으므로 위험도 함수의
 // 우선순위/임계값을 workflows/lib/decide-risk-tier.js와 의도적으로 복제한다.
 function decideNanoRiskTier(input) {
-  const { stepFileCount = 0, cumulativeFileCount = 0, sensitivePath = false, dependencyBoundaryCrossed = false, remainingTokenPct, providerHeadroom } = input || {}
+  const { stepFileCount = 0, cumulativeFileCount = 0, sensitivePath = false, dependencyBoundaryCrossed = false, dependencyEdges, remainingTokenPct, providerHeadroom, changedFiles = [] } = input || {}
   const providerHeadroomPct = lowestNanoHeadroom(providerHeadroom)
   const singlePct = typeof remainingTokenPct === 'number' && Number.isFinite(remainingTokenPct) && remainingTokenPct >= 0 && remainingTokenPct <= 100 ? remainingTokenPct : undefined
   const tokenPct = providerHeadroomPct ?? singlePct
-  if (sensitivePath) return 'full'
-  if (dependencyBoundaryCrossed) return 'mid'
+  const fileTiers = (Array.isArray(changedFiles) ? changedFiles : []).map(classifyNanoFile)
+  if (sensitivePath || fileTiers.includes('full')) return 'full'
+  if (fileTiers.includes('mid')) return 'mid'
+  if (dependencyBoundaryCrossed || detectNanoDependencyBoundary(changedFiles, dependencyEdges)) return 'mid'
   if (cumulativeFileCount > 3) return 'mid'
   if (stepFileCount > 3) return 'mid'
   if (tokenPct !== undefined && tokenPct <= 10) return 'mid'
@@ -782,8 +843,27 @@ async function runNanoGate(task, context, cwd, harnessFile, eventFile, options =
     }
 
     log(`[나노] ${step.stepId}: 계약 단위 실행`)
-    const execution = await fullExecute(cwd, `${step.instruction}\n\n[완료조건]\n${step.doneCriteria}`, context, harnessFile)
-    const realDiff = await gatherRealDiff(cwd)
+    const executionInstruction = `${step.instruction}\n\n[완료조건]\n${step.doneCriteria}`
+    let execution = await fullExecute(cwd, executionInstruction, context, harnessFile)
+    let realDiff = await gatherRealDiff(cwd)
+    // A successful dispatcher response is not proof that Codex wrote files.
+    // If the declared target is still absent from the real diff, issue one
+    // explicit corrective execution before invoking the reviewer. This turns
+    // a silent no-op into a bounded recovery attempt while preserving the
+    // independent diff-based safety check.
+    const declaredFilesForRetry = Array.isArray(step.files) ? step.files : []
+    const actualFilesAfterFirstExecution = Array.isArray(realDiff?.filesChanged) ? realDiff.filesChanged : []
+    const missingDeclaredFiles = declaredFilesForRetry.filter((file) => !actualFilesAfterFirstExecution.includes(file))
+    if (execution?.ok !== false && missingDeclaredFiles.length > 0) {
+      log(`[나노] ${step.stepId}: 실행 응답은 왔지만 실제 diff 없음 — 1회 교정 실행`)
+      execution = await fullExecute(
+        cwd,
+        `${executionInstruction}\n\n[교정 실행]\n앞선 실행 후 실제 git diff에 변경이 없습니다. 이번에는 반드시 위 작업을 실제 파일에 적용하고, 완료 전에 git diff -- ${missingDeclaredFiles.join(' ')} 로 변경을 확인해.`,
+        context,
+        harnessFile
+      )
+      realDiff = await gatherRealDiff(cwd)
+    }
     const actualFiles = Array.isArray(realDiff?.filesChanged) ? realDiff.filesChanged : []
     const declaredFiles = Array.isArray(step.files) ? step.files : []
     const changedFiles = [...new Set([
@@ -798,6 +878,7 @@ async function runNanoGate(task, context, cwd, harnessFile, eventFile, options =
       cumulativeFileCount: cumulativeFiles.size,
       sensitivePath: !!realDiff?.sensitivePath,
       dependencyBoundaryCrossed: step.dependencyBoundaryCrossed,
+      dependencyEdges: step.dependencyEdges,
       remainingTokenPct,
       providerHeadroom,
     }
