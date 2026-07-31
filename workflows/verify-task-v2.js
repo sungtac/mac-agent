@@ -24,7 +24,7 @@ export const meta = {
 // 비용과 호환성을 위해 유지한다.
 //
 // Workflow 스크립트는 다른 로컬 파일을 import 할 수 없어(자기완결적이어야
-// 함), verify-task.js와 겹치는 헬퍼(대시패치 지시문 생성, 검증용 diff 수집,
+// 함), 공통 헬퍼(대시패치 지시문 생성, 검증용 diff 수집,
 // 히스토리 기록, preflight)를 이 파일 안에 중복 구현한다 — 의도적 중복이지,
 // 실수가 아니다.
 
@@ -35,7 +35,7 @@ const PREFLIGHT_SCHEMA = {
 }
 
 async function preflightCheck() {
-  // 2026-07-30 fix (Codex 코드리뷰로 발견) — verify-task.js와 동일한 이유로
+  // 2026-07-30 fix (Codex 코드리뷰로 발견) — 같은 이유로
   // CODEX_BIN/AGY_BIN 환경변수 override를 존중하도록 통일.
   return agent(
     `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 Homebrew/사용자 bin 후보를 찾아 써 — 이 실행 환경 PATH가 축소돼 있을 수 있어서 bare 명령어만 믿지 말 것):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-\$HOME/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법을 issues에 적어줘.`,
@@ -133,7 +133,7 @@ function buildScoreDispatchInstruction(tool, prompt, harnessFile, schemaKind) {
   return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로> ${schemaKind}\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
-// v1(verify-task.js)은 문자열(dealbreaker_reason) 동기화로 도구 실패를
+// 기존 rubric 경로는 문자열(dealbreaker_reason) 동기화로 도구 실패를
 // 판별하지만, v2는 스키마마다 필드가 달라 문자열 위치가 스키마별로 다를 수
 // 있어 그 방식이 안 맞는다. 대신 모든 v2 실패 봉투가 공통으로 갖는
 // dispatchFailed 불리언 마커 하나로 스키마 무관하게 판별한다(score-dispatch.sh
@@ -237,7 +237,7 @@ function decideTier(context) {
   return fileCount <= 3 && !sensitive && !hasFullFile && !hasCodeFile ? 'light' : 'full'
 }
 
-// ---------- 사후 검증용 실제 diff 수집 (verify-task.js와 동일 패턴) ----------
+// ---------- 사후 검증용 실제 diff 수집 ----------
 
 const REAL_DIFF_SCHEMA = {
   type: 'object',
@@ -1239,7 +1239,7 @@ if (!cwd) {
   }
 }
 
-// v1(verify-task.js)에서 실측 확인된 것과 같은 버그 클래스에 대한 대칭 방어:
+// 기존 경로에서 실측 확인된 것과 같은 버그 클래스에 대한 대칭 방어:
 // Workflow({scriptPath, resumeFromRunId})로 재개할 때 args를 다시 안 넘기면
 // parsedArgs가 {}로 무너진다. v2는 cwd 필수라 위 가드가 대부분 이 경로를 우연히
 // 막아주지만, task만 비고 cwd는 어쩌다 남아있는 경로까지 커버하려면 별도 확인이

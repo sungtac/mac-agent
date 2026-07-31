@@ -553,7 +553,7 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
 - `weekly-report.sh`의 Calendar/사용량 감지 정규식 — OAuth 만료/토큰 문제/MCP 서버 불가,
   429/rate limit exceeded/overloaded/quota exceeded 등 흔한 변형 추가, 배터리 테스트로 신규
   포착·기존 회귀 없음·오탐 없음 확인.
-- `score-dispatch.sh`의 `CODEX_BIN`/`AGY_BIN` override가 `verify-task(-v2).js`의 preflight엔
+- `score-dispatch.sh`의 `CODEX_BIN`/`AGY_BIN` override가 `verify-task-v2.js`의 preflight엔
   적용 안 되던 것 — 같은 `${VAR:-기본값}` bash 파라미터 확장 관례를 preflight 프롬프트에도
   적용해 일관성 확보.
 - `CODEX_DISPATCH_LOCKS` 크로스프로세스 미보호(사용자 확정, blocking 등급) — 파일 기반

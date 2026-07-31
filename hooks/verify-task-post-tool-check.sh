@@ -20,7 +20,7 @@ WORKFLOW_TASK="$(printf '%s' "$INPUT" | jq -r '.tool_input.args.task // .input.a
 if [ -n "$TOOL_NAME" ] && [ "$TOOL_NAME" != "Workflow" ]; then
   exit 0
 fi
-if ! printf '%s\n%s' "$SCRIPT_PATH" "$WORKFLOW_NAME" | grep -Eq '(^|/)verify-task(-v2)?(-wf_[A-Za-z0-9_-]+)?\.js$|^verify-task(-v2)?$'; then
+if ! printf '%s\n%s' "$SCRIPT_PATH" "$WORKFLOW_NAME" | grep -Eq '(^|/)verify-task-v2(-wf_[A-Za-z0-9_-]+)?\.js$|^verify-task-v2$'; then
   exit 0
 fi
 # The workflow must have been given the same checkout and a concrete task.

@@ -16,9 +16,8 @@ set -uo pipefail
 TOOL="${1:?usage: score-dispatch.sh <codex|agy> <prompt-file> [schema-kind]}"
 PROMPT_FILE="${2:?usage: score-dispatch.sh <codex|agy> <prompt-file> [schema-kind]}"
 # schema-kind: which caller's JSON schema the failure envelope must satisfy
-# (its required fields). Optional, defaults to "rubric" — verify-task.js (v1)
-# calls this script with only 2 args, so it silently keeps getting the
-# original rubric-shaped envelope unchanged. verify-task-v2.js (v1's sibling,
+# (its required fields). Optional, defaults to the rubric-compatible envelope
+# for generic callers. verify-task-v2.js passes this explicitly. The
 # many different schemas per stage) passes this explicitly. Discovered
 # 2026-07-27/28: a single fixed rubric-shaped envelope only matches v1's
 # schema — every v2 stage schema (plan/critique/reconcile/review/light-eval/
@@ -35,11 +34,9 @@ import json, sys
 reason = sys.argv[1]
 kind = sys.argv[2]
 
-# v1(verify-task.js) 계약: 정확히 이 다섯 필드, dealbreaker_reason 문구까지
-# 그대로 — v1의 isDispatchFailure()가 이 문구를 하드코딩해서 비교하므로
-# 절대 바꾸면 안 됨(둘이 반드시 동기화돼야 하는 상수, verify-task.js에 동일한
-# 경고 주석 있음). 이 kind는 새 필드를 추가하지 않는다 — 방금 실측 검증한
-# v1 경로에 아무 부작용도 안 남기기 위해 기존 그대로 둠.
+# rubric-compatible 계약: 정확히 이 필드와 dealbreaker_reason 문구를
+# 유지한다. 일부 직접 호출자가 이 봉투 형식을 사용하므로 새 필드를
+# 추가하지 않는다.
 if kind == "rubric":
     envelope = {
         "scores": {"목표달성도": 0, "정확성": 0, "제약안전성": 0, "완성도": 0, "명확성": 0, "효율성": 0},

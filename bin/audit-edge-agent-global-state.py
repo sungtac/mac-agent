@@ -94,10 +94,10 @@ def collect() -> dict:
                 "missing is expected until a production nano run records an event",
             ),
             _entry(
-                claude / "verify-task-history.jsonl",
-                "verify-task workflow",
+                claude / "verify-task-v2-history.jsonl",
+                "verify-task-v2 workflow",
                 "history_ledger",
-                "workflows/verify-task.js",
+                "workflows/verify-task-v2.js",
             ),
             _entry(
                 HOME / ".claude-watchdog",

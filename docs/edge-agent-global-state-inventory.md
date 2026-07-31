@@ -14,7 +14,7 @@
 | Telegram Claude/Codex/Anti의 provider CLI 및 하위 도구 | `.openclaw/workspace/team_os`, `state`, `sukja_telegram` | provider sandbox로 쓰기 차단 | 현재 정책에 포함 |
 | Discord Claude/Codex의 provider CLI 및 하위 도구 | 위와 동일 | provider sandbox로 쓰기 차단 | 현재 정책에 포함 |
 | Telegram/Discord 봇 프로세스 자체 | `~/.claude/hooks-state/`, `~/.claude/discord-bot/pending/`, `repo-locks/`, singleton lock | sandbox 바깥 | 운영 상태·재시작에 필요하므로 즉시 제한하지 않음 |
-| Claude Stop hook·주간보고 등 사용자 세션/launchd 보조 작업 | `~/.claude/hooks-state/*`, `verify-task-history.jsonl` 등 | sandbox 바깥 | provider 경계와 별도 감사 필요 |
+| Claude Stop hook·주간보고 등 사용자 세션/launchd 보조 작업 | `~/.claude/hooks-state/*`, `verify-task-v2-history.jsonl` 등 | sandbox 바깥 | provider 경계와 별도 감사 필요 |
 | watchdog이 관리하는 `claude-main` 세션 | tmux 세션 및 Claude의 직접 작업 경로 | sandbox 바깥 | 독립 유지, 별도 승인 없이는 변경하지 않음 |
 | Roda Gemma | Ollama 요청·봇 로그 | Team OS 쓰기 경로 없음 | 대화 전용 유지 |
 
@@ -30,7 +30,7 @@
 | `~/.claude/hooks-state/usage-routing-nag/` | 라우팅 점검 hook | 세션별 marker | 라우팅 감사용, provider 상태 원장이 아님 |
 | `~/.claude/discord-bot/pending/` | Discord 봇·재시도 workflow | 재시도 작업 JSON | 삭제·이동 시 답장 재시도 기능 손상 가능 |
 | `~/.claude/nano-gate-events.jsonl` | nano event store | 전역 이벤트 원장 | 현재 파일 부재 확인; 생성 시 원자 append·idempotency 필요 |
-| `~/.claude/verify-task-history.jsonl` | verify-task workflow | 검증 이력 | worktree별 분리 또는 append lock 필요 |
+| `~/.claude/verify-task-v2-history.jsonl` | verify-task-v2 workflow | 검증 이력 | worktree별 분리 또는 append lock 필요 |
 | `~/.claude/provider-usage-snapshots.jsonl` | usage snapshot helper | provider 잔여량 관측 이력 | provider 호출과 분리된 로컬 관측 원장 |
 
 snapshot 재사용은 `bin/read-provider-usage-snapshot.py`로 수행하며, 오래된 값은
