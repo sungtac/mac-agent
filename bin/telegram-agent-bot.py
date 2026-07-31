@@ -60,6 +60,14 @@ if not ALLOWED_CHAT_ID:
     )
 TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_TIMEOUT_SECONDS", "1800"))
 STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
+# Claude/Antigravity verify calls only have to read a diff and render a
+# verdict — not author code — so they get their own, much shorter timeout
+# than a full codex authoring run. Round-7 independent review (Codex +
+# Antigravity, 2026-07-31) flagged the shared 1800s timeout as enabling a
+# ~3h worst-case _BUSY_LOCK hold across 2 rounds; both agents independently
+# recommended cutting verify-call time specifically rather than the
+# authoring timeout (codex genuinely may need the full budget to code).
+CODEX_VERIFY_CALL_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_CALL_TIMEOUT_SECONDS", "600"))
 CHUNK_SIZE = 3900
 MAX_CHUNKS = int(os.environ.get("TELEGRAM_AGENT_MAX_CHUNKS", "15"))
 
@@ -478,7 +486,8 @@ async def acquire_workspace_lock(resolved_path: str, on_wait=None):
         os.close(fd)
 
 
-async def _run_cli(role: str, prompt: str, on_wait=None) -> str:
+async def _run_cli(role: str, prompt: str, on_wait=None, timeout_seconds: int | None = None) -> str:
+    timeout_seconds = timeout_seconds if timeout_seconds is not None else TIMEOUT_SECONDS
     cli_path = ROLES[role]["binary"]
     if not cli_path.exists():
         raise RuntimeError(f"provider executable is missing: {cli_path}")
@@ -538,10 +547,10 @@ async def _run_cli(role: str, prompt: str, on_wait=None) -> str:
             except ProcessLookupError:
                 pgid = proc.pid
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=TIMEOUT_SECONDS)
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
             except asyncio.TimeoutError:
                 await _terminate_process_group(proc, pgid)
-                raise RuntimeError(f"{role} 실행 시간이 제한 시간({TIMEOUT_SECONDS}초)을 초과했습니다.")
+                raise RuntimeError(f"{role} 실행 시간이 제한 시간({timeout_seconds}초)을 초과했습니다.")
             except BaseException:
                 # Covers asyncio.CancelledError (task cancellation — e.g. app
                 # shutdown mid-request; CancelledError is a BaseException,
@@ -626,17 +635,38 @@ async def run_provider(prompt: str, on_wait=None) -> str:
 # as the raw original prompt when the escalation message is built).
 CODEX_VERIFY_MAX_ROUNDS = max(1, min(2, int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_MAX_ROUNDS", "2"))))
 
+# Overall governor on top of the per-round-max above: even with the shorter
+# verify-call timeout, a round can still legitimately run close to its worst
+# case (codex authoring up to TIMEOUT_SECONDS + two verify calls up to
+# CODEX_VERIFY_CALL_TIMEOUT_SECONDS each). Checked only *between* rounds —
+# never aborts a round already in flight — so round 1 always gets to
+# complete once for any request; this only decides whether round 2 is
+# worth starting given how much of the budget round 1 already spent. Round-7
+# independent review (Codex, 2026-07-31) asked for exactly this: a total-loop
+# cap so _BUSY_LOCK can't be held for the full multi-round worst case.
+CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS = int(
+    os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS", "3600")
+)
+
 # Deliberately a coarse, low-cost keyword heuristic rather than an LLM call —
-# this only decides "is the heavier verify loop worth it," so false
-# negatives (rare coding phrasing not in this list) just fall back to a
-# normal single codex reply, and false positives just add one extra
-# verify+revise round for a message that turns out not to need it. Neither
-# failure mode is severe enough to justify spending a model call on
-# classification before every codex message.
+# this only decides "is the heavier verify loop worth it." False negatives
+# (rare coding phrasing not in this list) just fall back to a normal single
+# codex reply, which is cheap. False positives are NOT cheap, though: a
+# false positive triggers up to CODEX_VERIFY_MAX_ROUNDS rounds of codex
+# authoring plus a claude AND antigravity verify call each round — three
+# providers and real wall-clock time for a message that never needed it.
+# Earlier versions of this list included bare "수정"/"오류"/"에러"/"커밋" —
+# words common in everyday non-coding chat ("이 오류 메시지가 뭐야?", "커밋
+# 언제 할거야?") — which made false positives too easy to trigger. Round-7
+# independent review (Codex + Antigravity, 2026-07-31) both flagged this and
+# recommended requiring a coding-context word to co-occur rather than
+# matching those four words alone; kept as compound phrases below instead
+# of removing the concepts entirely.
 _CODING_TASK_KEYWORDS = (
-    "코드", "구현", "수정", "고쳐", "고쳐줘", "버그", "함수", "스크립트",
-    "리팩터", "리팩토링", "짜줘", "만들어줘", "개발해", "디버그", "오류", "에러",
-    "배포", "커밋", "테스트 작성", "class ", "def ", "function",
+    "코드", "구현", "고쳐", "고쳐줘", "버그", "함수", "스크립트",
+    "리팩터", "리팩토링", "짜줘", "만들어줘", "개발해", "디버그", "배포",
+    "테스트 작성", "class ", "def ", "function",
+    "코드 수정", "코드 오류", "코드 에러", "버그 수정", "커밋해줘", "커밋 해줘",
 )
 
 
@@ -678,8 +708,15 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
     codex_report = original_prompt
     last_claude_verdict = ""
     last_agy_verdict = ""
+    loop_started = time.monotonic()
 
     for round_num in range(1, CODEX_VERIFY_MAX_ROUNDS + 1):
+        if round_num > 1 and time.monotonic() - loop_started >= CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS:
+            log(
+                f"codex_verify_and_revise 총 시간 상한({CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS}초) 초과, "
+                f"라운드{round_num} 생략하고 조기 종료"
+            )
+            break
         if round_num == 1:
             write_prompt = original_prompt
         else:
@@ -698,11 +735,15 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
 
         verify_prompt = _build_verify_prompt(original_prompt, codex_report)
         try:
-            claude_verdict = await _run_cli("claude", verify_prompt, on_wait=on_wait)
+            claude_verdict = await _run_cli(
+                "claude", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             claude_verdict = f"RESULT: FAIL\n(클로드 검증 실행 오류: {exc})"
         try:
-            agy_verdict = await _run_cli("antigravity", verify_prompt, on_wait=on_wait)
+            agy_verdict = await _run_cli(
+                "antigravity", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
+            )
         except Exception as exc:
             agy_verdict = f"RESULT: FAIL\n(안티그래비티 검증 실행 오류: {exc})"
         last_claude_verdict, last_agy_verdict = claude_verdict, agy_verdict
