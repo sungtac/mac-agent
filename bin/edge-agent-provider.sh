@@ -8,13 +8,13 @@ PROMPT_FILE="${2:?usage: edge-agent-provider.sh <claude|codex|agy> <prompt-file>
 WORKDIR="${3:-$PWD}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
-BEHAVIOR_RULES="$ROOT/skills/edge-agent-behavior/SKILL.md"
 SANDBOX="$ROOT/bin/edge-agent-provider-sandbox.sh"
+CAPABILITY_RESOLVER="$ROOT/bin/edge_agent_capability_registry.py"
 
 [ -f "$PROMPT_FILE" ] || { echo "prompt file not found: $PROMPT_FILE" >&2; exit 66; }
 [ -d "$WORKDIR" ] || { echo "workdir not found: $WORKDIR" >&2; exit 66; }
 
-PROMPT="$(cat "$BEHAVIOR_RULES"; printf '\n\n[터미널 작업 요청]\n'; cat "$PROMPT_FILE")"
+PROMPT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$(cat "$PROMPT_FILE")"; printf '\n\n[터미널 작업 요청]\n'; cat "$PROMPT_FILE")"
 
 case "$PROVIDER" in
   claude)

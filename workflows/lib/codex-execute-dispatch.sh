@@ -131,11 +131,11 @@ if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
 fi
 CODEX_CWD="$CWD"
 CODEX_PROMPT="$(cat "$PROMPT_FILE")"
-# Keep terminal Codex aligned with Telegram providers. This is behavioral
-# context only; permissions still come from the explicit sandbox and cwd.
-BEHAVIOR_RULES="$SCRIPT_DIR/../../skills/edge-agent-behavior/SKILL.md"
-if [ -r "$BEHAVIOR_RULES" ]; then
-  CODEX_PROMPT="$(cat "$BEHAVIOR_RULES"; printf '\n\n[작업 요청]\n'; cat "$PROMPT_FILE")"
+# Keep terminal Codex aligned with Telegram providers through the common
+# capability resolver. Permissions still come from the explicit sandbox/cwd.
+CAPABILITY_RESOLVER="$SCRIPT_DIR/../../bin/edge_agent_capability_registry.py"
+if [ -r "$CAPABILITY_RESOLVER" ]; then
+  CODEX_PROMPT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$(cat "$PROMPT_FILE")"; printf '\n\n[작업 요청]\n'; cat "$PROMPT_FILE")"
 fi
 # Codex's own seatbelt accepts /tmp as a temporary workspace but can reject
 # macOS's canonical spelling /private/tmp with sandbox_apply=71. The two

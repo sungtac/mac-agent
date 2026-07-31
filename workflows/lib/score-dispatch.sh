@@ -126,10 +126,10 @@ AGY_BIN="${AGY_BIN:-}"
 [ -n "$CODEX_BIN" ] || CODEX_BIN="$(find_codex_bin || true)"
 [ -n "$AGY_BIN" ] || AGY_BIN="$(find_agy_bin || true)"
 
-BEHAVIOR_RULES="$SCRIPT_DIR/../../skills/edge-agent-behavior/SKILL.md"
 PROMPT_CONTENT="$(cat "$PROMPT_FILE")"
-if [ -r "$BEHAVIOR_RULES" ]; then
-  PROMPT_CONTENT="$(cat "$BEHAVIOR_RULES"; printf '\n\n[검증 요청]\n'; cat "$PROMPT_FILE")"
+CAPABILITY_RESOLVER="$SCRIPT_DIR/../../bin/edge_agent_capability_registry.py"
+if [ -r "$CAPABILITY_RESOLVER" ]; then
+  PROMPT_CONTENT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$(cat "$PROMPT_FILE")"; printf '\n\n[검증 요청]\n'; cat "$PROMPT_FILE")"
 fi
 
 truncate_output() {

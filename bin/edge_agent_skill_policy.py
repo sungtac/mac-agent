@@ -5,6 +5,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from edge_agent_capability_registry import resolve
+
 
 SKILL_TRIGGERS = {
     "context_budget": ("context", "compact", "clear", "handoff", "컨텍스트", "요약"),
@@ -44,4 +46,8 @@ def build_skill_context(prompt: str, documents: dict[str, str], *, max_chars: in
             continue
         sections.append(block)
         remaining -= len(block)
-    return SkillSelection(selected, "".join(sections), tuple(omitted))
+    common = resolve(prompt, max_chars=max(0, remaining), include_core=True) if remaining >= 100 else None
+    if common is not None and common.context:
+        sections.append(common.context[:remaining])
+        omitted.extend(common.omitted)
+    return SkillSelection(selected, "".join(sections)[:max_chars], tuple(dict.fromkeys(omitted)))

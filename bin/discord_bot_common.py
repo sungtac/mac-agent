@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Awaitable, Callable
 
 from edge_agent_locks import canonical_repository_root
+from edge_agent_capability_registry import prepare_provider_argv
 
 MAC_AGENT = Path.home() / "mac-agent"
 
@@ -624,6 +625,7 @@ async def run_provider_attempt(
     """
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds must be positive")
+    args = prepare_provider_argv(provider, args)
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
