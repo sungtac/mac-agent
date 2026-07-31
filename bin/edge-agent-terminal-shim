@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROLE="${EDGE_AGENT_SHIM_ROLE:-$(basename "$0")}"
 ROOT="${EDGE_AGENT_ROOT:-$HOME/mac-agent}"
+PYTHON="${EDGE_AGENT_PYTHON:-/opt/homebrew/bin/python3}"
 REAL=""
 case "$ROLE" in
   claude) REAL="${CLAUDE_REAL_BIN:-$HOME/.local/bin/claude}" ;;
@@ -36,6 +37,40 @@ if [ -n "$prompt" ] && [ -x "$ROOT/bin/edge-agent-provider.sh" ]; then
   exec "$ROOT/bin/edge-agent-provider.sh" "$ROLE" "$tmp" "$PWD"
 fi
 
-# Preserve native interactive/provider-specific invocations. One-shot forms
-# are the unified path; unsupported argument layouts remain non-destructive.
-exec "$REAL" "$@"
+# Native interactive sessions receive the same bounded contract/session
+# context, while continuing to use the provider's own interactive UI.
+TASK_ID="${EDGE_AGENT_TASK_ID:-terminal-interactive-${ROLE}-$(printf '%s' "$PWD" | shasum -a 256 | cut -c1-12)}"
+SESSION_ID="${EDGE_AGENT_LOGICAL_SESSION_ID:-}"
+if [ -z "$SESSION_ID" ] && [ -f "$ROOT/bin/edge_agent_session_bridge.py" ]; then
+  SESSION_ID="$("$PYTHON" "$ROOT/bin/edge_agent_session_bridge.py" start "$TASK_ID" "$ROLE" "$PWD")"
+fi
+CONTEXT=""
+if [ -n "$SESSION_ID" ]; then
+  CONTEXT="$("$PYTHON" "$ROOT/bin/edge_agent_session_bridge.py" context "$SESSION_ID")"
+fi
+
+set +e
+case "$ROLE" in
+  claude)
+    "$REAL" "$@" --append-system-prompt "$CONTEXT"
+    RC=$?
+    ;;
+  codex)
+    "$REAL" "$@" "$CONTEXT"
+    RC=$?
+    ;;
+  agy)
+    "$REAL" "$@" --prompt-interactive "$CONTEXT"
+    RC=$?
+    ;;
+  *)
+    "$REAL" "$@"
+    RC=$?
+    ;;
+esac
+set -e
+
+if [ -n "$SESSION_ID" ]; then
+  "$PYTHON" "$ROOT/bin/edge_agent_session_bridge.py" finish "$SESSION_ID" "$([ "$RC" -eq 0 ] && echo succeeded || echo failed)" || true
+fi
+exit "$RC"
