@@ -33,6 +33,7 @@ from edge_agent_locks import canonical_repository_root
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
 from edge_agent_reflection import write_reflection, write_worktree_metadata
 from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
+from edge_agent_session_bridge import start_session, update_session, bounded_context
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
 
@@ -61,6 +62,7 @@ RUNTIME_CONTRACT = Path(
     os.environ.get("EDGE_AGENT_RUNTIME_CONTRACT", str(HOME / ".edge-agent" / "EDGE_AGENT.md"))
 ).expanduser().resolve()
 ACTIVE_TASK_WORKSPACE: Path | None = None
+ACTIVE_LOGICAL_SESSION_ID: str | None = None
 ROLE = os.environ.get("TELEGRAM_AGENT_ROLE", "").strip().lower()
 TOKEN_FILE = Path(
     os.environ.get(
@@ -199,10 +201,17 @@ def _auth_source(role: str) -> str:
 def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
     skill_context = build_skill_context(prompt)
     skill_block = f"\n{skill_context}\n" if skill_context else ""
+    session_block = ""
+    if ACTIVE_LOGICAL_SESSION_ID:
+        try:
+            session_block = f"\n{bounded_context(ACTIVE_LOGICAL_SESSION_ID)}\n"
+        except (FileNotFoundError, ValueError) as exc:
+            log(f"공유 세션 컨텍스트 로드 실패(계속 진행): {exc}")
     context = (
         f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
         "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
         f"{skill_block}"
+        f"{session_block}"
     )
     if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
         prepared = _EFFICIENCY_ADAPTER.prepare(
@@ -1081,7 +1090,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     async with _BUSY_LOCK:
-        global ACTIVE_TASK_WORKSPACE
+        global ACTIVE_TASK_WORKSPACE, ACTIVE_LOGICAL_SESSION_ID
         user_id = message.from_user.id if message.from_user else "?"
         started = time.monotonic()
         log(f"처리 시작 chat={message.chat_id} user={user_id} text={text[:80]!r}")
@@ -1093,6 +1102,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
             auth_source=_auth_source(ROLE),
         )
+        try:
+            ACTIVE_LOGICAL_SESSION_ID = start_session(
+                task_id=task_id,
+                channel="telegram",
+                provider=ROLE,
+                owner=f"telegram-{ROLE}",
+                workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+            )
+        except Exception as exc:
+            ACTIVE_LOGICAL_SESSION_ID = None
+            write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
+            await message.reply_text(f"❌ 공통 세션 초기화 오류: {exc}")
+            return
 
         if ROLE in ROLES:
             try:
@@ -1107,8 +1129,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     workspace=str(ACTIVE_TASK_WORKSPACE),
                     auth_source=_auth_source(ROLE),
                 )
+                update_session(
+                    ACTIVE_LOGICAL_SESSION_ID,
+                    status="running",
+                    workspace=str(ACTIVE_TASK_WORKSPACE),
+                    worktree=str(ACTIVE_TASK_WORKSPACE),
+                    event_type="worktree_bound",
+                )
             except Exception as exc:
                 ACTIVE_TASK_WORKSPACE = None
+                if ACTIVE_LOGICAL_SESSION_ID:
+                    update_session(ACTIVE_LOGICAL_SESSION_ID, status="failed", summary="텔레그램 작업공간 생성 실패", next_action="작업공간 생성 오류를 확인", event_type="worktree_failed")
+                ACTIVE_LOGICAL_SESSION_ID = None
                 write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
                 await message.reply_text(f"❌ Codex 작업공간 생성 오류: {exc}")
                 return
@@ -1171,6 +1203,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 workspace=ACTIVE_TASK_WORKSPACE,
             )
             write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
+            if ACTIVE_LOGICAL_SESSION_ID:
+                update_session(
+                    ACTIVE_LOGICAL_SESSION_ID,
+                    status="failed",
+                    summary=f"{ROLE} 실행 실패: {str(exc)[:1000]}",
+                    next_action="실패 원인과 검증 결과를 확인",
+                    event_type="provider_failed",
+                )
             write_reflection(
                 task_id=task_id,
                 role=ROLE,
@@ -1179,6 +1219,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 error=str(exc),
             )
             ACTIVE_TASK_WORKSPACE = None
+            ACTIVE_LOGICAL_SESSION_ID = None
             error_text = f"❌ {ROLE_LABELS[ROLE]} 실행 오류: {exc}"
             try:
                 if progress is not None:
@@ -1197,6 +1238,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             started=started,
             workspace=ACTIVE_TASK_WORKSPACE,
         )
+        if ACTIVE_LOGICAL_SESSION_ID:
+            update_session(
+                ACTIVE_LOGICAL_SESSION_ID,
+                status="succeeded",
+                summary=reply[:8000],
+                next_action="사용자 후속 요청 대기",
+                workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+                worktree=str(ACTIVE_TASK_WORKSPACE or ""),
+                verification={"telegram_delivery_pending": True, "response_chars": len(reply)},
+                event_type="provider_succeeded",
+            )
 
         try:
             chunks = [reply[i:i + CHUNK_SIZE] for i in range(0, len(reply), CHUNK_SIZE)] or [""]
@@ -1225,6 +1277,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 response_preview=reply,
             )
             ACTIVE_TASK_WORKSPACE = None
+            ACTIVE_LOGICAL_SESSION_ID = None
             log(f"처리 완료 chat={message.chat_id} duration={time.monotonic() - started:.1f}s truncated={truncated}")
         except TelegramError as exc:
             # Provider already succeeded — do NOT show the "실행 오류"
@@ -1232,6 +1285,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # task failure. Just log it; the user sees a stuck "⏳ 처리
             # 중..." message, which at least doesn't claim something false.
             ACTIVE_TASK_WORKSPACE = None
+            ACTIVE_LOGICAL_SESSION_ID = None
             log(f"provider 성공했으나 텔레그램 전송 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
 
 
