@@ -9,6 +9,7 @@ transcripts.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 from datetime import datetime, timezone
 from typing import Any
@@ -102,29 +103,73 @@ def finish_session(session_id: str, *, status: str, summary: str = "") -> None:
     )
 
 
+def latest_session(*, provider: str = "", channel: str = "", workspace: str = "") -> dict[str, Any] | None:
+    session = _store().latest_session(
+        provider=provider or None,
+        channel=channel or None,
+        workspace=workspace,
+    )
+    if session is None:
+        return None
+    payload = session.to_dict()
+    payload["selection"] = {
+        "method": "updated_at_then_logical_session_id",
+        "updated_at": session.updated_at,
+        "workspace_filter": workspace,
+        "summary_tail": session.summary[-1000:],
+    }
+    return payload
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=("context", "session-id", "start", "finish"))
-    parser.add_argument("value")
+    parser.add_argument("command", choices=("context", "session-id", "start", "finish", "latest", "list"))
+    parser.add_argument("value", nargs="?")
     parser.add_argument("provider", nargs="?")
     parser.add_argument("workspace", nargs="?")
     parser.add_argument("status", nargs="?")
+    parser.add_argument("--filter-provider", default="")
+    parser.add_argument("--filter-channel", default="")
+    parser.add_argument("--filter-workspace", default="")
+    parser.add_argument("--limit", type=int, default=10)
     args = parser.parse_args()
     if args.command == "context":
+        if not args.value:
+            parser.error("context requires session_id")
         print(bounded_context(args.value), end="")
     elif args.command == "session-id":
+        if not args.value:
+            parser.error("session-id requires task_id")
         print(session_id_for_task(args.value))
     elif args.command == "start":
-        if not args.provider or not args.workspace:
+        if not args.value or not args.provider or not args.workspace:
             parser.error("start requires task_id provider workspace")
         provider = "antigravity" if args.provider == "agy" else args.provider
         print(start_session(task_id=args.value, channel="terminal", provider=provider,
                             owner="terminal", workspace=args.workspace, worktree=args.workspace))
     else:
-        finish_status = args.status or args.provider
-        if finish_status not in {"succeeded", "failed"}:
-            parser.error("finish requires status succeeded|failed")
-        finish_session(args.value, status=finish_status)
+        if args.command == "finish":
+            if not args.value:
+                parser.error("finish requires session_id")
+            finish_status = args.status or args.provider
+            if finish_status not in {"succeeded", "failed"}:
+                parser.error("finish requires status succeeded|failed")
+            finish_session(args.value, status=finish_status)
+        else:
+            sessions = _store().list_sessions(
+                provider=args.filter_provider or None,
+                channel=args.filter_channel or None,
+                workspace=args.filter_workspace,
+            )
+            if args.command == "latest":
+                payload = latest_session(
+                    provider=args.filter_provider,
+                    channel=args.filter_channel,
+                    workspace=args.filter_workspace,
+                )
+                print(json.dumps(payload or {"status": "not_found", "selection": {"candidate_count": 0}}, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps({"sessions": [item.to_dict() for item in sessions[:max(1, min(args.limit, 100))]], "count": len(sessions)}, ensure_ascii=False, indent=2))
     return 0
 
 

@@ -79,6 +79,34 @@ class ContextStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.load(session.logical_session_id)
 
+    def test_latest_session_uses_updated_at_not_snapshot_filename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = ContextStore(temp)
+            older = LogicalSession(
+                logical_session_id="sess-z-old",
+                task_id="task-old",
+                channel="terminal",
+                owner="terminal",
+                updated_at="2026-08-02T00:01:00+00:00",
+                summary="오래된 세션의 마지막 부분",
+            )
+            newer = LogicalSession(
+                logical_session_id="sess-a-new",
+                task_id="task-new",
+                channel="terminal",
+                owner="terminal",
+                updated_at="2026-08-02T00:02:00+00:00",
+                summary="최신 세션의 마지막 부분",
+            )
+            store.create(older)
+            store.create(newer)
+
+            latest = store.latest_session()
+
+            self.assertIsNotNone(latest)
+            self.assertEqual(latest.logical_session_id, "sess-a-new")
+            self.assertIn("최신 세션의 마지막 부분", latest.summary)
+
 
 if __name__ == "__main__":
     unittest.main()

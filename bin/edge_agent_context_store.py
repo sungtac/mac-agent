@@ -150,9 +150,58 @@ class ContextStore:
             raise ValueError(f"logical session snapshot is corrupt: {session_id}") from exc
         return load_logical_session(payload)
 
+    @staticmethod
+    def _activity_key(session: LogicalSession) -> tuple[float, str, str]:
+        """Use persisted activity metadata, never filesystem mtime."""
+        try:
+            activity = datetime.fromisoformat(session.updated_at.replace("Z", "+00:00")).timestamp()
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            activity = 0.0
+        return activity, session.updated_at or "", session.logical_session_id
+
+    def list_sessions(
+        self,
+        *,
+        provider: Provider | str | None = None,
+        channel: SessionChannel | str | None = None,
+        workspace: str = "",
+        include_failed: bool = True,
+    ) -> list[LogicalSession]:
+        """List snapshots ordered by explicit ``updated_at`` metadata."""
+        selected_provider = Provider(provider).value if provider is not None else ""
+        selected_channel = SessionChannel(channel).value if channel is not None else ""
+        sessions: list[LogicalSession] = []
+        snapshot_root = self.root / "snapshots"
+        try:
+            paths = sorted(snapshot_root.glob("*.json"), key=lambda item: item.name)
+        except OSError:
+            paths = []
+        for path in paths:
+            try:
+                session = self.load(path.stem)
+            except (OSError, UnicodeError, ValueError):
+                continue
+            if selected_provider and (session.provider.value if session.provider else "") != selected_provider:
+                continue
+            if selected_channel and session.channel.value != selected_channel:
+                continue
+            if workspace and session.workspace != workspace and session.worktree != workspace:
+                continue
+            if not include_failed and session.status in {SessionStatus.FAILED, SessionStatus.CANCELLED}:
+                continue
+            sessions.append(session)
+        return sorted(sessions, key=self._activity_key, reverse=True)
+
+    def latest_session(self, **filters: Any) -> LogicalSession | None:
+        """Return the one latest session by ``updated_at`` and stable ID tie-break."""
+        sessions = self.list_sessions(**filters)
+        return sessions[0] if sessions else None
+
     def append_event(self, session_id: str, event_type: str, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._locked(session_id):
             session = self.load(session_id)
+            session.updated_at = _now()
+            self._save_unlocked(session)
             return self._append_event_unlocked(session, event_type, payload)
 
     def save(self, session: LogicalSession, *, event_type: str = "", payload: Mapping[str, Any] | None = None) -> None:
@@ -161,6 +210,7 @@ class ContextStore:
         with self._locked(session.logical_session_id):
             if not snapshot_path.exists():
                 raise FileNotFoundError(f"logical session not found: {session.logical_session_id}")
+            session.updated_at = _now()
             self._save_unlocked(session)
             if event_type:
                 self._append_event_unlocked(session, event_type, payload or {})

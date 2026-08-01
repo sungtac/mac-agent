@@ -1,6 +1,6 @@
 # 엣지 에이전트 컨텍스트·인계 저장소 계약
 
-상태: v1 구현, Telegram Claude 네이티브 세션 연결 적용
+상태: v1 구현, 결정적 최신 세션 조회 적용 (2026-08-02)
 
 ## 저장 구조
 
@@ -15,6 +15,15 @@
 - event journal은 한 줄 JSONL로 append하고 `fsync`한다.
 - snapshot·event 접근은 세션별 `flock`으로 직렬화한다.
 - 손상된 JSON·지원하지 않는 schema·민감정보 표식은 성공으로 처리하지 않는다.
+- 최신 세션 판정은 snapshot의 `updated_at`과 논리 세션 ID의 안정적인
+  tie-break를 사용한다. 파일명 순서와 filesystem mtime은 판정에 사용하지 않는다.
+- 조회 명령은 `python3 ~/mac-agent/bin/edge_agent_session_bridge.py latest`이며,
+  `--filter-provider`, `--filter-channel`, `--filter-workspace`로 범위를 고정할 수 있다.
+
+작업 상태(`~/.edge-agent/state/`)는 `history.jsonl`에도 모든 상태 쓰기를 append한다.
+각 이벤트에는 UTC `updated_at`, epoch, monotonic `sequence`, 요청 앞부분·끝부분,
+응답 끝부분이 포함된다. `python3 ~/mac-agent/bin/edge_agent_state.py latest`가
+이 원장을 기준으로 최신 작업을 고른다. `latest.json`은 호환성을 위한 포인터일 뿐이다.
 
 ## 컨텍스트 정책
 
