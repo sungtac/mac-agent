@@ -155,14 +155,49 @@ def restart(role: str, *, reason: str = "operator requested restart", drain_seco
         clear_maintenance(role)
 
 
+def stop(role: str, *, reason: str = "operator requested stop", drain_seconds: int = DEFAULT_DRAIN_SECONDS, runner=subprocess.run, sleep=time.sleep) -> None:
+    """Drain active work and stop one Telegram LaunchAgent safely."""
+    target = TARGETS[role]
+    deadline = time.monotonic() + max(0, drain_seconds)
+    while request_is_active(target["log"]):
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"{role} active request did not drain before stop")
+        sleep(1)
+
+    if not service_running(target["label"], runner=runner):
+        return
+
+    marker_expires = time.time() + max(MARKER_SECONDS, 30)
+    set_maintenance(role, reason=reason, expires_at=marker_expires)
+    try:
+        result = runner(
+            ["/bin/launchctl", "bootout", f"gui/{os.getuid()}/{target['label']}"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "launchctl bootout failed").strip()
+            raise RuntimeError(detail[-500:])
+        if service_running(target["label"], runner=runner):
+            raise RuntimeError(f"{role} service remained loaded after stop")
+    finally:
+        clear_maintenance(role)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Drain-aware Telegram agent restart")
     parser.add_argument("role", choices=sorted(TARGETS))
     parser.add_argument("--reason", default="operator requested restart")
     parser.add_argument("--drain-seconds", type=int, default=DEFAULT_DRAIN_SECONDS)
+    parser.add_argument("--stop", action="store_true", help="drain and stop instead of restart")
     args = parser.parse_args()
-    restart(args.role, reason=args.reason, drain_seconds=args.drain_seconds)
-    print(f"restarted {args.role}")
+    if args.stop:
+        stop(args.role, reason=args.reason, drain_seconds=args.drain_seconds)
+        print(f"stopped {args.role}")
+    else:
+        restart(args.role, reason=args.reason, drain_seconds=args.drain_seconds)
+        print(f"restarted {args.role}")
     return 0
 
 

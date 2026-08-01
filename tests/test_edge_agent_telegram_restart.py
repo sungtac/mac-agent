@@ -78,6 +78,36 @@ class TelegramRestartTests(unittest.TestCase):
                 MODULE.TARGETS = original_targets
                 MODULE.MAINTENANCE_FILE = original_marker
 
+    def test_stop_drains_and_boots_out_service(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            log = root / "stderr.log"
+            marker = root / "maintenance.json"
+            log.write_text("Starting direct Telegram codex bot\n", encoding="utf-8")
+            original_targets = MODULE.TARGETS
+            original_marker = MODULE.MAINTENANCE_FILE
+            MODULE.TARGETS = {"x": {"label": "com.example.x", "log": log}}
+            MODULE.MAINTENANCE_FILE = marker
+            calls = []
+
+            class Result:
+                returncode = 0
+                stdout = ""
+                stderr = ""
+
+            def runner(argv, **kwargs):
+                calls.append(argv)
+                return Result()
+
+            try:
+                with patch.object(MODULE, "service_running", side_effect=[True, False]):
+                    MODULE.stop("x", drain_seconds=0, runner=runner, sleep=lambda _: None)
+                self.assertIn("bootout", calls[0])
+                self.assertFalse(marker.exists())
+            finally:
+                MODULE.TARGETS = original_targets
+                MODULE.MAINTENANCE_FILE = original_marker
+
 
 if __name__ == "__main__":
     unittest.main()
