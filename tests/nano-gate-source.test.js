@@ -47,21 +47,21 @@ test('위험도 결과에 따라 light/mid/full 통합검증이 선택된다', (
   assert.match(source, /return \{ ok: !codexReview\.hasBlockingIssue && !antigravityReview\.hasBlockingIssue/)
 })
 
-test('코드 리뷰 역할은 Codex 1차 리뷰와 Antigravity 독립 검증으로 고정된다', () => {
-  assert.match(source, /async function codexReviewDiff\(/)
-  assert.match(source, /buildScoreDispatchInstruction\('codex'/)
-  assert.match(source, /reviewers: \['codex', 'antigravity'\]/)
+test('전체 코드 리뷰 역할은 Claude와 Antigravity 독립 검증으로 고정된다', () => {
+  assert.match(source, /async function claudeReviewDiff\(/)
+  assert.match(source, /async function antigravityReviewDiff\(/)
+  assert.match(source, /FullCodeReviewSkill: 'claude\.communicator\|antigravity\.auditor'/)
 })
 
 test('headless Write 계약을 지키도록 임시 dispatch 파일을 먼저 Read한다', () => {
-  assert.match(source, /반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어\(빈 파일이어도 괜찮아/)
+  assert.match(source, /반드시 Read 툴로 그 실제 경로의 임시 파일을 한 번 읽어\(빈 파일이어도 괜찮아/)
   assert.match(source, /Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음/)
-  assert.match(source, /파일경로는 3번 경로로 치환/)
+  assert.match(source, /실제 경로를 인자로 전달/)
 })
 
 test('컨텍스트/실제 diff 수집은 모든 StructuredOutput 필드를 명시한다', () => {
-  assert.match(source, /\{"cwdExists":true,"contextText":"수집한 사실","intendedFiles":\["예상 경로"\],"sensitivePath":false\}/)
-  assert.match(source, /\{"content":"위 명령의 원문 출력","filesChanged":\["실제 변경 경로"\],"sensitivePath":false,"headSha":"현재 HEAD SHA"\}/)
+  assert.match(source, /relevant_files: \{ type: 'array'/)
+  assert.match(source, /files_changed: \{ type: 'array'/)
 })
 
 test('full 리뷰는 SHA 귀속 보고서를 저장하고 저장 실패 시 승인하지 않는다', () => {
@@ -75,8 +75,6 @@ test('나노 이벤트 기록도 임시 파일 Read 후 Write하고 light 검토
   assert.match(source, /마지막 응답은 반드시 다른 설명 없이 아래 세 키를 모두 포함한 JSON 객체 하나여야 해\(필드 누락 금지\)/)
 })
 
-test('일반 트랙도 코딩 파일은 경량으로 우회하지 않는다', () => {
-  assert.match(source, /function standardFileTier\(filePath\)/)
-  assert.match(source, /const hasCodeFile = fileTiers\.includes\('mid'\)/)
-  assert.match(source, /!hasFullFile && !hasCodeFile/)
+test('일반 코드 파일은 결정론적 민감도 조건이 없으면 경량으로 처리할 수 있다', () => {
+  assert.match(source, /return context\?\.policy\?\.track === 'light' \? 'light' : 'full'/)
 })

@@ -117,6 +117,44 @@ if [ ! -f "$PROMPT_FILE" ]; then
   exit 0
 fi
 
+record_verify_metric() {
+  [ -n "${VERIFY_METRICS_FILE:-}" ] || return 0
+  python3 - "$VERIFY_METRICS_FILE" "$PROMPT_FILE" "${VERIFY_TASK_ID:-unknown}" "${VERIFY_AGENT:-unknown}" "${VERIFY_ROLE:-unknown}" <<'PYEOF' || true
+import json
+import os
+import sys
+from pathlib import Path
+
+metrics_path, prompt_path, task_id, agent, role = sys.argv[1:]
+try:
+    package_bytes = os.path.getsize(prompt_path)
+except OSError:
+    package_bytes = 0
+record = {
+    "task_id": task_id,
+    "track": None,
+    "agent": agent,
+    "role": role,
+    "round": None,
+    "model": None,
+    "effort": None,
+    "input_tokens": 0,
+    "output_tokens": 0,
+    "cache_read_tokens": 0,
+    "cache_creation_tokens": 0,
+    "package_bytes": package_bytes,
+    "package_tokens": max(1, package_bytes // 4),
+    "prefix_fingerprint": None,
+}
+path = Path(metrics_path)
+path.parent.mkdir(parents=True, exist_ok=True)
+with path.open("a", encoding="utf-8") as handle:
+    handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+PYEOF
+}
+
+trap record_verify_metric EXIT
+
 # Both codex and agy are invoked by a resolved absolute path, not a bare
 # command name —
 # confirmed 2026-07-26 that a Workflow-spawned agent's Bash environment can
@@ -147,18 +185,184 @@ truncate_output() {
   printf '%s' "$1" | head -c 2000
 }
 
+REPO_ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/../.." 2>/dev/null && pwd -P)"
+AGY_REVIEW_LOG_ROOT=""
+AGY_REVIEW_PREFLIGHT_ERROR=""
+AGY_REVIEW_PROFILE_TEMP=""
+AGY_REVIEW_PROFILE_ERROR=""
+
+resolve_agy_review_log_root() {
+  local configured_root
+  local normalized_root
+
+  if [ "${AGY_LOG_ROOT+x}" = x ]; then
+    configured_root="$AGY_LOG_ROOT"
+    if [ -z "$configured_root" ]; then
+      AGY_REVIEW_PREFLIGHT_ERROR="AGY_LOG_ROOT가 비어 있음"
+      return 1
+    fi
+  else
+    if [ -z "${HOME:-}" ]; then
+      AGY_REVIEW_PREFLIGHT_ERROR="HOME이 비어 있어 Antigravity 로그 경로를 결정할 수 없음"
+      return 1
+    fi
+    configured_root="$HOME/.gemini/antigravity-cli"
+  fi
+
+  if ! normalized_root="$(python3 -c '
+import os
+import sys
+
+candidate, repository = sys.argv[1:]
+if not os.path.isabs(candidate):
+    raise SystemExit(1)
+if any(ord(char) < 32 or ord(char) == 127 for char in candidate):
+    raise SystemExit(1)
+if os.path.islink(candidate):
+    raise SystemExit(1)
+
+normalized = os.path.realpath(candidate)
+repository = os.path.realpath(repository)
+try:
+    inside_repository = os.path.commonpath((normalized, repository)) == repository
+except ValueError:
+    inside_repository = False
+if inside_repository:
+    raise SystemExit(1)
+print(normalized)
+' "$configured_root" "$REPO_ROOT")"; then
+    AGY_REVIEW_PREFLIGHT_ERROR="Antigravity 로그 루트가 절대 경로가 아니거나 제어 문자를 포함하거나 심볼릭 링크이거나 저장소 내부임"
+    return 1
+  fi
+  if [ -z "$normalized_root" ]; then
+    AGY_REVIEW_PREFLIGHT_ERROR="Antigravity 로그 루트 정규화 결과가 비어 있음"
+    return 1
+  fi
+
+  AGY_REVIEW_LOG_ROOT="$normalized_root"
+  return 0
+}
+
 check_agy_review_log_dirs() {
-  local log_root="${AGY_LOG_ROOT:-${HOME:-}/.gemini/antigravity-cli}"
+  local log_root
   local directory
+
+  if [ -z "$AGY_REVIEW_LOG_ROOT" ]; then
+    AGY_REVIEW_PREFLIGHT_ERROR="Antigravity 로그 루트가 정해지지 않음"
+    return 1
+  fi
+  log_root="$AGY_REVIEW_LOG_ROOT"
+
+  if [ -e "$log_root" ] && [ ! -d "$log_root" ]; then
+    AGY_REVIEW_PREFLIGHT_ERROR="agy 로그 루트가 디렉터리가 아님: $log_root"
+    return 1
+  fi
   for directory in "$log_root/log" "$log_root/crashes"; do
     # Missing directories are left to the provider, which may create them
     # itself. If they already exist, catch a definite permission/type error
     # before starting a review process that can only return logging noise.
-    if [ -e "$directory" ] && { [ ! -d "$directory" ] || [ ! -w "$directory" ]; }; then
-      printf '%s' "agy 로그 디렉터리에 쓰기 권한이 없거나 디렉터리가 아님: $directory"
+    if [ -L "$directory" ] || { [ -e "$directory" ] && { [ ! -d "$directory" ] || [ ! -w "$directory" ]; }; }; then
+      AGY_REVIEW_PREFLIGHT_ERROR="agy 로그 디렉터리에 쓰기 권한이 없거나 디렉터리가 아니거나 심볼릭 링크임: $directory"
       return 1
     fi
   done
+  return 0
+}
+
+escape_seatbelt_path() {
+  python3 - "$1" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+if any(ord(char) < 32 or ord(char) == 127 for char in path):
+    raise SystemExit(1)
+print(path.replace('\\', '\\\\').replace('"', '\\"'))
+PYEOF
+}
+
+cleanup_agy_review_profile() {
+  local exit_status=$?
+  if [ -n "$AGY_REVIEW_PROFILE_TEMP" ]; then
+    rm -f -- "$AGY_REVIEW_PROFILE_TEMP" || true
+  fi
+  return "$exit_status"
+}
+
+create_agy_review_profile() {
+  local base_profile
+  local default_profile="$SCRIPT_DIR/../../config/code-review-read-only.sb"
+  local escaped_log
+  local escaped_crashes
+
+  if [ "${EDGE_AGENT_REVIEW_PROFILE+x}" = x ]; then
+    base_profile="$EDGE_AGENT_REVIEW_PROFILE"
+  else
+    base_profile="$default_profile"
+  fi
+  if [ -L "$base_profile" ] || [ ! -f "$base_profile" ] || [ ! -r "$base_profile" ]; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 프로필이 없거나 읽을 수 없는 정규 파일이 아님: $base_profile"
+    return 1
+  fi
+
+  if ! AGY_REVIEW_PROFILE_TEMP="$(mktemp "${TMPDIR:-/tmp}/edge-agent-review-profile.XXXXXX")"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 임시 프로필을 만들 수 없음"
+    AGY_REVIEW_PROFILE_TEMP=""
+    return 1
+  fi
+  if ! chmod 600 "$AGY_REVIEW_PROFILE_TEMP"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 임시 프로필 권한 설정 실패"
+    return 1
+  fi
+
+  if ! python3 - "$base_profile" "$AGY_REVIEW_PROFILE_TEMP" <<'PYEOF'
+import shutil
+import sys
+
+shutil.copyfile(sys.argv[1], sys.argv[2])
+PYEOF
+  then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 기본 프로필 복사 실패: $base_profile"
+    return 1
+  fi
+
+  if [ "${EDGE_AGENT_REVIEW_PROFILE+x}" != x ] && ! python3 - "$AGY_REVIEW_PROFILE_TEMP" <<'PYEOF'
+import sys
+
+profile_path = sys.argv[1]
+with open(profile_path, "rb") as profile:
+    lines = profile.readlines()
+with open(profile_path, "wb") as profile:
+    for line in lines:
+        stripped = line.strip()
+        if (stripped.startswith(b'(allow file-write* (subpath "')
+                and (b'/antigravity-cli/log' in stripped or b'/antigravity-cli/crashes' in stripped)):
+            continue
+        profile.write(line)
+PYEOF
+  then
+    AGY_REVIEW_PROFILE_ERROR="기본 Antigravity review 프로필의 고정 로그 허용 규칙 제거 실패"
+    return 1
+  fi
+
+  if ! chmod 600 "$AGY_REVIEW_PROFILE_TEMP"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 임시 프로필 권한 재설정 실패"
+    return 1
+  fi
+  if ! escaped_log="$(escape_seatbelt_path "$AGY_REVIEW_LOG_ROOT/log")"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity 로그 경로를 sandbox 프로필 문자열로 변환할 수 없음"
+    return 1
+  fi
+  if ! escaped_crashes="$(escape_seatbelt_path "$AGY_REVIEW_LOG_ROOT/crashes")"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity crash 경로를 sandbox 프로필 문자열로 변환할 수 없음"
+    return 1
+  fi
+  if ! {
+    printf '%s\n' "(allow file-write* (subpath \"$escaped_log\"))"
+    printf '%s\n' "(allow file-write* (subpath \"$escaped_crashes\"))"
+  } >> "$AGY_REVIEW_PROFILE_TEMP"; then
+    AGY_REVIEW_PROFILE_ERROR="Antigravity review 동적 로그 허용 규칙 추가 실패"
+    return 1
+  fi
   return 0
 }
 
@@ -176,11 +380,20 @@ case "$TOOL" in
       FAILURE_ENVELOPE "agy 실행파일을 찾을 수 없음: $AGY_BIN (AGY_BIN 환경변수로 경로를 override할 수 있음)"
       exit 0
     fi
-    if ! AGY_LOG_PREFLIGHT="$(check_agy_review_log_dirs)"; then
-      FAILURE_ENVELOPE "$AGY_LOG_PREFLIGHT"
+    if ! resolve_agy_review_log_root; then
+      FAILURE_ENVELOPE "$AGY_REVIEW_PREFLIGHT_ERROR"
       exit 0
     fi
-    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT EDGE_AGENT_PROVIDER_MODE=review "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"
+    if ! check_agy_review_log_dirs; then
+      FAILURE_ENVELOPE "$AGY_REVIEW_PREFLIGHT_ERROR"
+      exit 0
+    fi
+    trap cleanup_agy_review_profile EXIT
+    if ! create_agy_review_profile; then
+      FAILURE_ENVELOPE "$AGY_REVIEW_PROFILE_ERROR"
+      exit 0
+    fi
+    RAW_OUTPUT="$(env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT AGY_LOG_ROOT="$AGY_REVIEW_LOG_ROOT" EDGE_AGENT_REVIEW_PROFILE="$AGY_REVIEW_PROFILE_TEMP" EDGE_AGENT_PROVIDER_MODE=review "$PROVIDER_SANDBOX" "$AGY_BIN" -p "$PROMPT_CONTENT" 2>&1)"
     EXIT_CODE=$?
     ;;
   *)

@@ -42,3 +42,9 @@ native ID를 `native_sessions.claude`로 기록한다.
 ContextStore와 token-free 테스트를 유지하면서 Telegram Claude handler에
 네이티브 세션 연결을 적용했다. 기존 provider별 세션 분리는 유지하며,
 세션 파일이 손상되거나 없으면 새 세션으로 fail-safe 시작한다.
+
+추가 적용 범위: Telegram의 context envelope 저장소는 기존 세션 snapshot 저장소와
+분리된 `~/.edge-agent/state/telegram-context` 아래에서 chat·channel별 envelope와
+entity anchor를 저장한다. Telegram adapter가 chat ID를 제공하면 native session
+metadata도 chat·provider·workspace identity를 함께 확인하고, 불일치 시 resume하지
+않는다. 이는 기존 logical session과 provider native session 분리 원칙을 바꾸지 않는다.

@@ -5,12 +5,10 @@ export const meta = {
     { title: 'Preflight' },
     { title: 'Context' },
     { title: 'Light' },
-    { title: 'FullPromptify' },
     { title: 'FullResearch' },
     { title: 'FullPlan' },
-    { title: 'FullPlanReview' },
-    { title: 'FullPlanRevise' },
     { title: 'FullExecute' },
+    { title: 'FullSelfCheck' },
     { title: 'FullCodeReviewSkill' },
   ],
 }
@@ -18,10 +16,9 @@ export const meta = {
 // 설계 전체는 docs/verify-task-v2-design.md 참고 — 이 스크립트는 결정 기록이
 // 아니라 구현이다. 결정의 "왜"를 다시 읽지 않고 이 파일만 고치지 말 것.
 //
-// 2026-08-01 개정: 전체(full) 트랙을 Claude 프롬프트화→Antigravity 병렬
-// 조사→Claude 병렬화 계획→Codex 병렬 계획 검토→Codex 계획 수정/실행→
-// code-review 스킬 발동 흐름으로 변경함. 경량(light)·나노(nano) 트랙은
-// 비용과 호환성을 위해 유지한다.
+// 2026-08-01 개정: 결정론적 하네스가 저장소 상태·규칙·트랙·diff·테스트
+// 요약을 만들고, Claude는 경량 구현자 또는 전체 독립 리뷰어로만 호출한다.
+// 전체 계획·구현은 Codex가 담당하며 Claude 계획 단계는 기본 경로에서 제거했다.
 //
 // Workflow 스크립트는 다른 로컬 파일을 import 할 수 없어(자기완결적이어야
 // 함), 공통 헬퍼(대시패치 지시문 생성, 검증용 diff 수집,
@@ -35,12 +32,7 @@ const PREFLIGHT_SCHEMA = {
 }
 
 async function preflightCheck() {
-  // 2026-07-30 fix (Codex 코드리뷰로 발견) — 같은 이유로
-  // CODEX_BIN/AGY_BIN 환경변수 override를 존중하도록 통일.
-  return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘 (CODEX_BIN/AGY_BIN 환경변수가 설정돼 있으면 그 경로를 쓰고, 없으면 Homebrew/사용자 bin 후보를 찾아 써 — 이 실행 환경 PATH가 축소돼 있을 수 있어서 bare 명령어만 믿지 말 것):\n1. "\${CODEX_BIN:-/opt/homebrew/bin/codex}" login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT "\${AGY_BIN:-\$HOME/.local/bin/agy}" models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법을 issues에 적어줘.`,
-    { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
-  )
+  return runHarness('preflight', cwd, task, 'harness-preflight', PREFLIGHT_SCHEMA)
 }
 
 // Workflow 스크립트는 Node.js API에 접근할 수 없다(process 미정의) — 여기서
@@ -48,6 +40,7 @@ async function preflightCheck() {
 // 환경에서 필요하면 args로 받아서 써야지 process.env로 받으면 안 된다.
 const MAC_AGENT_ROOT = '/Users/edge_ai/mac-agent'
 const CODE_REVIEW_STORE = MAC_AGENT_ROOT + '/workflows/lib/code-review-store.js'
+const VERIFY_TASK_HARNESS = MAC_AGENT_ROOT + '/bin/verify-task-harness.py'
 const CLAUDE_HOME = '/Users/edge_ai'
 const SCORE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/score-dispatch.sh`
 const CODEX_EXECUTE_DISPATCH = `${MAC_AGENT_ROOT}/workflows/lib/codex-execute-dispatch.sh`
@@ -61,15 +54,16 @@ const NANO_EVENT_FILE_DEFAULT = `${CLAUDE_HOME}/.claude/nano-gate-events.jsonl`
 // contract directly. Keep the version and wording synchronized with the
 // canonical JSON; source tests check the required role/persona names.
 const AGENT_PROFILE_VERSION = '1.0.0'
-const AGENT_PROFILE_CONTRACT_SHA256 = 'ce44fbdbd9b74da1c75384322499b5648237c9fd116ace3aefe722ae8117c57a'
+const AGENT_PROFILE_CONTRACT_SHA256 = '825e6f984205537e35701781a0216c9e197e6c6aa9a64214d77bcdc4e5df7793'
 const COMMON_RESPONSE_STYLE = `공통 답변 규칙(plain-high-school-v1): 일반 사용자가 이해할 수 있는 고등학생 수준으로 설명하고, 결론을 먼저 말해. 어려운 용어는 처음 나올 때 풀어 쓰고, 짧은 문장과 문단을 사용해. 실제로 하지 않은 일을 완료했다고 말하지 마. 사용자에게 보이는 답변에는 장식용 ###와 ** 문법을 사용하지 마.`
 const WORKFLOW_PROFILE = Object.freeze({
   claude: {
-    identity: '수석 오케스트레이터이자 아키텍트',
+    identity: '제한된 구현자 또는 독립 리뷰어',
     personas: {
       planner: '요구사항, 범위, 완료 조건과 불확실한 부분을 실행 가능한 계획으로 정리해.',
       coordinator: '작업을 독립 단위로 나누고 파일 충돌과 의존성을 확인해 실행 순서를 정해.',
-      communicator: '여러 에이전트의 결과를 합쳐 일반 사용자가 이해할 수 있는 결론과 다음 조치를 설명해.',
+      implementer: '허용된 파일만 수정하고 지정된 테스트를 실행해. 계획 수립이나 저장소 전체 조사는 하지 마.',
+      communicator: '제공된 최소 리뷰 패키지만 근거로 차단 이슈를 위치·원인·수정 방향과 함께 적어.',
     },
   },
   codex: {
@@ -92,14 +86,12 @@ const WORKFLOW_PROFILE = Object.freeze({
   },
 })
 const WORKFLOW_PROFILE_STAGES = Object.freeze({
-  FullPromptify: 'claude.planner',
   FullResearch: 'antigravity.researcher|antigravity.red-team',
-  FullPlan: 'claude.coordinator',
-  FullPlanReview: 'codex.plan-reviewer',
-  FullPlanRevise: 'codex.architect',
+  FullPlan: 'codex.architect',
   FullExecute: 'codex.implementer',
-  FullCodeReviewSkill: 'codex.code-reviewer|antigravity.auditor',
-  Light: 'claude.coordinator|codex.test-engineer',
+  FullSelfCheck: 'codex.test-engineer',
+  FullCodeReviewSkill: 'claude.communicator|antigravity.auditor',
+  Light: 'claude.implementer|codex.test-engineer',
 })
 
 function workflowProfile(role, persona) {
@@ -130,7 +122,7 @@ function buildScoreDispatchInstruction(tool, prompt, harnessFile, schemaKind) {
   const harnessNote = injectHarness
     ? `[하네스 주입] 3번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
     : ''
-  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-${tool}-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환): bash ${SCORE_DISPATCH} ${tool} <파일경로> ${schemaKind}\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
+  return `${harnessNote}1. Bash로 \`TMP_FILE=\"$(mktemp -t verify-task-v2-${tool})\" && printf '%s\\n' \"$TMP_FILE\"\`를 실행해 실제 임시 파일 경로를 얻어. 명령 출력에 나온 경로를 TMP_FILE로 기억해.\n2. 이후 단계에서 문자열 \`XXXXXX\`, \`<파일경로>\`, \`<임시파일>\`을 그대로 사용하지 말고, 1번 명령이 출력한 실제 경로를 사용해.\n3. 반드시 Read 툴로 그 실제 경로의 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n4. Write 툴로 그 실제 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${injectHarness ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n5. Bash로 다음을 실행해(실제 경로를 인자로 전달): VERIFY_METRICS_FILE=${JSON.stringify(`${RUN_DIR}/metrics.jsonl`)} VERIFY_TASK_ID=${JSON.stringify(RUN_ID)} VERIFY_AGENT=${JSON.stringify(tool)} VERIFY_ROLE=${JSON.stringify(schemaKind)} bash ${SCORE_DISPATCH} ${tool} \"$TMP_FILE\" ${schemaKind}\n6. 실행이 끝나면 Bash로 그 실제 경로의 임시 파일을 삭제해.\n7. 5번 명령의 stdout은 이미 검증된 JSON 한 줄이야 — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 // 기존 rubric 경로는 문자열(dealbreaker_reason) 동기화로 도구 실패를
@@ -158,7 +150,7 @@ function buildExecuteDispatchInstruction(cwd, prompt, harnessFile) {
   const harnessNote = harnessFile
     ? `[하네스 주입] 3번에서 저장할 내용은 [프롬프트 내용]을 그대로 저장하는 게 아니라, 먼저 Read 툴로 ${harnessFile}을 읽고(파일이 없으면 첫 실행이니 "해당 없음"으로 간주), "[코덱스 하네스 — 반드시 준수]\\n" + 그 내용 + "\\n\\n---\\n\\n"를 맨 앞에 붙인 뒤 [프롬프트 내용]을 이어붙인 합본이어야 해.\n\n`
     : ''
-  return `${harnessNote}1. Bash로 \`mktemp /tmp/verify-task-v2-exec-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. 반드시 Read 툴로 방금 얻은 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n3. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${harnessFile ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n4. Bash로 다음을 실행해 (파일경로는 3번 경로로 치환, timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} <파일경로>\n5. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n6. 4번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
+  return `${harnessNote}1. Bash로 \`TMP_FILE=\"$(mktemp -t verify-task-v2-exec)\" && printf '%s\\n' \"$TMP_FILE\"\`를 실행해 실제 임시 파일 경로를 얻어. 명령 출력에 나온 경로를 TMP_FILE로 기억해.\n2. 이후 단계에서 문자열 \`XXXXXX\`, \`<파일경로>\`, \`<임시파일>\`을 그대로 사용하지 말고, 1번 명령이 출력한 실제 경로를 사용해.\n3. 반드시 Read 툴로 그 실제 경로의 임시 파일을 한 번 읽어(빈 파일이어도 괜찮아 — Claude의 Write 계약상 먼저 읽은 파일만 Write할 수 있음).\n4. Write 툴로 그 실제 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고${harnessFile ? ', 단 하네스 주입 지시가 있으면 위에서 설명한 합본으로' : ''}) 저장해.\n5. Bash로 다음을 실행해(실제 경로를 인자로 전달하고 timeout 300000ms 이상 줘): bash ${CODEX_EXECUTE_DISPATCH} ${JSON.stringify(cwd)} \"$TMP_FILE\"\n6. 실행이 끝나면 Bash로 그 실제 경로의 임시 파일을 삭제해.\n7. 5번 명령의 stdout은 이미 검증된 JSON 한 줄이야({"ok":bool,"message":string}) — 그 값을 그대로 구조화된 출력으로 반환해. 내용을 고치거나, 재해석하거나, 다른 값으로 대체하지 마. 이 결과는 코덱스 자체 보고일 뿐 실제 검증이 아님을 기억해 — 실제 변경사항은 별도로 git diff로 확인할 거야.\n\n[프롬프트 내용]\n${prompt}`
 }
 
 const EXECUTE_ENVELOPE_SCHEMA = {
@@ -172,12 +164,19 @@ const EXECUTE_ENVELOPE_SCHEMA = {
 const CONTEXT_SCHEMA = {
   type: 'object',
   properties: {
-    cwdExists: { type: 'boolean' },
+    schema: { type: 'string' },
+    task_id: { type: 'string' },
+    run_dir: { type: 'string' },
     contextText: { type: 'string' },
-    intendedFiles: { type: 'array', items: { type: 'string' } },
-    sensitivePath: { type: 'boolean' },
+    relevant_files: { type: 'array', items: { type: 'string' } },
+    protected_files: { type: 'array', items: { type: 'string' } },
+    applicable_rules: { type: 'array', items: { type: 'string' } },
+    rules_text: { type: 'string' },
+    test_commands: { type: 'array', items: { type: 'string' } },
+    policy: { type: 'object' },
+    preflight: { type: 'object' },
   },
-  required: ['cwdExists', 'contextText', 'intendedFiles', 'sensitivePath'],
+  required: ['schema', 'task_id', 'run_dir', 'contextText', 'relevant_files', 'protected_files', 'applicable_rules', 'test_commands', 'policy'],
 }
 
 // 민감 경로 근사 규칙 — docs/verify-task-v2-design.md의 "설정/보안/
@@ -220,21 +219,32 @@ function standardFileTier(filePath) {
   return STANDARD_CODE_EXTENSIONS.has(extension) ? 'mid' : 'light'
 }
 
-async function gatherContext(cwd, task) {
-  const gathered = await agent(
-    `아래는 곧 시작할 작업이고, 아직 아무 실행도 안 한 상태야. 순서대로 해줘:\n\n[작업]\n${task}\n\n0. 먼저 Bash로 \`[ -d ${JSON.stringify(cwd)} ] && echo EXISTS || echo MISSING\`을 실행해. "MISSING"이면 cwdExists=false로 하고, contextText에는 그 사실만 짧게 적고, intendedFiles는 빈 배열, sensitivePath는 false로 채워서 즉시 끝내 — 존재하지 않는 디렉토리에서 아래 1~7번을 시도하지 마(git 명령이 엉뚱한 디렉토리에서 실행되거나 에러 텍스트가 진짜 컨텍스트인 것처럼 섞여 들어감).\n1. cwdExists=true로 하고, Bash로 이 디렉토리에서 아래를 실행: cd ${JSON.stringify(cwd)} && { echo '--- git status ---'; git status; echo '--- 최근 커밋 5개 ---'; git log --oneline -5; } 2>&1\n2. 작업과 관련 있어 보이는 파일들을 Glob/Grep/Read로 가볍게 훑어봐(전체 저장소를 다 읽지 말고, 작업 키워드로 관련 있는 것만).\n3. 이 디렉토리(또는 상위)에 CLAUDE.md/AGENTS.md 같은 컨벤션 문서가 있으면 Read로 읽어서 관련 부분을 요약해.\n4. package.json의 scripts, Makefile, README의 테스트 관련 섹션 등에서 테스트 실행 명령을 찾아봐(있으면).\n5. 위 1~4에서 얻은 사실을 contextText 하나의 텍스트로 정리해(요약하지 말고 사실 위주로, 다음 단계 에이전트들이 저장소를 직접 못 보고 이 텍스트만 볼 거야).\n6. 이 작업이 **실제로 건드릴 것으로 예상되는 파일 경로 목록**을 intendedFiles에 넣어줘 — 아직 실행 전이니 예측이야, 최대한 구체적으로. 새로 만들 파일도 포함.\n7. intendedFiles 중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true, 아니면 false.\n\n마지막 응답은 반드시 다른 설명 없이 아래 네 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"cwdExists":true,"contextText":"수집한 사실","intendedFiles":["예상 경로"],"sensitivePath":false}`,
-    { phase: 'Context', label: 'gather-context', schema: CONTEXT_SCHEMA }
+async function runHarness(command, cwd, task, label, schema = CONTEXT_SCHEMA) {
+  const fullFlag = parsedArgs.fullValidation === true || parsedArgs.full === true ? ' --full' : ''
+  const commandLine = `python3 ${JSON.stringify(VERIFY_TASK_HARNESS)} ${command} --cwd ${JSON.stringify(cwd)} --task ${JSON.stringify(task)} --run-dir ${JSON.stringify(RUN_DIR)}${fullFlag}`
+  return agent(
+    `결정론적 하네스 명령만 실행해. 저장소를 직접 조사하거나 판단하지 말고, 아래 명령의 stdout JSON 한 줄을 그대로 반환해. 실패하면 JSON을 임의로 만들지 말고 실행 실패를 반환해.\n\n${commandLine}`,
+    { phase: 'Harness', label, schema, agentType: 'general-purpose' }
   )
-  return gathered
+
+async function gatherContext(cwd, task) {
+  return runHarness('init', cwd, task, 'harness-init')
+}
+
+const TEST_SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    schema: { type: 'string' },
+    status: { type: 'string' },
+    command: { type: 'string' },
+    failures: { type: 'array', items: { type: 'string' } },
+    full_log_path: { type: 'string' },
+  },
+  required: ['schema', 'status', 'failures', 'full_log_path'],
 }
 
 function decideTier(context) {
-  const fileCount = (context?.intendedFiles || []).length
-  const sensitive = !!context?.sensitivePath
-  const fileTiers = (context?.intendedFiles || []).map(standardFileTier)
-  const hasFullFile = fileTiers.includes('full')
-  const hasCodeFile = fileTiers.includes('mid')
-  return fileCount <= 3 && !sensitive && !hasFullFile && !hasCodeFile ? 'light' : 'full'
+  return context?.policy?.track === 'light' ? 'light' : 'full'
 }
 
 // ---------- 사후 검증용 실제 diff 수집 ----------
@@ -242,12 +252,28 @@ function decideTier(context) {
 const REAL_DIFF_SCHEMA = {
   type: 'object',
   properties: {
+    schema: { type: 'string' },
+    task_id: { type: 'string' },
+    run_dir: { type: 'string' },
     content: { type: 'string' },
-    filesChanged: { type: 'array', items: { type: 'string' } },
-    sensitivePath: { type: 'boolean' },
-    headSha: { type: 'string' },
+    diff_path: { type: 'string' },
+    files_changed: { type: 'array', items: { type: 'string' } },
+    head_sha: { type: 'string' },
+    policy: { type: 'object' },
+    package_bytes: { type: 'number' },
+    package_tokens: { type: 'number' },
   },
-  required: ['content', 'filesChanged', 'sensitivePath', 'headSha'],
+  required: ['schema', 'run_dir', 'content', 'files_changed', 'head_sha', 'policy', 'package_bytes', 'package_tokens'],
+}
+
+const VERIFICATION_SCHEMA = {
+  ...REAL_DIFF_SCHEMA,
+  properties: { ...REAL_DIFF_SCHEMA.properties, test_summary: { type: 'object' } },
+  required: [...REAL_DIFF_SCHEMA.required, 'test_summary'],
+}
+
+async function gatherVerification(cwd) {
+  return runHarness('snapshot-tests', cwd, task, 'harness-snapshot-tests', VERIFICATION_SCHEMA)
 }
 
 // 주의: `git diff HEAD`는 아직 add된 적 없는 untracked 신규 파일을 절대 보여주지
@@ -258,16 +284,12 @@ const REAL_DIFF_SCHEMA = {
 // 뽑아 전체 내용을 별도 섹션으로 반드시 덧붙인다 — git add 등으로 실제 git
 // 상태를 건드리지 않고 읽기만 한다.
 async function gatherRealDiff(cwd) {
-  const gathered = await agent(
-    `Bash로 아래 명령을 그 디렉토리에서 실행하고, 나온 출력을 절대 요약하거나 고치지 말고 content 필드에 그대로 담아 반환해:\n\ncd ${JSON.stringify(cwd)} && { echo '--- git rev-parse HEAD ---'; git rev-parse HEAD; echo '--- git status --porcelain ---'; git status --porcelain; echo '--- git diff --stat HEAD (tracked 변경만) ---'; git diff --stat HEAD; echo '--- git diff HEAD (tracked 변경만) ---'; git diff HEAD; echo '--- untracked 신규 파일 전체 내용 (git diff에는 안 잡힘) ---'; git status --porcelain | awk '$1 == "??" {print $2}' | while IFS= read -r f; do echo "=== NEW FILE: $f ==="; cat "$f"; done; } 2>&1\n\n출력이 8000자를 넘으면 앞 8000자만 남기고 끝에 "...(잘림)"을 붙여.\n\n추가로: git rev-parse HEAD의 결과를 headSha 문자열에 넣어. git status --porcelain 출력 전체(수정된 tracked 파일 + untracked 신규 파일 둘 다)에서 실제로 변경/추가된 파일 경로를 전부 뽑아 filesChanged 배열에 넣고(신규 파일도 반드시 포함), 그중 설정/보안/.github/workflows//공개문서(README 등)에 해당하는 게 하나라도 있으면 sensitivePath=true로 반환해.\n\n마지막 응답은 반드시 다른 설명 없이 아래 네 키를 모두 포함한 JSON 객체 하나여야 해(필드 누락 금지):\n{"content":"위 명령의 원문 출력","filesChanged":["실제 변경 경로"],"sensitivePath":false,"headSha":"현재 HEAD SHA"}`,
-    { phase: 'Light', label: 'gather-real-diff', schema: REAL_DIFF_SCHEMA }
-  )
-  return gathered
+  return runHarness('snapshot', cwd, task, 'harness-snapshot', REAL_DIFF_SCHEMA)
 }
 
 function mechanicalTierViolated(realDiff) {
-  const fileCount = (realDiff?.filesChanged || []).length
-  return fileCount > 3 || !!realDiff?.sensitivePath
+  const policy = realDiff?.policy || {}
+  return (realDiff?.files_changed || []).length > 3 || policy.track === 'full'
 }
 
 const REVIEW_PERSIST_SCHEMA = {
@@ -282,11 +304,11 @@ const REVIEW_PERSIST_SCHEMA = {
 }
 
 function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
-  if (!realDiff?.headSha) return null
-  const reviewRounds = history.filter((entry) => entry.codexReview || entry.antigravityReview)
+  if (!realDiff?.head_sha) return null
+  const reviewRounds = history.filter((entry) => entry.claudeReview || entry.antigravityReview)
   const lastRound = reviewRounds[reviewRounds.length - 1] || {}
   const reviewResults = [
-    ['codex', lastRound.codexReview],
+    ['claude', lastRound.claudeReview],
     ['antigravity', lastRound.antigravityReview],
   ]
   const findings = []
@@ -296,7 +318,7 @@ function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
         id: source + '-' + (index + 1),
         severity: issue.blocking ? 'blocker' : 'medium',
         category: 'correctness',
-        location: (realDiff.filesChanged || []).join(', ') || 'diff',
+        location: (realDiff.files_changed || []).join(', ') || 'diff',
         title: source + ' review finding',
         evidence: String(issue.description || 'No description provided'),
         remediation: 'Review and resolve this finding before approval.',
@@ -323,9 +345,9 @@ function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
   )
   const approvalEligible = tier === 'full' &&
     !!verdict?.passed &&
-    !!lastRound.codexReview &&
+    !!lastRound.claudeReview &&
     !!lastRound.antigravityReview &&
-    !lastRound.codexReview.hasBlockingIssue &&
+    !lastRound.claudeReview.hasBlockingIssue &&
     !lastRound.antigravityReview.hasBlockingIssue &&
     reviewerChecksPass
   const report = {
@@ -334,8 +356,8 @@ function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
     status: approvalEligible ? 'AI_APPROVED' : verdict?.needsUserDecision ? 'ESCALATED' : 'CHANGES_REQUIRED',
     target: {
       scope: 'diff',
-      head_sha: realDiff.headSha,
-      paths: realDiff.filesChanged || [],
+      head_sha: realDiff.head_sha,
+      paths: realDiff.files_changed || [],
     },
     findings,
     checks,
@@ -343,8 +365,8 @@ function buildReviewReport(task, cwd, tier, realDiff, verdict, history) {
   if (approvalEligible) {
     report.approval = {
       provider: 'antigravity',
-      reviewed_head_sha: realDiff.headSha,
-      decision_reason: 'Codex review and independent Antigravity verification passed on the same SHA.',
+      reviewed_head_sha: realDiff.head_sha,
+      decision_reason: 'Claude independent review and Antigravity verification passed on the same SHA.',
     }
   }
   return report
@@ -379,7 +401,7 @@ const LIGHT_EXEC_SCHEMA = {
 async function lightExecute(task, context, cwd, feedback) {
   const feedbackBlock = feedback ? `\n\n[이전 라운드 코덱스 피드백 — 반영해서 수정해]\n${feedback}` : ''
   return agent(
-    `${workflowProfile('claude', 'coordinator')}\n\n아래 작업을 실제로 수행해(Edit/Write/Bash 등 필요한 도구 다 써도 됨). 작업 디렉토리: ${cwd}\n\n[작업]\n${task}\n\n[저장소 컨텍스트]\n${context.contextText}${feedbackBlock}\n\n다 하고 나서 한 일을 summary에 간결하게 적어(파일별로 뭘 했는지).`,
+    `${workflowProfile('claude', 'implementer')}\n\n아래 작업을 실제로 수행해. 허용된 파일 밖은 수정하지 말고 저장소 전체를 탐색하지 마. 작업 디렉토리: ${cwd}\n\n[작업]\n${task}\n\n[허용된 관련 파일]\n${JSON.stringify(context.relevant_files || context.intendedFiles || [])}\n\n[적용 규칙]\n${context.rules_text || context.contextText}${feedbackBlock}\n\n다 하고 나서 파일별 변경 요약만 summary에 간결하게 적어.`,
     { phase: 'Light', label: 'light-execute', schema: LIGHT_EXEC_SCHEMA, agentType: 'general-purpose' }
   )
 }
@@ -387,39 +409,18 @@ async function lightExecute(task, context, cwd, feedback) {
 const LIGHT_EVAL_SCHEMA = {
   type: 'object',
   properties: {
-    completionCriteria: { type: 'string' },
-    total: { type: 'number' },
-    escapeHatch: { type: 'boolean' },
-    escapeHatchReason: { type: 'string' },
-    feedback: { type: 'string' },
+    verdict: { type: 'string', enum: ['pass', 'changes_required', 'full_track_required'] },
+    blocking_issues: { type: 'array', items: { type: 'object' } },
   },
-  required: ['completionCriteria', 'total', 'escapeHatch', 'feedback'],
+  required: ['verdict', 'blocking_issues'],
 }
 
-function buildLightEvalPrompt(task, context, summary, realDiff) {
-  return `${workflowProfile('codex', 'test-engineer')}\n\n너는 독립 채점자야. 이건 경량 트랙 작업(파일 5개 이하, 되돌리기 쉬움, 구조·보안·외부공개 영향 없는 작업으로 사전 분류됨)이라 정식 사전 스펙이 없어. 아래 절차로 해:
-
-1. [원 작업]과 [저장소 컨텍스트]만 보고, 채점 전에 네가 판단하는 완료조건을 completionCriteria에 먼저 명시해(채점표를 사후에 유리하게 짜맞추지 말고, 원 작업 자체에서 합리적으로 도출되는 기준).
-2. [실제 변경사항](git diff — 이게 진실이고, [에이전트 보고]는 참고만)을 그 completionCriteria에 대조해서 100점 만점으로 채점(total).
-3. **탈출구**: 실제로 건드린 범위가 "가볍게"라는 전제를 벗어났다고 판단되면(파일이 예상보다 많다, 구조적으로 크다 등), 관대하게 채점하지 말고 escapeHatch=true로 반려해. 단, "느낌상 크다"는 안 되고, escapeHatchReason에 구체적 근거(실제 파일 수, 어떤 파일이 왜 문제인지)를 반드시 명시해야만 escapeHatch=true를 쓸 수 있어. 근거 없이는 escapeHatch=false로 두고 정상 채점해.
-
-[원 작업]
-${task}
-
-[저장소 컨텍스트]
-${context.contextText}
-
-[에이전트 보고]
-${summary}
-
-[실제 변경사항 — git diff]
-${realDiff.content}
-
-반드시 JSON으로만 답해: {"completionCriteria":"","total":0,"escapeHatch":false,"escapeHatchReason":"","feedback":"구체적 감점 사유와 개선점"}`
+function buildLightEvalPrompt(task, context, summary, realDiff, testSummary) {
+  return `${workflowProfile('codex', 'test-engineer')}\n\n너는 경량 트랙의 독립 차단 리뷰어야. 점수는 매기지 않는다. 하네스가 계산한 실제 변경 파일·트랙·diff·테스트 결과만 근거로 판단해. blocking_issues가 0개이고 테스트가 통과했을 때만 pass다. 실제 파일이 3개를 초과하거나 민감 경로·의존성·마이그레이션·배포·공개 API 파괴 변경이 있으면 full_track_required다. 각 이슈는 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test를 포함해.\n\n[원 작업]\n${task}\n\n[허용/관련 파일]\n${JSON.stringify(context.relevant_files || context.intendedFiles || [])}\n\n[적용 규칙]\n${context.rules_text || context.contextText}\n\n[하네스 트랙 판정]\n${JSON.stringify(realDiff.policy || {})}\n\n[에이전트 보고]\n${summary || ''}\n\n[실제 변경사항]\n${realDiff.content}\n\n[테스트 요약]\n${JSON.stringify(testSummary || {})}\n\nJSON으로만 답해: {"verdict":"pass|changes_required|full_track_required","blocking_issues":[]}`
 }
 
-async function codexEvaluateLight(task, context, summary, realDiff, isRetry) {
-  const prompt = buildLightEvalPrompt(task, context, summary, realDiff)
+async function codexEvaluateLight(task, context, summary, realDiff, testSummary, isRetry) {
+  const prompt = buildLightEvalPrompt(task, context, summary, realDiff, testSummary)
   return agent(buildScoreDispatchInstruction('codex', prompt, null, 'light-eval'), {
     phase: 'Light',
     label: isRetry ? 'light-eval-codex-retry' : 'light-eval-codex',
@@ -521,6 +522,48 @@ async function antigravityResearch(promptified, context, focus, isRetry) {
     phase: 'FullResearch',
     label: isRetry ? `antigravity-research-${focus.id}-retry` : `antigravity-research-${focus.id}`,
     schema: RESEARCH_SCHEMA,
+  })
+}
+
+// ---------- 전체 트랙: Codex 계획·자기점검 ----------
+
+const CODEX_PLAN_SCHEMA = {
+  type: 'object',
+  properties: {
+    needsClarification: { type: 'boolean' },
+    clarifyingQuestions: { type: 'string' },
+    plan: { type: 'string' },
+  },
+  required: ['needsClarification', 'clarifyingQuestions', 'plan'],
+}
+
+function buildCodexPlanPrompt(task, context, research) {
+  return `${workflowProfile('codex', 'architect')}\n\n원 작업과 하네스가 만든 최소 패키지, Antigravity의 구조화 조사만 보고 구현 계획을 작성해. 계획은 Codex 실행자가 바로 사용할 수 있게 허용 파일, 의존성 순서, 통합 단계, 테스트 명령을 포함해야 한다. 저장소 전체 재탐색이나 자연어 장문 설명은 하지 마. 정보가 실제로 부족할 때만 needsClarification=true로 하고 질문은 최대 3개다.\n\n[원 작업]\n${task}\n\n[하네스 패키지]\n${JSON.stringify({ files: context.relevant_files || [], rules: context.applicable_rules || [], tests: context.test_commands || [], policy: context.policy || {} })}\n\n[Antigravity 조사 요약]\n${JSON.stringify(research)}\n\nJSON으로만 답해: {"needsClarification":false,"clarifyingQuestions":"","plan":"구현 순서, 파일 소유권, 통합 및 테스트"}`
+}
+
+async function codexBuildPlan(task, context, research, isRetry) {
+  return agent(buildScoreDispatchInstruction('codex', buildCodexPlanPrompt(task, context, research), HARNESS_FILE, 'plan'), {
+    phase: 'FullPlan',
+    label: isRetry ? 'codex-plan-retry' : 'codex-plan',
+    schema: CODEX_PLAN_SCHEMA,
+  })
+}
+
+const SELF_CHECK_SCHEMA = {
+  type: 'object',
+  properties: {
+    verdict: { type: 'string', enum: ['pass', 'changes_required'] },
+    blocking_issues: { type: 'array', items: { type: 'object' } },
+  },
+  required: ['verdict', 'blocking_issues'],
+}
+
+async function codexSelfCheck(task, context, realDiff, testSummary, isRetry) {
+  const prompt = `${workflowProfile('codex', 'test-engineer')}\n\n너는 구현자의 자기점검 단계야. 아래 최소 패키지만 보고 실제 diff가 원 작업·허용 범위·테스트 결과를 충족하는지 확인해. 독립 리뷰 슬롯으로 계산하지 않는다. 차단 이슈는 file, symbol, issue, evidence, required_fix, required_test를 포함해.\n\n[원 작업]\n${task}\n[허용 파일]\n${JSON.stringify(context.relevant_files || [])}\n[실제 diff]\n${realDiff.content}\n[테스트 요약]\n${JSON.stringify(testSummary || {})}\n\nJSON으로만 답해: {"verdict":"pass|changes_required","blocking_issues":[]}`
+  return agent(buildScoreDispatchInstruction('codex', prompt, null, 'review'), {
+    phase: 'FullSelfCheck',
+    label: isRetry ? 'codex-self-check-retry' : 'codex-self-check',
+    schema: SELF_CHECK_SCHEMA,
   })
 }
 
@@ -728,7 +771,7 @@ JSON으로만: {"appended":true,"rulesAdded":[""]}`,
 // ---------- 전체 트랙: 실행 (코덱스, 쓰기 가능) ----------
 
 async function fullExecute(cwd, instruction, context, harnessFile) {
-  const prompt = `${workflowProfile('codex', 'implementer')}\n\n아래 지시대로 실제로 파일을 수정/생성해줘. 작업 디렉토리: ${cwd}\n\n[저장소 컨텍스트]\n${context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 뭘 했는지 짧게 설명해.`
+  const prompt = `${workflowProfile('codex', 'implementer')}\n\n아래 지시대로 실제로 파일을 수정/생성해줘. 허용된 파일 범위를 벗어나지 마. 작업 디렉토리: ${cwd}\n\n[허용된 관련 파일]\n${JSON.stringify(context.relevant_files || context.intendedFiles || [])}\n\n[적용 규칙]\n${context.rules_text || context.contextText}\n\n[지시]\n${instruction}\n\n다 하고 나서 변경 파일과 실행한 테스트만 짧게 설명해.`
   return dispatchWithRetry(
     () => agent(buildExecuteDispatchInstruction(cwd, prompt, harnessFile), {
       phase: 'FullExecute',
@@ -749,7 +792,19 @@ const CODE_REVIEW_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { description: { type: 'string' }, blocking: { type: 'boolean' } },
+        properties: {
+          id: { type: 'string' },
+          file: { type: 'string' },
+          symbol: { type: 'string' },
+          line_start: { type: 'number' },
+          line_end: { type: 'number' },
+          description: { type: 'string' },
+          issue: { type: 'string' },
+          evidence: { type: 'string' },
+          required_fix: { type: 'string' },
+          required_test: { type: 'string' },
+          blocking: { type: 'boolean' },
+        },
         required: ['description', 'blocking'],
       },
     },
@@ -770,26 +825,35 @@ const CODE_REVIEW_SCHEMA = {
   required: ['hasBlockingIssue', 'issues', 'checks'],
 }
 
-function buildReviewPrompt(task, context, realDiff, role = 'codex', persona = 'code-reviewer') {
-  return `${workflowProfile(role, persona)}\n\n너는 code-review 스킬 계약을 수행하는 독립 코드 리뷰어야. 점수는 매기지 않는다. Codex는 1차 리뷰어이고 Antigravity는 독립 승인 검증자다. 실제 변경사항(git diff)에서 correctness/security/robustness/performance/maintainability 문제를 찾고, 다른 리뷰어의 의견은 보지 않는다(블라인드).
+function buildReviewPrompt(task, context, realDiff, testSummary = {}, plan = '', role = 'codex', persona = 'code-reviewer') {
+  return `${workflowProfile(role, persona)}\n\n너는 code-review 스킬 계약을 수행하는 독립 코드 리뷰어야. 점수는 매기지 않는다. Claude와 Antigravity는 서로 독립적으로 실제 변경사항을 검토한다. 제공된 패키지 밖의 저장소 전체를 탐색하지 말고, 다른 리뷰어의 의견은 보지 않는다(블라인드).
 
 [원 작업]
 ${task}
 
-[저장소 컨텍스트]
-${context.contextText}
+[최소 리뷰 패키지 — 허용 파일]
+${JSON.stringify(context.relevant_files || context.intendedFiles || [])}
+
+[적용 규칙]
+${context.rules_text || context.contextText}
+
+[최종 계획]
+${plan || '(계획 없음 — 현재 diff와 원 작업만 검토)'}
 
 [실제 변경사항 — git diff]
 ${realDiff.content}
 
-1. 가능하면 저장소에서 발견한 결정론적 검사(테스트, 린터, 타입 검사)를 실행하고 checks에 실제 결과와 evidence를 적어. 실행할 명령을 찾지 못하거나 실행하지 못했으면 status=not_run/error로 적고 통과로 가장하지 마.
-2. 실제로 문제가 되는 지점을 issues 배열에 담아(각 항목: description 필수, blocking — 반드시 고쳐야 할 정도면 true, 사소하면 false). 하나라도 blocking=true인 이슈가 있으면 hasBlockingIssue=true, 없으면 false. 문제가 없으면 issues는 빈 배열이고 hasBlockingIssue=false. notes에 그 외 참고할 점.
+[테스트 요약]
+${JSON.stringify(testSummary || {})}
 
-JSON으로만: {"hasBlockingIssue":false,"issues":[{"description":"","blocking":false}],"notes":"","checks":[{"name":"","status":"passed","evidence":""}]}`
+1. 테스트를 다시 실행하지 말고 하네스 테스트 요약만 확인해. 테스트가 not_run/error/failed이면 checks에 그대로 반영해.
+2. 실제로 문제가 되는 지점을 issues 배열에 담아. 각 차단 이슈는 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test를 채워야 한다. 하나라도 blocking=true면 hasBlockingIssue=true다. 문제가 없으면 issues는 빈 배열이다.
+
+JSON으로만: {"hasBlockingIssue":false,"issues":[{"id":"ISSUE-001","file":"","symbol":"","line_start":0,"line_end":0,"issue":"","evidence":"","required_fix":"","required_test":"","description":"","blocking":false}],"notes":"","checks":[{"name":"","status":"passed","evidence":""}]}`
 }
 
-async function claudeReviewDiff(task, context, realDiff) {
-  return agent(buildReviewPrompt(task, context, realDiff, 'claude', 'communicator'), {
+async function claudeReviewDiff(task, context, realDiff, testSummary, plan) {
+  return agent(buildReviewPrompt(task, context, realDiff, testSummary, plan, 'claude', 'communicator'), {
     phase: 'FullCodeReviewSkill',
     label: 'code-review-skill-claude',
     schema: CODE_REVIEW_SCHEMA,
@@ -797,16 +861,16 @@ async function claudeReviewDiff(task, context, realDiff) {
   })
 }
 
-async function codexReviewDiff(task, context, realDiff, isRetry) {
-  return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff, 'codex', 'code-reviewer'), null, 'review'), {
+async function codexReviewDiff(task, context, realDiff, isRetry, testSummary, plan) {
+  return agent(buildScoreDispatchInstruction('codex', buildReviewPrompt(task, context, realDiff, testSummary, plan, 'codex', 'code-reviewer'), null, 'review'), {
     phase: 'FullCodeReviewSkill',
     label: isRetry ? 'code-review-skill-codex-retry' : 'code-review-skill-codex',
     schema: CODE_REVIEW_SCHEMA,
   })
 }
 
-async function antigravityReviewDiff(task, context, realDiff, isRetry) {
-  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff, 'antigravity', 'auditor'), null, 'review'), {
+async function antigravityReviewDiff(task, context, realDiff, isRetry, testSummary, plan) {
+  return agent(buildScoreDispatchInstruction('agy', buildReviewPrompt(task, context, realDiff, testSummary, plan, 'antigravity', 'auditor'), null, 'review'), {
     phase: 'FullCodeReviewSkill',
     label: isRetry ? 'code-review-skill-antigravity-retry' : 'code-review-skill-antigravity',
     schema: CODE_REVIEW_SCHEMA,
@@ -1231,6 +1295,8 @@ const historyFile = parsedArgs.historyFile || `${CLAUDE_HOME}/.claude/verify-tas
 const HARNESS_FILE = parsedArgs.harnessFile || HARNESS_FILE_DEFAULT
 const NANO_MODE = parsedArgs.nanoMode === true || Array.isArray(parsedArgs.nanoSteps)
 const NANO_EVENT_FILE = parsedArgs.nanoEventFile || NANO_EVENT_FILE_DEFAULT
+const RUN_ID = parsedArgs.taskId || stableNanoTaskId(task || 'unknown-task', cwd || 'unknown-cwd')
+const RUN_DIR = parsedArgs.runDir || `${cwd || '/tmp'}/.verify/runs/${RUN_ID}`
 
 if (!cwd) {
   return {
@@ -1252,16 +1318,7 @@ if (!task) {
   }
 }
 
-log('사전 점검: Codex/Antigravity 로그인 상태 확인 중...')
-const preflight = await preflightCheck()
-if (!preflight || preflight.ok === false) {
-  const issues = preflight?.issues || '사전 점검 응답을 받지 못함'
-  log(`사전 점검 실패: ${issues}`)
-  return { finalVerdict: { passed: false, error: 'preflight_failed', issues }, history: [] }
-}
-log('사전 점검 통과')
-
-log('컨텍스트 수집 중 (git status/diff, 관련 파일, 컨벤션, 테스트 명령)...')
+log('하네스 사전 점검·컨텍스트 패키지 생성 중...')
 const context = await gatherContext(cwd, task)
 if (!context) {
   return { finalVerdict: { passed: false, error: 'context_gathering_failed' } }
@@ -1273,19 +1330,21 @@ if (!context) {
 // 전부 빈 컨텍스트로 계속 진행돼서 "완료" 판정이 날 수 있었다. 이제
 // gatherContext 스스로 존재 여부를 확인해서 보고하므로, 여기서 즉시
 // 막는다.
-if (context.cwdExists === false) {
+if (context.cwdExists === false || context.ok === false || context.preflight?.ok === false) {
   return {
     finalVerdict: {
       passed: false,
-      error: 'cwd_not_found',
-      reason: `cwd가 존재하지 않음: ${cwd}. Discord 답장 재시도라면 원본 pending-job이 가리키던 디렉토리(예: 임시 스크래치패드)가 이미 정리됐을 수 있음 — 유효한 cwd로 다시 시도할 것.`,
+      error: context.preflight?.ok === false ? 'preflight_failed' : 'cwd_not_found',
+      reason: context.preflight?.ok === false
+        ? `하네스 사전 점검 실패: ${context.preflight.issues || 'provider unavailable'}`
+        : `cwd가 존재하지 않음: ${cwd}. 유효한 cwd로 다시 시도할 것.`,
     },
     history: [],
   }
 }
 
 let tier = decideTier(context)
-log(`티어 판정: ${tier} (예상 파일 ${context.intendedFiles?.length ?? '?'}개, 민감경로: ${context.sensitivePath})`)
+log(`티어 판정: ${tier} (예상 파일 ${context.relevant_files?.length ?? context.intendedFiles?.length ?? '?'}개, 민감경로: ${context.policy?.sensitive_path ?? context.sensitivePath ?? false})`)
 
 const history = []
 let finalVerdict = null
@@ -1314,11 +1373,13 @@ if (tier === 'light') {
   for (let round = 1; round <= MAX_ROUNDS; round++) {
     log(`[경량] 라운드 ${round}: 클로드 실행 중...`)
     const execResult = await lightExecute(task, context, cwd, feedback)
-    const realDiff = await gatherRealDiff(cwd)
+    const verification = await gatherVerification(cwd)
+    const realDiff = verification
+    const testSummary = verification?.test_summary
 
     log(`[경량] 라운드 ${round}: 코덱스 평가 중...`)
     const evalResult = await dispatchWithRetry(
-      (isRetry) => codexEvaluateLight(task, context, execResult?.summary, realDiff, isRetry),
+      (isRetry) => codexEvaluateLight(task, context, execResult?.summary, realDiff, testSummary, isRetry),
       '코덱스 경량 평가'
     )
     history.push({ tier: 'light', round, execResult, evalResult })
@@ -1352,19 +1413,19 @@ if (tier === 'light') {
     }
 
     const mechViolated = mechanicalTierViolated(realDiff)
-    const codexEscapeHatch = !!evalResult?.escapeHatch && !!evalResult?.escapeHatchReason
+    const codexEscapeHatch = evalResult?.verdict === 'full_track_required' && (evalResult?.blocking_issues || []).length > 0
     if (mechViolated || codexEscapeHatch) {
       log(
-        `[경량] 탈출구 발동 — ${mechViolated ? '기계적 규칙 위반(실제 파일 ' + realDiff.filesChanged.length + '개/민감경로 ' + realDiff.sensitivePath + ')' : '코덱스 판단: ' + evalResult.escapeHatchReason}. 전체 트랙으로 재분류, 기존 산출물은 베이스라인으로 재사용.`
+        `[경량] 탈출구 발동 — ${mechViolated ? '기계적 규칙 위반(실제 파일 ' + realDiff.files_changed.length + '개/민감경로 ' + realDiff.policy.sensitive_path + ')' : '코덱스의 구체적 full_track_required 판단'}. 전체 트랙으로 재분류, 기존 산출물은 베이스라인으로 재사용.`
       )
       baseline = execResult
       tier = 'full'
       break
     }
 
-    if ((evalResult?.total ?? 0) >= 90) {
+    if (evalResult?.verdict === 'pass' && testSummary?.status === 'passed') {
       finalVerdict = { passed: true, tier: 'light', round, execResult, evalResult }
-      log(`[경량] 라운드 ${round}에서 통과 (${evalResult.total}점)`)
+      log(`[경량] 라운드 ${round}에서 통과 (차단 이슈 없음, 테스트 통과)`)
       break
     }
 
@@ -1376,13 +1437,13 @@ if (tier === 'light') {
         execResult,
         evalResult,
         needsUserDecision: true,
-        reason: `경량 트랙 최대 ${MAX_ROUNDS}라운드 안에 90점을 못 넘김. 호출한 에이전트는 사용자에게 물어야 함: (a) 현재 결과물 수용 (b) maxRounds 늘려 재시도 (c) 수동 개입.`,
+        reason: `경량 트랙 최대 ${MAX_ROUNDS}라운드 안에 차단 이슈 또는 테스트 실패를 해소하지 못함.`,
       }
       break
     }
 
-    log(`[경량] 라운드 ${round} 미통과 (${evalResult?.total ?? '?'}점) — 피드백 반영해서 재시도`)
-    feedback = evalResult?.feedback ?? ''
+    log(`[경량] 라운드 ${round} 미통과 (차단 이슈 ${evalResult?.blocking_issues?.length ?? '?'}, 테스트 ${testSummary?.status ?? 'unknown'}) — 현재 이슈만 전달해 재시도`)
+    feedback = JSON.stringify(evalResult?.blocking_issues || [])
   }
 }
 
@@ -1391,7 +1452,7 @@ if (tier === 'light') {
 // Codex 병렬 계획 검토→Codex 최종 계획 수정/구현→code-review 스킬 순서.
 // 탈출구로 들어온 경우 이미 실제 코드가 있으므로 사전 계획/조사를 생략하고
 // code-review 스킬로 직행한다.
-if (tier === 'full' && !finalVerdict) {
+if (false && tier === 'full' && !finalVerdict) {
   if (baseline) {
     log('[전체] 탈출구 경로 — 사전 계획/조사 생략, code-review 스킬로 직행')
     realDiff = await gatherRealDiff(cwd)
@@ -1607,6 +1668,166 @@ if (tier === 'full' && !finalVerdict) {
     log(`[전체] ${round}라운드 불통과 — 코덱스에게 수정 지시`)
     await fullExecute(cwd, formatFixInstruction(combinedIssues), context, HARNESS_FILE)
     realDiff = await gatherRealDiff(cwd)
+  }
+}
+
+// ---------- 전체 트랙: 최소 Claude 독립 리뷰 경로 ----------
+// Claude는 이 경로에서 계획·조사·구현을 맡지 않는다. 하네스가 만든 파일 기반
+// 패키지와 Antigravity 조사만 Codex에 전달하고, 구현 후에는 Claude/Antigravity
+// 독립 리뷰 결과와 결정론적 테스트 결과로만 통과를 판정한다.
+if (tier === 'full' && !finalVerdict) {
+  let finalPlan = ''
+  let testSummary = null
+  if (baseline) {
+    log('[전체] 경량→전체 격상 — 기존 Claude 산출물을 보존하고 계획 단계는 생략')
+    realDiff = await gatherVerification(cwd)
+  } else {
+    log('[전체] 1단계: Antigravity가 저장소 구조·규칙·위험을 병렬 조사...')
+    const promptified = {
+      normalizedPrompt: task,
+      researchBrief: '관련 파일·적용 규칙·위험·회귀 가능성·권장 테스트만 구조화해 조사',
+      acceptanceCriteria: context.test_commands || [],
+      constraints: context.applicable_rules || [],
+    }
+    const researchResults = await parallel(
+      RESEARCH_FOCI.map((focus) =>
+        () => dispatchWithRetry(
+          (isRetry) => antigravityResearch(promptified, context, focus, isRetry),
+          `Antigravity 조사(${focus.id})`
+        )
+      )
+    )
+    const failedResearch = researchResults
+      .map((result, index) => (!result || isDispatchFailure(result) ? RESEARCH_FOCI[index].id : null))
+      .filter(Boolean)
+    if (failedResearch.length) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'research_failed',
+        reason: `Antigravity 병렬 조사 실패(${failedResearch.join(', ')}) — 구조화 조사 없이 구현하지 않음.`,
+        needsUserDecision: true,
+      }
+      return await finalizeAndReturn()
+    }
+
+    log('[전체] 2단계: Codex가 조사 결과를 바탕으로 최종 구현 계획 수립...')
+    const planResult = await dispatchWithRetry(
+      (isRetry) => codexBuildPlan(task, context, researchResults, isRetry),
+      'Codex 구현 계획'
+    )
+    if (!planResult || isDispatchFailure(planResult) || !planResult.plan) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'plan_failed',
+        reason: 'Codex 구현 계획을 받지 못해 실행을 중단함.',
+        needsUserDecision: true,
+      }
+      return await finalizeAndReturn()
+    }
+    if (planResult.needsClarification) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'needs_clarification',
+        questions: planResult.clarifyingQuestions,
+        reason: 'Codex 계획 단계에서 구현에 필요한 정보가 부족함.',
+      }
+      return await finalizeAndReturn()
+    }
+    finalPlan = planResult.plan
+
+    log('[전체] 3단계: Codex가 최종 계획대로 구현...')
+    const execution = await fullExecute(cwd, finalPlan, context, HARNESS_FILE)
+    if (!execution || execution.ok === false) {
+      finalVerdict = {
+        passed: false,
+        tier: 'full',
+        error: 'execution_failed',
+        reason: execution?.message || 'Codex 실행이 성공 응답을 반환하지 않음.',
+        needsUserDecision: true,
+      }
+      return await finalizeAndReturn()
+    }
+  }
+
+  realDiff = realDiff || await gatherVerification(cwd)
+  if (!realDiff || !realDiff.head_sha) {
+    finalVerdict = { passed: false, tier: 'full', error: 'diff_snapshot_failed', reason: '현재 diff를 하네스가 만들지 못함.', needsUserDecision: true }
+    return await finalizeAndReturn()
+  }
+  if (mechanicalTierViolated(realDiff) && tier === 'light') {
+    tier = 'full'
+  }
+  testSummary = realDiff.test_summary
+  const selfCheck = await dispatchWithRetry(
+    (isRetry) => codexSelfCheck(task, context, realDiff, testSummary, isRetry),
+    'Codex 자기점검'
+  )
+  history.push({ tier: 'full', stage: 'self-check', selfCheck, testSummary })
+  if (!selfCheck || isDispatchFailure(selfCheck)) {
+    finalVerdict = { passed: false, tier: 'full', error: 'self_check_failed', reason: 'Codex 자기점검을 완료하지 못함.', needsUserDecision: true }
+    return await finalizeAndReturn()
+  }
+  if (selfCheck.verdict !== 'pass' || (selfCheck.blocking_issues || []).length > 0 || testSummary?.status !== 'passed') {
+    finalVerdict = {
+      passed: false,
+      tier: 'full',
+      error: 'self_check_blocked',
+      selfCheck,
+      testSummary,
+      reason: 'Codex 자기점검 또는 결정론적 테스트가 통과하지 않아 독립 리뷰를 승인 단계로 진행하지 않음.',
+      needsUserDecision: true,
+    }
+    return await finalizeAndReturn()
+  }
+
+  for (let round = 1; round <= MAX_ROUNDS; round++) {
+    log(`[전체] ${round}라운드: Claude/Antigravity 독립 차단 리뷰...`)
+    const [claudeReview, antigravityReview] = await parallel([
+      () => dispatchWithRetry((isRetry) => claudeReviewDiff(task, context, realDiff, testSummary, finalPlan), 'Claude 독립 코드리뷰'),
+      () => dispatchWithRetry((isRetry) => antigravityReviewDiff(task, context, realDiff, isRetry, testSummary, finalPlan), 'Antigravity 독립 코드리뷰'),
+    ])
+    history.push({ tier: 'full', round, claudeReview, antigravityReview, testSummary })
+    const failedReviews = [
+      ['claude', claudeReview],
+      ['antigravity', antigravityReview],
+    ].filter(([, result]) => !result || isDispatchFailure(result))
+    if (failedReviews.length) {
+      if (round === MAX_ROUNDS) {
+        finalVerdict = { passed: false, tier: 'full', round, error: 'code_review_failed', reason: '독립 리뷰어 결과가 없어 통과 판정을 할 수 없음.', needsUserDecision: true }
+        break
+      }
+      continue
+    }
+
+    const combinedIssues = [
+      ...(claudeReview.issues || []).map((issue) => ({ ...issue, source: 'claude' })),
+      ...(antigravityReview.issues || []).map((issue) => ({ ...issue, source: 'antigravity' })),
+    ]
+    for (const result of [claudeReview, antigravityReview]) {
+      for (const check of result.checks || []) {
+        if (check.status !== 'passed') combinedIssues.push({ description: `결정론적 검사 미통과 또는 미실행: ${check.name}`, evidence: check.evidence, blocking: true })
+      }
+    }
+    if (combinedIssues.length) {
+      const harnessResultPost = await appendHarnessRules(combinedIssues, 'code-review', HARNESS_FILE)
+      harnessRulesAddedCount += harnessResultPost?.rulesAdded?.length || 0
+    }
+    const passed = !claudeReview.hasBlockingIssue && !antigravityReview.hasBlockingIssue && testSummary.status === 'passed' && combinedIssues.filter((issue) => issue.blocking).length === 0
+    if (passed) {
+      finalVerdict = { passed: true, tier: 'full', round, wasEscapeHatch: !!baseline }
+      break
+    }
+    if (round === MAX_ROUNDS) {
+      finalVerdict = { passed: false, tier: 'full', round, combinedIssues, needsUserDecision: true, reason: '독립 리뷰 차단 이슈를 최대 라운드 안에 해소하지 못함.' }
+      break
+    }
+    log(`[전체] ${round}라운드 차단 이슈를 현재 diff와 함께 Codex 수정 세션에 전달...`)
+    await fullExecute(cwd, formatFixInstruction(combinedIssues.filter((issue) => issue.blocking !== false)), context, HARNESS_FILE)
+    realDiff = await gatherVerification(cwd)
+    testSummary = realDiff.test_summary
   }
 }
 

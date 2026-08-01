@@ -34,3 +34,8 @@
 
 이번 단계에서는 계약 모델과 token-free 검증만 추가했다. Telegram·Discord·터미널
 런처, launchd, watchdog, Team OS 실행 경로에는 아직 연결하지 않는다.
+
+추가 적용 범위: Telegram adapter는 `ContextEnvelopeStore`를 통해 chat별
+`logical_session_id`와 제한된 entity anchor를 envelope에 기록한다. 이 연결은
+provider native session을 logical session에 병합하지 않으며, 위에 적은 Telegram·
+Discord·터미널 런처 전체 연결이 완료되었다는 뜻은 아니다.

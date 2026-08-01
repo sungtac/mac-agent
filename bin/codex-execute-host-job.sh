@@ -10,21 +10,35 @@ STATUS_FILE="$4"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 . "$SCRIPT_DIR/../workflows/lib/provider-bin.sh"
 
-if ! /usr/bin/git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  printf '%s\n' 66 > "$STATUS_FILE"
+write_failure() {
+  local code="$1"
+  local message="$2"
+  printf '%s\n' "$message" > "$OUTPUT_FILE"
+  printf '%s\n' "$code" > "$STATUS_FILE"
   exit 0
+}
+
+# Validate on the host side too. A literal mktemp template or stale path must
+# never turn into an empty Codex prompt that exits successfully.
+if [ ! -f "$PROMPT_FILE" ]; then
+  write_failure 66 "호스트 Codex 프롬프트 파일을 찾을 수 없음: $PROMPT_FILE"
+fi
+if [ ! -s "$PROMPT_FILE" ]; then
+  write_failure 66 "호스트 Codex 프롬프트 파일이 비어 있음: $PROMPT_FILE"
+fi
+
+if ! /usr/bin/git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  write_failure 66 "작업 디렉토리가 git 저장소가 아님: $CWD"
 fi
 case "$CWD" in
   /Users/edge_ai/.openclaw/workspace|/Users/edge_ai/.openclaw/workspace/*)
-    printf '%s\n' 77 > "$STATUS_FILE"
-    exit 0
+    write_failure 77 "보호된 작업 디렉토리에서는 호스트 Codex를 실행하지 않음: $CWD"
     ;;
 esac
 
 CODEX_BIN="$(find_codex_bin || true)"
 if [ -z "$CODEX_BIN" ] || [ ! -x "$CODEX_BIN" ]; then
-  printf '%s\n' 69 > "$STATUS_FILE"
-  exit 0
+  write_failure 69 "호스트 Codex 실행파일을 찾을 수 없음"
 fi
 
 CODEX_CWD="$CWD"

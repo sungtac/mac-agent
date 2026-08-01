@@ -20,6 +20,8 @@ from telegram import Update
 from telegram.constants import ChatType
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from edge_agent_context_envelope import ContextEnvelopeStore
+
 
 HOME = Path.home()
 TOKEN_FILE = Path(os.environ.get("RODA_GEMMA_TOKEN_FILE", HOME / ".config/roda-gemma/telegram.token"))
@@ -30,7 +32,7 @@ ALLOWED_USER_IDS = {
     int(value) for value in os.environ.get("RODA_GEMMA_ALLOWED_USER_IDS", "6417205500").split(",") if value.strip()
 }
 ALLOWED_GROUP_IDS = {
-    int(value) for value in os.environ.get("RODA_GEMMA_ALLOWED_GROUP_IDS", "-1003709316152").split(",") if value.strip()
+    int(value) for value in os.environ.get("RODA_GEMMA_ALLOWED_GROUP_IDS", "-1003952617795").split(",") if value.strip()
 }
 MAX_PROMPT_CHARS = int(os.environ.get("RODA_GEMMA_MAX_PROMPT_CHARS", "6000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("RODA_GEMMA_MAX_OUTPUT_TOKENS", "512"))
@@ -49,6 +51,10 @@ log = logging.getLogger("roda-gemma")
 for noisy_logger in ("httpx", "httpcore", "telegram", "telegram.ext"):
     logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 REQUEST_SEMAPHORE = asyncio.Semaphore(1)
+
+
+def _context_store() -> ContextEnvelopeStore:
+    return ContextEnvelopeStore(os.environ.get("TELEGRAM_CONTEXT_ROOT") or os.environ.get("RODA_CONTEXT_ROOT") or None)
 
 
 def _ollama_chat(prompt: str) -> str:
@@ -104,6 +110,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = (message.text or message.caption or "").strip()
     if not text:
         return
+    original_text = text
     if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         if chat.id not in ALLOWED_GROUP_IDS:
             return
@@ -115,16 +122,43 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if len(text) > MAX_PROMPT_CHARS:
         text = text[:MAX_PROMPT_CHARS]
 
+    try:
+        preparation = _context_store().prepare(
+            channel="telegram",
+            provider="gemma",
+            chat_id=chat.id,
+            message_id=getattr(message, "message_id", "0"),
+            reply_to_message_id=getattr(getattr(message, "reply_to_message", None), "message_id", None),
+            # The original user text is the only candidate source.  The helper
+            # intentionally does not create a new anchor for short follow-ups.
+            text=original_text,
+        )
+    except (OSError, ValueError, TypeError) as exc:
+        log.warning("context preparation failed; continuing without anchor: %s", type(exc).__name__)
+        preparation = None
+    if preparation is not None and preparation.guard_required:
+        guard = "⚠️ 이전 대상을 하나로 특정할 수 없습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요." if preparation.resolution.status == "ambiguous" else "⚠️ 이전 대상이 만료되었습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요."
+        await message.reply_text(guard)
+        return
+    prompt = f"{preparation.prompt_block}\n\n[사용자 요청]\n{text}" if preparation is not None else text
+
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     async with REQUEST_SEMAPHORE:
         try:
-            answer = await asyncio.to_thread(_ollama_chat, text)
+            answer = await asyncio.to_thread(_ollama_chat, prompt)
         except Exception as exc:  # keep Telegram polling alive on provider errors
             log.warning("request failed: %s", exc)
             await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
             return
     for part in _split_message(answer):
-        await message.reply_text(part)
+        sent = await message.reply_text(part)
+        if preparation is not None and preparation.resolution.anchor is not None and getattr(sent, "message_id", None) is not None:
+            _context_store().bind_response_message(
+                channel="telegram",
+                chat_id=chat.id,
+                source_message_id=preparation.resolution.anchor.source_message_id,
+                response_message_id=sent.message_id,
+            )
 
 
 async def post_init(application: Application) -> None:

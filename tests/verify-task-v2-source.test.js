@@ -14,14 +14,12 @@ function position(text) {
   return index
 }
 
-test('full 트랙은 프롬프트화→조사→계획→계획검토→수정→실행→코드리뷰 순서다', () => {
+test('full 트랙은 조사→Codex 계획→실행→자기점검→독립 코드리뷰 순서다', () => {
   const ordered = [
-    "{ title: 'FullPromptify'",
     "{ title: 'FullResearch'",
     "{ title: 'FullPlan'",
-    "{ title: 'FullPlanReview'",
-    "{ title: 'FullPlanRevise'",
     "{ title: 'FullExecute'",
+    "{ title: 'FullSelfCheck'",
     "{ title: 'FullCodeReviewSkill'",
   ].map(position)
 
@@ -30,21 +28,28 @@ test('full 트랙은 프롬프트화→조사→계획→계획검토→수정�
   }
 })
 
-test('Antigravity 조사와 Codex 계획 검토는 병렬 호출이고 실패 결과를 빈 결과로 대체하지 않는다', () => {
+test('Antigravity 조사는 병렬 호출이고 Codex 계획은 조사 결과를 받는다', () => {
   position('RESEARCH_FOCI.map((focus) =>')
-  position('const planReviews = await parallel([')
+  position('const planResult = await dispatchWithRetry(')
   position('const failedResearch = researchResults')
-  position('const failedPlanReviews = planReviews.filter')
   position("error: 'research_failed'")
-  position("error: 'plan_review_failed'")
 })
 
-test('Codex 최종 계획 수정 후 실행 성공을 확인하고 code-review 스킬로 넘어간다', () => {
-  const revise = position('const reconciled = await dispatchWithRetry(')
-  const execute = position('const execution = await fullExecute(')
-  const review = position("log(`[전체] ${round}라운드: code-review 스킬 발동")
-  assert.ok(revise < execute)
+test('provider dispatch는 mktemp 템플릿이 아닌 실제 프롬프트 경로를 전달하도록 지시한다', () => {
+  assert.doesNotMatch(source, /mktemp \/tmp\/verify-task-v2-(?:codex|agy|exec)-XXXXXX/)
+  assert.match(source, /TMP_FILE=.*mktemp -t verify-task-v2-/)
+  assert.match(source, /문자열 \\`XXXXXX\\`, \\`<파일경로>\\`, \\`<임시파일>\\`을 그대로 사용하지 말고/)
+  assert.match(source, /실제 경로를 인자로 전달/)
+})
+
+test('Codex 계획 후 실행·자기점검 성공을 확인하고 독립 code-review로 넘어간다', () => {
+  const plan = position('const planResult = await dispatchWithRetry(')
+  const execute = position('const execution = await fullExecute(cwd, finalPlan')
+  const selfCheck = position('const selfCheck = await dispatchWithRetry(')
+  const review = position("log(`[전체] ${round}라운드: Claude/Antigravity 독립 차단 리뷰")
+  assert.ok(plan < execute)
   assert.ok(execute < review)
+  assert.ok(selfCheck < review)
   position("error: 'execution_failed'")
 })
 
@@ -131,14 +136,14 @@ test('이전 자체계획·블라인드 비평 함수 경로가 제거됐다', (
 test('Workflow 단계마다 영구 아이덴티티와 persona 계약이 주입된다', () => {
   position("const AGENT_PROFILE_VERSION = '1.0.0'")
   position("const COMMON_RESPONSE_STYLE =")
-  position("FullPromptify: 'claude.planner'")
+  position("FullResearch: 'antigravity.researcher|antigravity.red-team'")
+  position("FullPlan: 'codex.architect'")
   position("FullExecute: 'codex.implementer'")
-  position("FullCodeReviewSkill: 'codex.code-reviewer|antigravity.auditor'")
-  position("workflowProfile('claude', 'planner')")
+  position("FullSelfCheck: 'codex.test-engineer'")
+  position("FullCodeReviewSkill: 'claude.communicator|antigravity.auditor'")
   position("workflowProfile('antigravity', persona)")
-  position("workflowProfile('codex', 'plan-reviewer')")
   position("workflowProfile('codex', 'implementer')")
-  position("buildReviewPrompt(task, context, realDiff, 'antigravity', 'auditor')")
+  position("buildReviewPrompt(task, context, realDiff, testSummary, plan, 'antigravity', 'auditor')")
   position("style: 'plain-high-school-v1'")
 })
 
@@ -146,4 +151,170 @@ test('Workflow profile snapshot은 기준 계약 파일과 동기화되어 있�
   const contract = fs.readFileSync(path.resolve(__dirname, '../config/agent-profile-contract.json'))
   const digest = crypto.createHash('sha256').update(contract).digest('hex')
   assert.match(source, new RegExp(`AGENT_PROFILE_CONTRACT_SHA256 = '${digest}'`))
+})
+
+const canRunMacSandbox = (() => {
+  if (process.platform !== 'darwin' || !fs.existsSync('/usr/bin/sandbox-exec')) return false
+  const smoke = childProcess.spawnSync(
+    '/usr/bin/sandbox-exec',
+    ['-f', path.resolve(__dirname, '../config/code-review-read-only.sb'), '--', '/usr/bin/true'],
+    { encoding: 'utf8' }
+  )
+  return smoke.status === 0
+})()
+
+function writeFakeAgy(tempDir) {
+  const fakeAgy = path.join(tempDir, 'fake-agy')
+  fs.writeFileSync(fakeAgy, `#!/bin/sh
+set -u
+printf '%s' 'allowed' > "$AGY_LOG_ROOT/log/provider-write.txt"
+if printf '%s' 'forbidden' > "$FORBIDDEN_PATH" 2>"$AGY_LOG_ROOT/log/forbidden.stderr"; then
+  printf '%s' 'unexpected-success' > "$AGY_LOG_ROOT/log/forbidden-result.txt"
+else
+  printf '%s' 'denied' > "$AGY_LOG_ROOT/log/forbidden-result.txt"
+fi
+printf '%s\\n' '{"hasBlockingIssue":false,"issues":[],"notes":"sandbox probe","checks":[{"name":"sandbox-write","status":"passed","evidence":"probe"}]}'
+`)
+  fs.chmodSync(fakeAgy, 0o755)
+  return fakeAgy
+}
+
+function runAgySandboxScenario(useOverride) {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-task-agy-dynamic-profile-'))
+  try {
+    const homeDir = path.join(tempDir, 'home')
+    const logRoot = useOverride
+      ? path.join(tempDir, 'override-root')
+      : path.join(homeDir, '.gemini', 'antigravity-cli')
+    const profileTempDir = path.join(tempDir, 'profile-tmp')
+    const promptFile = path.join(tempDir, 'prompt.txt')
+    const forbiddenPath = useOverride
+      ? path.join(tempDir, 'override-sibling.txt')
+      : path.join(homeDir, '.gemini', 'antigravity-sibling.txt')
+    fs.mkdirSync(path.join(logRoot, 'log'), { recursive: true })
+    fs.mkdirSync(path.join(logRoot, 'crashes'), { recursive: true })
+    fs.mkdirSync(profileTempDir, { recursive: true })
+    fs.writeFileSync(promptFile, 'sandbox probe\n')
+    const fakeAgy = writeFakeAgy(tempDir)
+    const env = {
+      ...process.env,
+      AGY_BIN: fakeAgy,
+      FORBIDDEN_PATH: forbiddenPath,
+      HOME: homeDir,
+      TMPDIR: profileTempDir,
+    }
+    if (useOverride) {
+      env.AGY_LOG_ROOT = logRoot
+    } else {
+      delete env.AGY_LOG_ROOT
+    }
+    delete env.EDGE_AGENT_REVIEW_PROFILE
+
+    const result = childProcess.spawnSync(
+      'bash',
+      [path.resolve(__dirname, '../workflows/lib/score-dispatch.sh'), 'agy', promptFile, 'review'],
+      { encoding: 'utf8', env }
+    )
+    assert.equal(result.error, undefined, result.error && result.error.message)
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    const envelope = JSON.parse(result.stdout)
+    assert.notEqual(envelope.dispatchFailed, true, result.stdout)
+    assert.equal(envelope.checks[0].status, 'passed')
+    assert.equal(fs.readFileSync(path.join(logRoot, 'log', 'provider-write.txt'), 'utf8'), 'allowed')
+    assert.equal(fs.readFileSync(path.join(logRoot, 'log', 'forbidden-result.txt'), 'utf8'), 'denied')
+    assert.equal(fs.existsSync(forbiddenPath), false)
+    assert.deepEqual(
+      fs.readdirSync(profileTempDir).filter((entry) => entry.startsWith('edge-agent-review-profile.')),
+      []
+    )
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+}
+
+test('AGY_LOG_ROOT override는 동적 로그 허용과 저장소 밖 쓰기 거부를 함께 적용한다', {
+  skip: !canRunMacSandbox,
+}, () => {
+  runAgySandboxScenario(true)
+})
+
+test('AGY_LOG_ROOT가 없으면 HOME fallback 경로에 동적 로그 허용을 적용한다', {
+  skip: !canRunMacSandbox,
+}, () => {
+  runAgySandboxScenario(false)
+})
+
+test('동적 review 프로필 생성 실패는 provider 실행 전에 구조화된 실패로 반환된다', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-task-agy-profile-failure-'))
+  try {
+    const logRoot = path.join(tempDir, 'logs')
+    const profileTempDir = path.join(tempDir, 'profile-tmp')
+    const promptFile = path.join(tempDir, 'prompt.txt')
+    const fakeAgy = path.join(tempDir, 'fake-agy')
+    fs.mkdirSync(path.join(logRoot, 'log'), { recursive: true })
+    fs.mkdirSync(path.join(logRoot, 'crashes'), { recursive: true })
+    fs.mkdirSync(profileTempDir, { recursive: true })
+    fs.writeFileSync(promptFile, 'profile failure probe\n')
+    fs.writeFileSync(fakeAgy, '#!/bin/sh\nprintf x > "$AGY_LOG_ROOT/log/provider-ran.txt"\n')
+    fs.chmodSync(fakeAgy, 0o755)
+    const result = childProcess.spawnSync(
+      'bash',
+      [path.resolve(__dirname, '../workflows/lib/score-dispatch.sh'), 'agy', promptFile, 'review'],
+      {
+        encoding: 'utf8',
+        env: {
+          ...process.env,
+          AGY_BIN: fakeAgy,
+          AGY_LOG_ROOT: logRoot,
+          EDGE_AGENT_REVIEW_PROFILE: path.join(tempDir, 'missing-profile.sb'),
+          HOME: path.join(tempDir, 'home'),
+          TMPDIR: profileTempDir,
+        },
+      }
+    )
+    assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+    const envelope = JSON.parse(result.stdout)
+    assert.equal(envelope.dispatchFailed, true)
+    assert.equal(envelope.checks[0].status, 'error')
+    assert.match(envelope.dispatchFailureReason, /프로필/)
+    assert.equal(fs.existsSync(path.join(logRoot, 'log', 'provider-ran.txt')), false)
+    assert.deepEqual(fs.readdirSync(profileTempDir), [])
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
+})
+
+test('Antigravity 로그 루트가 저장소 내부이거나 심볼릭 링크면 fail-closed 한다', () => {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-task-agy-path-rejection-'))
+  try {
+    const promptFile = path.join(tempDir, 'prompt.txt')
+    const targetDir = path.join(tempDir, 'target')
+    const symlinkRoot = path.join(tempDir, 'symlink-root')
+    fs.mkdirSync(targetDir)
+    fs.writeFileSync(promptFile, 'path rejection probe\n')
+    fs.symlinkSync(targetDir, symlinkRoot, 'dir')
+
+    for (const logRoot of [path.resolve(__dirname, '..'), symlinkRoot]) {
+      const result = childProcess.spawnSync(
+        'bash',
+        [path.resolve(__dirname, '../workflows/lib/score-dispatch.sh'), 'agy', promptFile, 'review'],
+        {
+          encoding: 'utf8',
+          env: {
+            ...process.env,
+            AGY_BIN: '/usr/bin/true',
+            AGY_LOG_ROOT: logRoot,
+            HOME: path.join(tempDir, 'home'),
+          },
+        }
+      )
+      assert.equal(result.status, 0, `${result.stderr}\n${result.stdout}`)
+      const envelope = JSON.parse(result.stdout)
+      assert.equal(envelope.dispatchFailed, true)
+      assert.equal(envelope.checks[0].status, 'error')
+      assert.match(envelope.dispatchFailureReason, /절대 경로|제어 문자|심볼릭 링크|저장소 내부/)
+    }
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true })
+  }
 })

@@ -19,14 +19,14 @@
   "agents": {
     "claude": {
       "label": "Claude",
-      "identity": "수석 오케스트레이터이자 아키텍트",
-      "mission": "사용자 목표를 실행 가능한 계획으로 바꾸고 조사·구현·검증 결과를 통합한다.",
-      "default_persona": "coordinator",
+      "identity": "제한된 구현자 또는 독립 리뷰어",
+      "mission": "경량 작업을 제한된 범위에서 구현하거나 전체 작업의 최소 패키지를 독립적으로 검토한다.",
+      "default_persona": "implementer",
       "phase_personas": {
         "FullPromptify": "planner",
         "FullPlan": "coordinator",
         "FullCodeReviewSkill": "communicator",
-        "Light": "coordinator"
+        "Light": "implementer"
       },
       "personas": {
         "planner": {
@@ -36,6 +36,10 @@
         "coordinator": {
           "label": "병렬 작업 조율자",
           "instruction": "작업을 독립 단위로 나누고 파일 충돌과 의존성을 확인해 실행 순서를 정한다."
+        },
+        "implementer": {
+          "label": "제한된 구현 담당자",
+          "instruction": "허용된 파일만 수정하고 지정된 테스트를 실행한다. 계획 수립이나 저장소 전체 조사는 하지 않는다."
         },
         "communicator": {
           "label": "사용자 소통 담당자",

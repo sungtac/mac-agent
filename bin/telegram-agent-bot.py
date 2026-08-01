@@ -37,6 +37,11 @@ from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_
 from edge_agent_reflection import write_reflection, write_worktree_metadata
 from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
 from edge_agent_session_bridge import bind_native_session, start_session, update_session, bounded_context
+from edge_agent_context_envelope import (
+    ContextEnvelopeStore,
+    ContextPreparation,
+    native_session_path,
+)
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
@@ -142,6 +147,19 @@ ROLE_LABELS = {role: cfg["label"] for role, cfg in ROLES.items()}
 ROLE_USERNAMES = {role: cfg["username"] for role, cfg in ROLES.items()}
 ROLE_WAKE_WORDS = {role: cfg["wake_words"] for role, cfg in ROLES.items()}
 
+# Telegram has one polling process per provider. These words are understood
+# by the independent Roda bot, so the three provider bots must stay silent
+# when Roda is explicitly addressed.
+EXTERNAL_AGENT_USERNAMES = ("sukja_hwpx_helper_bot",)
+EXTERNAL_AGENT_WAKE_WORDS = ("로다",)
+
+# A group address is an intentional fan-out request. It is handled as a
+# conversation-only request below, so matching bots may answer without
+# creating a Git worktree or repository lifecycle lock.
+GROUP_ADDRESS_WORDS = (
+    "각자", "둘 다", "둘다", "다같이", "같이", "모두 다", "모두", "전부", "얘들아",
+)
+
 # Video-derived efficiency policies are deliberately opt-in.  The default
 # keeps the long-tested Telegram command line byte-for-byte equivalent; the
 # pilot can enable bounded prompt/profile behavior without changing launchd
@@ -178,6 +196,59 @@ def _provider_workspace(role: str) -> Path:
     if ACTIVE_TASK_WORKSPACE is not None:
         return ACTIVE_TASK_WORKSPACE
     return CODEX_WORKSPACE if role == "codex" else WORKSPACE
+
+
+def _is_group_address(text: str) -> bool:
+    normalized = " ".join(text.split())
+    return any(word in normalized for word in GROUP_ADDRESS_WORDS)
+
+
+def _has_address(text: str, words: tuple[str, ...]) -> bool:
+    tokens = text.strip().split()
+    if not tokens:
+        return False
+    first = _strip_wake_particle(_strip_wake_punct(tokens[0]))
+    last = _strip_wake_particle(_strip_wake_punct(tokens[-1]))
+    if first in words or last in words:
+        return True
+    for raw_token in tokens:
+        token = _strip_wake_punct(raw_token)
+        for particle in ("야", "아", "씨", "님"):
+            if token.endswith(particle) and token != particle and token[:-len(particle)] in words:
+                return True
+    return False
+
+
+def _is_external_agent_addressed(text: str) -> bool:
+    lowered = text.lower()
+    if any(re.search(rf"@{re.escape(username)}(?![a-zA-Z0-9_])", lowered) for username in EXTERNAL_AGENT_USERNAMES):
+        return True
+    return _has_address(text, EXTERNAL_AGENT_WAKE_WORDS)
+
+
+def _message_route(text: str, mentioned_roles: set[str] | None = None) -> str:
+    """Return the routing class before any provider/worktree is started."""
+    if _is_external_agent_addressed(text):
+        return "external"
+    if mentioned_roles:
+        return "targeted"
+    if _is_group_address(text):
+        return "broadcast"
+    return "default"
+
+
+def _needs_task_worktree(text: str) -> bool:
+    """Only code work and Codex approval need an isolated task worktree."""
+    if is_approval(text) or _looks_like_coding_task(text):
+        return True
+    # Cover natural-language mutation requests that do not contain an
+    # explicit coding keyword (for example, "이 파일을 바꿔줘"). A false
+    # positive costs an isolated worktree; a false negative permits a
+    # write-capable provider to touch the shared workspace.
+    normalized = " ".join(text.split()).lower()
+    mutation_words = ("바꿔", "변경", "수정", "추가", "삭제", "구현", "작성", "만들", "고쳐", "적용")
+    targets = ("파일", "코드", "스크립트", "함수", "저장소", "프로젝트", "리포")
+    return any(target in normalized for target in targets) and any(word in normalized for word in mutation_words)
 
 
 async def _create_task_worktree(task_id: str, *, on_wait=None) -> Path:
@@ -229,26 +300,56 @@ def _auth_source(role: str) -> str:
     return os.environ.get("GEMINI_DIR", str(HOME / ".gemini"))
 
 
-def _native_session_path(role: str) -> Path:
+def _native_session_path(role: str, chat_id: str | int | None = None) -> Path:
     configured = os.environ.get("TELEGRAM_AGENT_NATIVE_SESSION_FILE", "").strip()
-    if configured:
-        return Path(configured).expanduser().resolve()
-    return HOME / ".edge-agent" / "state" / "telegram-native-sessions" / f"{role}.json"
+    return native_session_path(configured or None, role=role, chat_id=chat_id)
 
 
-def _load_native_session_id(role: str) -> str | None:
-    path = _native_session_path(role)
+def _workspace_identity(workspace: Path) -> str:
+    resolved = workspace.expanduser().resolve()
+    try:
+        stat = resolved.stat()
+        return f"{resolved}:{stat.st_dev}:{stat.st_ino}"
+    except OSError:
+        return str(resolved)
+
+
+def _workspace_resume_valid(workspace: Path) -> bool:
+    try:
+        stat = workspace.expanduser().resolve().stat()
+        return (
+            workspace.expanduser().resolve().is_dir()
+            and os.access(workspace, os.R_OK | os.W_OK)
+            and stat.st_uid == os.getuid()
+        )
+    except (OSError, ValueError):
+        return False
+
+
+def _load_native_session_id(role: str, chat_id: str | int | None = None, workspace: Path | None = None) -> str | None:
+    path = _native_session_path(role, chat_id)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
         value = str(payload.get("session_id", "")).strip()
         uuid.UUID(value)
+        if chat_id is not None:
+            selected_workspace = workspace or _provider_workspace(role)
+            if not _workspace_resume_valid(selected_workspace):
+                return None
+            expected_workspace = str(selected_workspace.resolve())
+            if str(payload.get("chat_id")) != str(chat_id):
+                return None
+            if str(payload.get("provider")) != role or str(payload.get("workspace")) != expected_workspace:
+                return None
+            if str(payload.get("workspace_identity")) != _workspace_identity(selected_workspace):
+                return None
         return value
     except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 
-def _persist_native_session_id(role: str, session_id: str) -> None:
-    path = _native_session_path(role)
+def _persist_native_session_id(role: str, session_id: str, chat_id: str | int | None = None, workspace: Path | None = None) -> None:
+    path = _native_session_path(role, chat_id)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     descriptor = os.open(str(temporary), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
@@ -256,7 +357,12 @@ def _persist_native_session_id(role: str, session_id: str) -> None:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
             descriptor = -1
             json.dump(
-                {"schema": "edge_agent.telegram_native_session.v1", "provider": role, "session_id": session_id},
+                {
+                    "schema": "edge_agent.telegram_native_session.v1",
+                    "provider": role,
+                    "session_id": session_id,
+                    **({"chat_id": str(chat_id), "workspace": str((workspace or _provider_workspace(role)).resolve()), "workspace_identity": _workspace_identity(workspace or _provider_workspace(role))} if chat_id is not None else {}),
+                },
                 stream,
             )
             stream.write("\n")
@@ -339,6 +445,23 @@ def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
 
 def _runtime_prompt(prompt: str) -> str:
     return _runtime_prompt_parts(prompt)[0]
+
+
+def _context_store() -> ContextEnvelopeStore:
+    return ContextEnvelopeStore(os.environ.get("TELEGRAM_CONTEXT_ROOT") or None)
+
+
+def _prepare_context(message, text: str) -> ContextPreparation:
+    reply = getattr(message, "reply_to_message", None)
+    reply_id = getattr(reply, "message_id", None)
+    return _context_store().prepare(
+        channel="telegram",
+        provider=ROLE,
+        chat_id=message.chat_id,
+        message_id=getattr(message, "message_id", "0"),
+        reply_to_message_id=reply_id,
+        text=text,
+    )
 
 
 def _changed_file_count(workspace: Path | None) -> int:
@@ -556,9 +679,9 @@ def _is_stale(message) -> bool:
     return age > STALE_SECONDS
 
 
-# Two things independent reviews (round 5, 2026-07-31) flagged as security
-# gaps that are deliberately NOT fixed here — both are the user's own
-# explicit requirement from earlier in this same session, not oversights:
+# One thing independent reviews (round 5, 2026-07-31) flagged as a security
+# gap is deliberately NOT fixed here — it is the user's own explicit
+# requirement from earlier in this same session, not an oversight:
 #   1. No per-sender allowlist inside the group: "단체방 전체 누구나" (anyone
 #      in the group, not just the owner) was the explicit answer when asked
 #      whether to restrict plain-chat answering to the owner only. Adding a
@@ -566,13 +689,8 @@ def _is_stale(message) -> bool:
 #      decision. TELEGRAM_AGENT_CHAT_ID (added this session) is the intended
 #      boundary — trust is "whoever is in this specific group," not
 #      "whoever sent this specific message."
-#   2. An unaddressed plain message still runs all three providers
-#      sequentially against the shared WORKSPACE (each may see the previous
-#      one's edits) rather than picking a single writer — that's the direct
-#      consequence of "all three should answer free chat," the explicit
-#      feature this session was asked to build in the first place.
-# If either default should change, that's a product decision for the user
-# to make, not something to silently harden away during a review pass.
+# Ordinary unaddressed messages now go to Claude only; explicit group words
+# such as "각자" are the supported fan-out mechanism.
 def addressed_text(update: Update) -> str | None:
     message = update.effective_message
     chat = update.effective_chat
@@ -604,8 +722,26 @@ def addressed_text(update: Update) -> str | None:
         mentioned_roles = _mentioned_roles_from_regex(text)
     mentioned_roles |= _wake_roles(text)
 
+    route = _message_route(text, mentioned_roles)
+    if route == "external":
+        # Roda is a separate Telegram bot and has its own allowlist. Do not
+        # let the provider bots answer or create workspaces for its request.
+        return None
+
     if mentioned_roles and ROLE not in mentioned_roles:
         # Explicitly addressed to (a) different role bot(s) — stay silent.
+        return None
+
+    if not mentioned_roles and route == "default" and ROLE != "claude":
+        # Claude is the representative for ordinary conversation. This
+        # avoids three provider processes competing for one message while
+        # preserving explicit fan-out through words such as "각자".
+        return None
+
+    if route == "broadcast" and _needs_task_worktree(text) and ROLE != "codex":
+        # A multi-agent code request still needs one owner. Codex is the
+        # implementation owner; Claude/Antigravity should not independently
+        # create worktrees for the same request.
         return None
 
     # Strip every registered bot's @mention, not just this one's own — a
@@ -686,25 +822,20 @@ async def _force_kill_pgid(pgid: int, proc: asyncio.subprocess.Process) -> None:
         pass
 
 
-# Cross-process (not just cross-coroutine) lock so claude/codex/antigravity —
-# three separate OS processes, each with full write access to the same
-# shared WORKSPACE — can't run a provider CLI concurrently and step on each
-# other's file writes. This is a real, reachable case: an unaddressed plain
-# message makes all three answer at once (see addressed_text), each
-# launching its own workspace-write-capable CLI. Same lock-file *scheme* as
+# Cross-process (not just cross-coroutine) lock so provider processes with
+# full write access to the same shared WORKSPACE can't run concurrently and
+# step on each other's file writes. Explicit group-addressed conversation
+# can still fan out, so this lock serializes their shared-workspace provider
+# runs. Same lock-file *scheme* as
 # discord_bot_common.try_acquire_repo_lock() (fcntl.flock on a hashed-path
 # lock file) — copied locally rather than imported to avoid this bot
 # depending on the discord.py package, BUT deliberately NOT the same
 # reject-immediately policy: Discord's callers are guarding against an
 # accidental double-fire of what's conceptually one request, where an
-# instant "busy" is correct. Here, a plain group message deliberately
-# addresses all three bots at once — reject-immediately would mean the 2nd
-# and 3rd bot silently never answer the "all three respond" free-chat
-# behavior that was the explicit point of building it. So: wait (polling,
-# non-blocking flock attempts) up to WORKSPACE_LOCK_WAIT_SECONDS instead of
-# failing after the first attempt — correctness (no concurrent writes) is
-# kept, "eventually all three answer" is kept, at the cost of the 2nd/3rd
-# bot's reply landing later while the first is running.
+# instant "busy" is correct. Here, explicitly broadcast messages may
+# intentionally reach multiple bots, so we wait (polling, non-blocking flock
+# attempts) up to WORKSPACE_LOCK_WAIT_SECONDS instead of failing after the
+# first attempt.
 #
 # Points at the SAME directory discord_bot_common.REPO_LOCK_DIR uses, with
 # the same sha256[:32]+".lock" naming (_workspace_lock_path below matches
@@ -750,13 +881,21 @@ async def _run_cli(
     on_wait=None,
     timeout_seconds: int | None = None,
     sandbox_mode: str = "workspace-write",
+    *,
+    context_prompt: str | None = None,
+    provider_text: str | None = None,
+    chat_id: str | int | None = None,
 ) -> str:
     timeout_seconds = timeout_seconds if timeout_seconds is not None else TIMEOUT_SECONDS
     cli_path = ROLES[role]["binary"]
     if not cli_path.exists():
         raise RuntimeError(f"provider executable is missing: {cli_path}")
 
-    runtime_prompt, runtime_options = _runtime_prompt_parts(prompt)
+    provider_workspace = _provider_workspace(role)
+    effective_prompt = provider_text if provider_text is not None else prompt
+    if context_prompt:
+        effective_prompt = f"{context_prompt}\n\n[provider request]\n{effective_prompt}"
+    runtime_prompt, runtime_options = _runtime_prompt_parts(effective_prompt)
     native_session_id: str | None = None
     native_session_is_new = False
 
@@ -767,7 +906,7 @@ async def _run_cli(
         args = [
             str(cli_path), "-p",
         ]
-        native_session_id = _load_native_session_id(role)
+        native_session_id = _load_native_session_id(role, chat_id=chat_id, workspace=provider_workspace)
         native_session_is_new = native_session_id is None
         native_session_id = native_session_id or str(uuid.uuid4())
         args.extend(["--session-id" if native_session_is_new else "--resume", native_session_id])
@@ -783,7 +922,6 @@ async def _run_cli(
             "--", runtime_prompt,
         ])
     elif role == "codex":
-        provider_workspace = _provider_workspace(role)
         args = [str(cli_path), "exec"]
         if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE and runtime_options.get("reasoning_effort"):
             args.extend(["-c", f'model_reasoning_effort="{runtime_options["reasoning_effort"]}"'])
@@ -792,7 +930,6 @@ async def _run_cli(
             "-C", str(provider_workspace), "--skip-git-repo-check", "--", runtime_prompt,
         ])
     else:
-        provider_workspace = _provider_workspace(role)
         # `--print` is a *string-valued* flag (Go stdlib `flag` package) —
         # its value is whatever argv token comes immediately after it, taken
         # verbatim, dash-prefix or not. That means:
@@ -902,7 +1039,7 @@ async def _run_cli(
     if role == "claude" and native_session_id:
         if native_session_is_new:
             try:
-                _persist_native_session_id(role, native_session_id)
+                _persist_native_session_id(role, native_session_id, chat_id=chat_id, workspace=provider_workspace)
             except OSError as exc:
                 log(f"Claude 네이티브 세션 ID 저장 실패(응답은 유지): {type(exc).__name__}")
         if ACTIVE_LOGICAL_SESSION_ID:
@@ -913,11 +1050,11 @@ async def _run_cli(
     return output
 
 
-async def run_provider(prompt: str, on_wait=None) -> str:
-    return await _run_cli(ROLE, prompt, on_wait=on_wait)
+async def run_provider(prompt: str, on_wait=None, *, context_prompt: str | None = None, provider_text: str | None = None, chat_id: str | int | None = None) -> str:
+    return await _run_cli(ROLE, prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=provider_text, chat_id=chat_id)
 
 
-async def generate_coding_plan(prompt: str, on_wait=None) -> str:
+async def generate_coding_plan(prompt: str, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
     plan_prompt = (
         "코드를 수정하지 말고 읽기 전용으로 조사하라. 아래 코딩 요청에 대해 "
         "실행 가능한 계획만 작성하라. 계획에는 목표, 범위, 변경 예정 파일, "
@@ -925,7 +1062,7 @@ async def generate_coding_plan(prompt: str, on_wait=None) -> str:
         "파일·명령·테스트 결과를 완료된 것처럼 말하지 말라.\n\n"
         f"[코딩 요청]\n{prompt}"
     )
-    return await _run_cli(ROLE, plan_prompt, on_wait=on_wait, sandbox_mode="read-only")
+    return await _run_cli(ROLE, plan_prompt, on_wait=on_wait, sandbox_mode="read-only", context_prompt=context_prompt, provider_text=plan_prompt, chat_id=chat_id)
 
 
 # --- Codex-authors / Claude+Antigravity-verify loop ------------------------
@@ -1050,12 +1187,12 @@ def _build_verify_prompt(original_request: str, codex_report: str) -> str:
 # — this is the smallest useful step (delegate, relay codex's own report)
 # before building a general "any bot may call any bot" mechanism, which needs
 # its own cycle/depth guards that don't exist yet.
-async def claude_delegates_to_codex(original_prompt: str, message, on_wait=None) -> str:
-    codex_report = await _run_cli("codex", original_prompt, on_wait=on_wait)
+async def claude_delegates_to_codex(original_prompt: str, message, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
+    codex_report = await _run_cli("codex", original_prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=original_prompt, chat_id=chat_id)
     return f"🔧 (코덱스에게 위임한 결과)\n\n{codex_report}"
 
 
-async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -> str:
+async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
     codex_report = original_prompt
     last_claude_verdict = ""
     last_agy_verdict = ""
@@ -1078,7 +1215,7 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
                 "위 검증 피드백을 반영해서 코드를 직접 수정하라. 무엇을 어떻게 "
                 "고쳤는지 요약해서 보고하라."
             )
-        codex_report = await run_provider(write_prompt, on_wait=on_wait)
+        codex_report = await run_provider(write_prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=write_prompt, chat_id=chat_id)
         try:
             await message.reply_text(f"🔧 라운드{round_num}: 코덱스 작업 완료\n{codex_report[:1200]}")
         except TelegramError as exc:
@@ -1088,7 +1225,8 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
         claude_available = True
         try:
             claude_verdict = await _run_cli(
-                "claude", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
+                "claude", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS,
+                context_prompt=context_prompt, provider_text=verify_prompt, chat_id=chat_id,
             )
         except Exception as exc:
             claude_available = False
@@ -1096,7 +1234,8 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None) -
         antigravity_available = True
         try:
             agy_verdict = await _run_cli(
-                "antigravity", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS
+                "antigravity", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS,
+                context_prompt=context_prompt, provider_text=verify_prompt, chat_id=chat_id,
             )
         except Exception as exc:
             antigravity_available = False
@@ -1203,6 +1342,47 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         log(f"오래된 메시지 무시 chat={message.chat_id} age>{STALE_SECONDS}s")
         return
 
+    try:
+        preparation = _prepare_context(message, text)
+    except (OSError, ValueError, TypeError) as exc:
+        # Context storage is advisory.  A storage outage must not turn an
+        # otherwise valid provider request into an arbitrary hard failure.
+        log(f"Telegram 컨텍스트 준비 실패(안전한 envelope 없이 계속): {type(exc).__name__}")
+        preparation = None
+
+    if preparation is not None and preparation.guard_required:
+        guard_task_id = write_task_state(
+            role=ROLE,
+            chat_id=message.chat_id,
+            text=text,
+            status="waiting",
+            workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+            auth_source=_auth_source(ROLE),
+        )
+        try:
+            waiting_session = start_session(
+                task_id=guard_task_id,
+                channel="telegram",
+                provider=ROLE,
+                owner=f"telegram-{ROLE}",
+                workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+            )
+            update_session(
+                waiting_session,
+                status="waiting",
+                summary=f"컨텍스트 {preparation.resolution.status}: {preparation.resolution.reason}",
+                next_action="원본 링크나 대상을 명확히 지정",
+                event_type="context_resolution_waiting",
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"컨텍스트 대기 상태 기록 실패(guard는 유지): {type(exc).__name__}")
+        message_text = "⚠️ 이전 대상을 하나로 특정할 수 없습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요." if preparation.resolution.status == "ambiguous" else "⚠️ 이전 대상이 만료되었습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요."
+        try:
+            await message.reply_text(message_text)
+        except TelegramError as exc:
+            log(f"컨텍스트 명확화 안내 전송 실패: {exc}")
+        return
+
     if _BUSY_LOCK.locked():
         try:
             await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]}가 이미 다른 작업을 처리 중이에요. 끝나면 답할게요.")
@@ -1253,7 +1433,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             except TelegramError:
                 pass
 
-        if ROLE in ROLES:
+        # Classify before creating a worktree. Greetings, status questions,
+        # and broadcast self-introductions are provider conversations, not
+        # repository work. The old order created three worktrees first and
+        # caused the lifecycle lock failure seen in production.
+        needs_worktree = _needs_task_worktree(text)
+        if needs_worktree:
             try:
                 ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id, on_wait=_notify_waiting)
                 write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
@@ -1279,7 +1464,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     update_session(ACTIVE_LOGICAL_SESSION_ID, status="failed", summary="텔레그램 작업공간 생성 실패", next_action="작업공간 생성 오류를 확인", event_type="worktree_failed")
                 ACTIVE_LOGICAL_SESSION_ID = None
                 write_task_state(role=ROLE, chat_id=message.chat_id, text=text, status="failed", task_id=task_id, error=str(exc)[-1000:])
-                await message.reply_text(f"❌ Codex 작업공간 생성 오류: {exc}")
+                await message.reply_text(f"❌ {ROLE_LABELS[ROLE]} 작업공간 생성 오류: {exc}")
                 return
 
         # Split so a Telegram-side send/edit failure AFTER a successful
@@ -1295,9 +1480,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 if pending is None:
                     raise RuntimeError("승인 대기 중인 계획이 없습니다. 먼저 코딩 요청을 보내세요.")
                 clear_pending(message.chat_id)
-                reply = await codex_verify_and_revise(str(pending["request"]), message, on_wait=_notify_waiting)
+                reply = await codex_verify_and_revise(str(pending["request"]), message, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, chat_id=message.chat_id)
             elif ROLE == "codex" and _looks_like_coding_task(text):
-                plan = await generate_coding_plan(text, on_wait=_notify_waiting)
+                plan = await generate_coding_plan(text, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, chat_id=message.chat_id)
                 save_pending(
                     chat_id=message.chat_id,
                     task_id=task_id,
@@ -1311,9 +1496,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     "계획을 검토한 뒤 `실행 승인`이라고 보내면 구현을 시작합니다."
                 )
             elif ROLE == "claude" and _looks_like_coding_task(text):
-                reply = await claude_delegates_to_codex(text, message, on_wait=_notify_waiting)
+                reply = await claude_delegates_to_codex(text, message, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, chat_id=message.chat_id)
             else:
-                reply = await run_provider(text, on_wait=_notify_waiting)
+                reply = await run_provider(text, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, provider_text=text, chat_id=message.chat_id)
         except Exception as exc:
             log(f"처리 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
             _record_telegram_efficiency(
@@ -1379,9 +1564,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 chunks[-1] += f"\n\n… (응답이 너무 길어 {MAX_CHUNKS}개 메시지로 잘랐습니다)"
             for i, chunk in enumerate(chunks):
                 if i == 0 and progress is not None:
-                    await progress.edit_text(chunk)
+                    sent = await progress.edit_text(chunk)
                 else:
-                    await message.reply_text(chunk)
+                    sent = await message.reply_text(chunk)
+                if preparation is not None and preparation.resolution.anchor is not None:
+                    sent_id = getattr(sent, "message_id", None)
+                    if sent_id is not None:
+                        _context_store().bind_response_message(
+                            channel="telegram",
+                            chat_id=message.chat_id,
+                            source_message_id=preparation.resolution.anchor.source_message_id,
+                            response_message_id=sent_id,
+                        )
             write_task_state(
                 role=ROLE,
                 chat_id=message.chat_id,

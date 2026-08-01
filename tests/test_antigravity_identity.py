@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 
@@ -49,6 +50,38 @@ class AntigravityIdentityTests(unittest.TestCase):
     def test_wake_roles_recognizes_mid_sentence_vocatives_without_bare_mentions(self):
         self.assertEqual(BOT_MODULE._wake_roles("근데 클로드야 이 내용 확인해줘"), {"claude"})
         self.assertEqual(BOT_MODULE._wake_roles("어제 클로드가 이상했어"), set())
+
+    def test_routing_keeps_plain_chat_and_broadcast_separate(self):
+        self.assertEqual(BOT_MODULE._message_route("안녕하세요"), "default")
+        self.assertEqual(BOT_MODULE._message_route("각자 자기 소개를 해줘"), "broadcast")
+        self.assertFalse(BOT_MODULE._needs_task_worktree("각자 자기 소개를 해줘"))
+        self.assertTrue(BOT_MODULE._needs_task_worktree("버그를 수정해줘"))
+
+    def test_roda_address_is_not_claimed_by_provider_bots(self):
+        self.assertEqual(BOT_MODULE._message_route("로다야 코덱스 오류 안잡고 머해?"), "external")
+        self.assertEqual(BOT_MODULE._message_route("@sukja_hwpx_helper_bot 안녕"), "external")
+
+    def test_addressed_text_applies_role_routing(self):
+        def update(text):
+            message = SimpleNamespace(
+                text=text,
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                from_user=SimpleNamespace(is_bot=False),
+            )
+            chat = SimpleNamespace(type=BOT_MODULE.ChatType.GROUP, id=-1003952617795)
+            return SimpleNamespace(effective_message=message, effective_chat=chat)
+
+        with patch.object(BOT_MODULE, "ROLE", "claude"):
+            self.assertEqual(BOT_MODULE.addressed_text(update("안녕하세요")), "안녕하세요")
+            self.assertEqual(BOT_MODULE.addressed_text(update("각자 자기소개 해줘")), "각자 자기소개 해줘")
+            self.assertIsNone(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")))
+            self.assertIsNone(BOT_MODULE.addressed_text(update("로다야 안녕")))
+        with patch.object(BOT_MODULE, "ROLE", "codex"):
+            self.assertIsNone(BOT_MODULE.addressed_text(update("안녕하세요")))
+            self.assertEqual(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")), "코덱스야 확인해줘")
+            self.assertEqual(BOT_MODULE.addressed_text(update("각자 버그를 수정해줘")), "각자 버그를 수정해줘")
 
 
 if __name__ == "__main__":
