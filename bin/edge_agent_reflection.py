@@ -33,6 +33,7 @@ def _atomic_json(path: Path, value: dict[str, Any]) -> None:
 
 
 def write_worktree_metadata(worktree: Path, *, task_id: str, role: str, status: str = "active") -> None:
+    now = datetime.now(timezone.utc).isoformat()
     _atomic_json(
         worktree / ".edge-agent-task.json",
         {
@@ -40,10 +41,31 @@ def write_worktree_metadata(worktree: Path, *, task_id: str, role: str, status: 
             "task_id": task_id,
             "role": role,
             "status": status,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": now,
+            "updated_at": now,
             "worktree": str(worktree),
         },
     )
+
+
+def update_worktree_metadata(worktree: Path, *, task_id: str, role: str, status: str) -> None:
+    """Update lifecycle state without replacing creation ownership evidence."""
+    path = worktree / ".edge-agent-task.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"worktree metadata is unreadable: {path}") from exc
+    if (
+        payload.get("schema") != "edge_agent_worktree.v1"
+        or payload.get("task_id") != task_id
+        or payload.get("role") != role
+    ):
+        raise RuntimeError(f"worktree metadata ownership mismatch: {path}")
+    payload["status"] = status
+    payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+    if status in {"succeeded", "failed", "cancelled"}:
+        payload["completed_at"] = payload["updated_at"]
+    _atomic_json(path, payload)
 
 
 def write_reflection(*, task_id: str, role: str, workspace: str, status: str, response_preview: str = "", error: str = "") -> None:

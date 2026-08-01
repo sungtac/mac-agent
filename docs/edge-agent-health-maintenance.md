@@ -20,6 +20,21 @@ python3 bin/edge-agent-health-maintenance.py --json
 python3 bin/edge-agent-health-maintenance.py --json --apply
 ```
 
+Telegram task worktree는 별도 정책을 사용한다. 기본 점검은 읽기 전용이며,
+활성 세션·승인 대기·dirty 변경이 있거나 terminal 상태가 아닌 worktree는
+정리 후보가 되지 않는다.
+
+```bash
+python3 bin/edge-agent-telegram-worktree-maintenance.py --json
+```
+
+실제 정리는 후보 JSON을 검토한 뒤에만 명시적으로 실행한다. dirty worktree는
+git worktree remove 대상에서 제외되어 수동 검토를 위해 보존된다.
+
+```bash
+python3 bin/edge-agent-telegram-worktree-maintenance.py --json --apply
+```
+
 ## Telegram agent 재시작
 
 Telegram provider를 직접 `launchctl kickstart -k`로 종료하지 않는다. 진행 중인

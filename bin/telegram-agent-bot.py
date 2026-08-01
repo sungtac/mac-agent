@@ -34,7 +34,16 @@ from telegram.ext import Application, ContextTypes, MessageHandler, filters
 from edge_agent_locks import canonical_repository_root
 from edge_agent_capability_preflight import render_prompt
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
-from edge_agent_reflection import write_reflection, write_worktree_metadata
+from edge_agent_reflection import update_worktree_metadata, write_reflection, write_worktree_metadata
+from edge_agent_telegram_delivery import (
+    DeliveryStoreError,
+    create_delivery,
+    list_pending_deliveries,
+    mark_chunk_sent,
+    mark_delivery_failed,
+    mark_delivery_succeeded,
+    pending_indexes,
+)
 from edge_agent_runtime_adapter import EfficiencyMode, RuntimeEfficiencyAdapter
 from edge_agent_session_bridge import bind_native_session, start_session, update_session, bounded_context
 from edge_agent_context_envelope import (
@@ -251,10 +260,147 @@ def _needs_task_worktree(text: str) -> bool:
     return any(target in normalized for target in targets) and any(word in normalized for word in mutation_words)
 
 
+def _is_delivery_retry_request(text: str) -> bool:
+    normalized = " ".join((text or "").split()).lower()
+    return any(
+        phrase in normalized
+        for phrase in ("전송 재시도", "응답 재전송", "메시지 재전송", "delivery retry", "retry delivery")
+    )
+
+
+def _reply_chunks(reply: str) -> list[str]:
+    chunks = [reply[i:i + CHUNK_SIZE] for i in range(0, len(reply), CHUNK_SIZE)] or [""]
+    if len(chunks) > MAX_CHUNKS:
+        chunks = chunks[:MAX_CHUNKS]
+        chunks[-1] += f"\n\n… (응답이 너무 길어 {MAX_CHUNKS}개 메시지로 잘랐습니다)"
+    return chunks
+
+
+def _update_task_worktree_status(status: str) -> None:
+    if ACTIVE_TASK_WORKSPACE is None:
+        return
+    metadata = ACTIVE_TASK_WORKSPACE / ".edge-agent-task.json"
+    try:
+        payload = json.loads(metadata.read_text(encoding="utf-8"))
+        update_worktree_metadata(
+            ACTIVE_TASK_WORKSPACE,
+            task_id=str(payload["task_id"]),
+            role=str(payload["role"]),
+            status=status,
+        )
+    except (OSError, UnicodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+        log(f"Telegram worktree 상태 기록 실패(작업 결과는 유지): {type(exc).__name__}")
+
+
+async def _handle_delivery_retry(message, context) -> None:
+    owner_user_id = message.from_user.id if message.from_user else ""
+    try:
+        pending = list_pending_deliveries(
+            chat_id=message.chat_id,
+            role=ROLE,
+            owner_user_id=owner_user_id,
+        )
+    except DeliveryStoreError as exc:
+        await message.reply_text(f"❌ 전달 대기 원장을 읽지 못했습니다: {exc}")
+        return
+    if not pending:
+        await message.reply_text("ℹ️ 재전송 대기 중인 Telegram 응답이 없습니다.")
+        return
+    delivery = pending[-1]
+    delivery_id = delivery["delivery_id"]
+    delivery_finalized = False
+    try:
+        for index in pending_indexes(delivery):
+            chunk = delivery["chunks"][index]
+            progress_id = delivery.get("progress_message_id")
+            if index == 0 and progress_id:
+                sent = await context.bot.edit_message_text(
+                    chat_id=message.chat_id,
+                    message_id=int(progress_id),
+                    text=chunk,
+                )
+            else:
+                sent = await message.reply_text(chunk)
+            delivery = mark_chunk_sent(delivery_id, index, getattr(sent, "message_id", ""))
+        mark_delivery_succeeded(delivery_id)
+        delivery_finalized = True
+        write_task_state(
+            role=ROLE,
+            chat_id=message.chat_id,
+            text=delivery.get("request_preview", ""),
+            status="completed",
+            task_id=delivery["task_id"],
+            response_preview="".join(delivery["chunks"])[:1000],
+            delivery_id=delivery_id,
+        )
+        if delivery.get("session_id"):
+            update_session(
+                delivery["session_id"],
+                status="succeeded",
+                summary="Telegram 응답 재전송 완료",
+                next_action="사용자 후속 요청 대기",
+                verification={"telegram_delivery_pending": False, "delivery_id": delivery_id},
+                event_type="telegram_delivery_retry_succeeded",
+            )
+        write_reflection(
+            task_id=delivery["task_id"],
+            role=ROLE,
+            workspace=str(delivery.get("workspace") or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
+            status="completed",
+            response_preview="".join(delivery["chunks"]),
+        )
+        retry_workspace = Path(delivery["workspace"]).expanduser() if delivery.get("workspace") else None
+        if (
+            retry_workspace is not None
+            and retry_workspace.is_dir()
+            and retry_workspace.parent == CODEX_TASK_WORKTREE_ROOT
+        ):
+            try:
+                metadata = json.loads((retry_workspace / ".edge-agent-task.json").read_text(encoding="utf-8"))
+                if (
+                    metadata.get("schema") != "edge_agent_worktree.v1"
+                    or str(metadata.get("role")) != ROLE
+                ):
+                    raise RuntimeError("재전송 worktree 소유권 검증에 실패했습니다.")
+                update_worktree_metadata(
+                    retry_workspace,
+                    task_id=str(metadata["task_id"]),
+                    role=str(metadata["role"]),
+                    status="succeeded",
+                )
+            except (OSError, UnicodeError, KeyError, TypeError, ValueError, RuntimeError) as exc:
+                log(f"재전송 후 Telegram worktree 상태 기록 실패(전송은 완료): {type(exc).__name__}")
+        await message.reply_text("✅ provider를 다시 실행하지 않고 Telegram 응답을 재전송했습니다.")
+    except (TelegramError, DeliveryStoreError, OSError, ValueError, TypeError) as exc:
+        if delivery_finalized:
+            # The response chunks are already complete. Do not turn a later
+            # bookkeeping/confirmation failure into another delivery attempt.
+            log(f"Telegram 재전송은 완료됐지만 후속 상태 기록이 실패했습니다: {type(exc).__name__}")
+            return
+        try:
+            mark_delivery_failed(delivery_id, exc)
+        except DeliveryStoreError:
+            pass
+        await message.reply_text(f"⚠️ Telegram 응답 재전송이 완료되지 않았습니다. 다시 시도할 수 있습니다: {exc}")
+
+
 async def _create_task_worktree(task_id: str, *, on_wait=None) -> Path:
     CODEX_TASK_WORKTREE_ROOT.mkdir(parents=True, exist_ok=True)
     target = CODEX_TASK_WORKTREE_ROOT / task_id
     if target.exists():
+        metadata_path = target / ".edge-agent-task.json"
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"기존 Telegram 작업 worktree의 소유권 메타데이터를 확인할 수 없습니다: {target}"
+            ) from exc
+        if (
+            metadata.get("schema") != "edge_agent_worktree.v1"
+            or metadata.get("task_id") != task_id
+            or metadata.get("role") != ROLE
+        ):
+            raise RuntimeError(f"기존 Telegram 작업 worktree가 다른 작업에 속해 있습니다: {target}")
         return target
     if not (CODEX_SOURCE_REPO / ".git").exists():
         raise RuntimeError(f"Telegram 기준 저장소가 없습니다: {CODEX_SOURCE_REPO}")
@@ -393,22 +539,12 @@ def _bounded_cli_diagnostic(stdout: str, stderr: str, limit: int = 1600) -> str:
     return f"{detail[:500]}\n…(생략)…\n{detail[-(limit - 520):]}"
 
 
-SCRIPT_DIR = Path(__file__).resolve().parent
-
-
 def _load_identity_and_tone(role: str) -> str:
     try:
         return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{render_agent_profile(role)}\n\n"
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
-        log(f"공통 agent profile 로드 실패, 구형 파일로 폴백: {type(exc).__name__}")
-    identity_file = SCRIPT_DIR.parent / "config" / f"{role}-identity-and-tone.md"
-    if identity_file.exists():
-        try:
-            content = identity_file.read_text(encoding="utf-8").strip()
-            return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{content}\n\n"
-        except Exception as exc:
-            log(f"아이덴티티 및 톤앤매너 규칙 로드 실패: {exc}")
-    return ""
+        log(f"공통 agent profile 로드 실패(구형 fallback 없음): {type(exc).__name__}")
+        raise RuntimeError("canonical agent profile을 불러오지 못했습니다") from exc
 
 
 def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
@@ -1179,17 +1315,19 @@ def _build_verify_prompt(original_request: str, codex_report: str) -> str:
     )
 
 
-# Small first step toward cross-bot calling (2026-07-31): claude has no
-# workspace-write sandbox of its own here (see _run_cli's "claude" branch —
-# no -s/--sandbox flag, just a plain -p call), so a coding task addressed to
-# claude is handed straight to codex, which already runs with
-# workspace-write. Deliberately NOT a verify loop like codex_verify_and_revise
-# — this is the smallest useful step (delegate, relay codex's own report)
-# before building a general "any bot may call any bot" mechanism, which needs
-# its own cycle/depth guards that don't exist yet.
+# Claude has no workspace-write sandbox of its own here (see _run_cli's
+# "claude" branch — no -s/--sandbox flag, just a plain -p call). A coding task
+# addressed to Claude is therefore handed to Codex, and must use the same
+# independent verification loop as a Codex approval.
 async def claude_delegates_to_codex(original_prompt: str, message, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
-    codex_report = await _run_cli("codex", original_prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=original_prompt, chat_id=chat_id)
-    return f"🔧 (코덱스에게 위임한 결과)\n\n{codex_report}"
+    verified_report = await codex_verify_and_revise(
+        original_prompt,
+        message,
+        on_wait=on_wait,
+        context_prompt=context_prompt,
+        chat_id=chat_id,
+    )
+    return f"🔧 (코덱스에게 위임하고 독립 검증한 결과)\n\n{verified_report}"
 
 
 async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
@@ -1393,6 +1531,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with _BUSY_LOCK:
         global ACTIVE_TASK_WORKSPACE, ACTIVE_LOGICAL_SESSION_ID
         user_id = message.from_user.id if message.from_user else "?"
+        if _is_delivery_retry_request(text):
+            await _handle_delivery_retry(message, context)
+            return
         started = time.monotonic()
         log(f"처리 시작 chat={message.chat_id} user={user_id} text={text[:80]!r}")
         task_id = write_task_state(
@@ -1438,10 +1579,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # repository work. The old order created three worktrees first and
         # caused the lifecycle lock failure seen in production.
         needs_worktree = _needs_task_worktree(text)
+        pending_plan = load_pending(message.chat_id) if ROLE == "codex" and is_approval(text) else None
         if needs_worktree:
             try:
-                ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id, on_wait=_notify_waiting)
-                write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
+                if pending_plan is not None:
+                    candidate = Path(str(pending_plan.get("workspace", ""))).expanduser().resolve()
+                    metadata_path = candidate / ".edge-agent-task.json"
+                    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+                    if (
+                        candidate.parent != CODEX_TASK_WORKTREE_ROOT
+                        or metadata.get("schema") != "edge_agent_worktree.v1"
+                        or metadata.get("task_id") != pending_plan.get("task_id")
+                        or metadata.get("role") != ROLE
+                    ):
+                        raise RuntimeError("승인 대기 worktree 소유권 검증에 실패했습니다.")
+                    ACTIVE_TASK_WORKSPACE = candidate
+                else:
+                    ACTIVE_TASK_WORKSPACE = await _create_task_worktree(task_id, on_wait=_notify_waiting)
+                    write_worktree_metadata(ACTIVE_TASK_WORKSPACE, task_id=task_id, role=ROLE)
                 write_task_state(
                     role=ROLE,
                     chat_id=message.chat_id,
@@ -1476,7 +1631,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # round-6 independent review, 2026-07-31.
         try:
             if ROLE == "codex" and is_approval(text):
-                pending = load_pending(message.chat_id)
+                pending = pending_plan
                 if pending is None:
                     raise RuntimeError("승인 대기 중인 계획이 없습니다. 먼저 코딩 요청을 보내세요.")
                 clear_pending(message.chat_id)
@@ -1524,6 +1679,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 status="failed",
                 error=str(exc),
             )
+            _update_task_worktree_status("failed")
             ACTIVE_TASK_WORKSPACE = None
             ACTIVE_LOGICAL_SESSION_ID = None
             error_text = f"❌ {ROLE_LABELS[ROLE]} 실행 오류: {exc}"
@@ -1547,26 +1703,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if ACTIVE_LOGICAL_SESSION_ID:
             update_session(
                 ACTIVE_LOGICAL_SESSION_ID,
-                status="succeeded",
+                status="handoff_ready",
                 summary=reply[:8000],
-                next_action="사용자 후속 요청 대기",
+                next_action="Telegram 최종 응답 전송 완료 대기",
                 workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
                 worktree=str(ACTIVE_TASK_WORKSPACE or ""),
                 verification={"telegram_delivery_pending": True, "response_chars": len(reply)},
-                event_type="provider_succeeded",
+                event_type="provider_succeeded_delivery_pending",
             )
 
+        delivery = None
+        delivery_finalized = False
         try:
-            chunks = [reply[i:i + CHUNK_SIZE] for i in range(0, len(reply), CHUNK_SIZE)] or [""]
-            truncated = len(chunks) > MAX_CHUNKS
-            if truncated:
-                chunks = chunks[:MAX_CHUNKS]
-                chunks[-1] += f"\n\n… (응답이 너무 길어 {MAX_CHUNKS}개 메시지로 잘랐습니다)"
+            raw_chunk_count = max(1, (len(reply) + CHUNK_SIZE - 1) // CHUNK_SIZE)
+            chunks = _reply_chunks(reply)
+            truncated = raw_chunk_count > MAX_CHUNKS
+            delivery = create_delivery(
+                task_id=task_id,
+                role=ROLE,
+                chat_id=message.chat_id,
+                owner_user_id=user_id,
+                source_message_id=getattr(message, "message_id", ""),
+                session_id=ACTIVE_LOGICAL_SESSION_ID,
+                request_preview=text,
+                chunks=chunks,
+                workspace=str(ACTIVE_TASK_WORKSPACE or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
+                progress_message_id=getattr(progress, "message_id", None),
+                delivery_id=f"{task_id}-{getattr(message, 'message_id', 'response')}",
+            )
             for i, chunk in enumerate(chunks):
                 if i == 0 and progress is not None:
                     sent = await progress.edit_text(chunk)
                 else:
                     sent = await message.reply_text(chunk)
+                mark_chunk_sent(delivery["delivery_id"], i, getattr(sent, "message_id", ""))
                 if preparation is not None and preparation.resolution.anchor is not None:
                     sent_id = getattr(sent, "message_id", None)
                     if sent_id is not None:
@@ -1576,6 +1746,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             source_message_id=preparation.resolution.anchor.source_message_id,
                             response_message_id=sent_id,
                         )
+            mark_delivery_succeeded(delivery["delivery_id"])
+            delivery_finalized = True
             write_task_state(
                 role=ROLE,
                 chat_id=message.chat_id,
@@ -1583,6 +1755,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 status="completed",
                 task_id=task_id,
                 response_preview=reply[:1000],
+                delivery_id=delivery["delivery_id"],
             )
             write_reflection(
                 task_id=task_id,
@@ -1591,17 +1764,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 status="completed",
                 response_preview=reply,
             )
+            if ACTIVE_LOGICAL_SESSION_ID:
+                update_session(
+                    ACTIVE_LOGICAL_SESSION_ID,
+                    status="succeeded",
+                    summary=reply[:8000],
+                    next_action="사용자 후속 요청 대기",
+                    workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
+                    worktree=str(ACTIVE_TASK_WORKSPACE or ""),
+                    verification={"telegram_delivery_pending": False, "response_chars": len(reply)},
+                    event_type="telegram_delivery_succeeded",
+                )
+            _update_task_worktree_status("succeeded")
             ACTIVE_TASK_WORKSPACE = None
             ACTIVE_LOGICAL_SESSION_ID = None
             log(f"처리 완료 chat={message.chat_id} duration={time.monotonic() - started:.1f}s truncated={truncated}")
-        except TelegramError as exc:
-            # Provider already succeeded — do NOT show the "실행 오류"
-            # error text here, that would misreport a delivery problem as a
-            # task failure. Just log it; the user sees a stuck "⏳ 처리
-            # 중..." message, which at least doesn't claim something false.
+        except (TelegramError, DeliveryStoreError, OSError, ValueError, TypeError) as exc:
+            if delivery_finalized:
+                # Telegram delivery is already durable and complete. A later
+                # evidence/session write must not reopen a retry path and
+                # cause the user to receive a duplicate response.
+                log(f"Telegram 전송은 완료됐지만 후속 상태 기록이 실패했습니다: {type(exc).__name__}")
+                _update_task_worktree_status("succeeded")
+                ACTIVE_TASK_WORKSPACE = None
+                ACTIVE_LOGICAL_SESSION_ID = None
+                return
+            # Provider succeeded, but delivery did not. Keep the logical
+            # session handoff_ready and make the task state explicit so a
+            # later delivery retry can distinguish this from provider failure.
+            if delivery is not None:
+                try:
+                    mark_delivery_failed(delivery["delivery_id"], exc)
+                except (DeliveryStoreError, OSError):
+                    pass
+            write_task_state(
+                role=ROLE,
+                chat_id=message.chat_id,
+                text=text,
+                status="delivery_pending",
+                task_id=task_id,
+                response_preview=reply[:1000],
+                error=str(exc)[-1000:],
+                delivery_id=delivery["delivery_id"] if delivery else "",
+            )
+            if ACTIVE_LOGICAL_SESSION_ID:
+                update_session(
+                    ACTIVE_LOGICAL_SESSION_ID,
+                    status="handoff_ready",
+                    summary=reply[:8000],
+                    next_action="Telegram 응답 전송 재시도 필요",
+                    verification={"telegram_delivery_pending": True, "delivery_id": delivery["delivery_id"] if delivery else "", "delivery_error": str(exc)[-1000:]},
+                    event_type="telegram_delivery_failed",
+                )
+            write_reflection(
+                task_id=task_id,
+                role=ROLE,
+                workspace=str(ACTIVE_TASK_WORKSPACE or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
+                status="delivery_pending",
+                response_preview=reply,
+                error=str(exc),
+            )
+            _update_task_worktree_status("delivery_pending")
             ACTIVE_TASK_WORKSPACE = None
             ACTIVE_LOGICAL_SESSION_ID = None
-            log(f"provider 성공했으나 텔레그램 전송 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
+            log(f"provider 성공했으나 텔레그램 전송 대기 상태로 전환 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
 
 
 async def _post_init(application: Application) -> None:

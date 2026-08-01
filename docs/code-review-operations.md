@@ -76,5 +76,11 @@ bash bin/install-code-review-launchd.sh --dry-run
 복사하고 bootstrap한다. provider 실행이 포함된 템플릿을 설치하기 전에는
 반드시 `--require-providers --allow-execute` 점검을 먼저 통과시킨다.
 
+worker는 StartInterval=60 방식의 단발 실행 작업이므로 launchctl print에서
+주기 사이에 state = not running으로 보이는 것은 정상이다. 운영 확인은
+runs가 증가하는지, last exit code = 0인지, pending queue가 줄어드는지,
+Webhook /health가 응답하는지를 함께 확인한다. 상시 프로세스 복구를 위해
+worker를 직접 kickstart하지 않는다.
+
 GitHub 등록, TLS/reverse proxy, secret manager, launchd load는 이 로컬
 코드의 자동 변경 범위를 벗어난 운영 권한 작업이다.
