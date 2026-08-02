@@ -86,6 +86,20 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
         self.assertTrue(looks_like_anaphoric_reference("팩트체크 해줘", self.store.anchors(channel="telegram", chat_id="chat-1", now="2026-08-01T08:47:00+00:00")))
         self.assertFalse(looks_like_anaphoric_reference("안녕하세요", self.store.anchors(channel="telegram", chat_id="chat-1", now="2026-08-01T08:47:00+00:00")))
 
+    def test_long_new_deliberation_with_confirmation_word_is_not_stale_follow_up(self):
+        text = (
+            "얘들아, 새 canary야. 네 명이 각자 1차 의견을 내고 2차 교차검토와 "
+            "3차 최종 판정까지 실제로 진행해줘. 실제 서명 결과와 delivery ack가 "
+            "확인된 경우에만 통과라고 판정해"
+        )
+        prepared = self.store.prepare(
+            channel="telegram", provider="claude", chat_id="chat-1", message_id=12,
+            reply_to_message_id=None, text=text, now="2026-08-02T10:40:00+00:00",
+        )
+        self.assertEqual(prepared.resolution.status, "resolved")
+        self.assertFalse(prepared.guard_required)
+        self.assertIn("새 canary야", prepared.prompt_block)
+
     def test_ttl_marks_stale_without_deleting_and_reply_overrides_ttl(self):
         self.store.prepare(
             channel="telegram", provider="claude", chat_id="chat-1", message_id=20,

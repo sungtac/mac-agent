@@ -33,6 +33,9 @@ DEFAULT_ANCHOR_RETENTION_SECONDS = 86400
 DEFAULT_ANCHOR_CONFIDENCE = 0.35
 MAX_TOPIC_CHARS = 240
 MAX_ANCHORS = 50
+# Long, self-contained requests may contain words such as "확인" while still
+# being a new task.  Only short follow-ups should be forced to an old anchor.
+MIN_SELF_CONTAINED_REQUEST_CHARS = 80
 
 _SENSITIVE_PATTERN = re.compile(
     r"(?:token|api[_ -]?key|password|bearer|cookie|secret|authorization|private[ _-]?key)\s*[:=]??\s*[^\s&]+",
@@ -184,6 +187,10 @@ def looks_like_anaphoric_reference(text: str, recent_anchors: Iterable[EntityAnc
         return False
     if not any(anchor for anchor in recent_anchors):
         return False
+    if len(normalized) > MIN_SELF_CONTAINED_REQUEST_CHARS and not any(
+        normalized.startswith(prefix) for prefix in _DEICTIC
+    ):
+        return False
     return any(word in normalized for word in _DEICTIC + _FOLLOW_UP)
 
 
@@ -205,7 +212,7 @@ def extract_anchor(
         return EntityAnchor(str(chat_id), str(source_message_id), "url", _sanitize_url(value), float(confidence), _timestamp(now))
     if any(raw.lower().startswith(greeting) for greeting in _GREETING):
         return None
-    if any(word in raw.lower() for word in _FOLLOW_UP + _DEICTIC):
+    if len(raw) <= MIN_SELF_CONTAINED_REQUEST_CHARS and any(word in raw.lower() for word in _FOLLOW_UP + _DEICTIC):
         return None
     topic = _normalize_topic(raw)
     if not topic:
