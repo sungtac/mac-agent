@@ -10,6 +10,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 import edge_agent_completion_harness as module  # noqa: E402
+from edge_agent_deliberation import DeliberationStore, session_id_for_telegram  # noqa: E402
 
 
 class CompletionHarnessTests(unittest.TestCase):
@@ -61,12 +62,44 @@ class CompletionHarnessTests(unittest.TestCase):
             }
             evidence_path.write_text(json.dumps({"passed": True, "roles": ["claude", "codex", "antigravity", "roda"], "rounds": 3, "provider_probes": probes}), encoding="utf-8")
             passed, _ = module.canary_evidence_ok(evidence_path)
-            self.assertTrue(passed)
+            self.assertFalse(passed)
             with patch.dict(os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": str(Path(directory) / "improvements")}):
                 first = module.register_failure(store, "goal-2", "telegram_canary", blocker="missing", evidence=["rounds=2"], next_action="run")
                 second = module.register_failure(store, "goal-2", "telegram_canary", blocker="missing", evidence=["rounds=2"], next_action="run")
             self.assertEqual(first["task_id"], second["task_id"])
             self.assertEqual(len((Path(directory) / "improvements" / "tasks.jsonl").read_text().splitlines()), 1)
+
+    def test_canary_requires_live_signed_session_and_acked_bus(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "deliberations"
+            key_path = Path(directory) / "message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            session_id = session_id_for_telegram("-1", 204)
+            with patch.dict(os.environ, {
+                "EDGE_AGENT_DELIBERATION_ROOT": str(root),
+                "EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path),
+            }):
+                store = DeliberationStore(root)
+                store.start(session_id, "live canary")
+                roles = ("claude", "codex", "antigravity", "roda")
+                for round_number in range(1, 4):
+                    for role in roles:
+                        store.record(session_id, role, status="completed", summary=f"{role}-{round_number}", round_number=round_number)
+                evidence_path = Path(directory) / "canary.json"
+                probes = {
+                    role: {"status": "verified_available", "method": "fresh_session_probe", "observed_at": "2026-08-02T10:00:00Z"}
+                    for role in roles
+                }
+                evidence_path.write_text(json.dumps({
+                    "passed": True,
+                    "session_id": session_id,
+                    "roles": list(roles),
+                    "rounds": 3,
+                    "provider_probes": probes,
+                }), encoding="utf-8")
+                passed, evidence = module.canary_evidence_ok(evidence_path)
+            self.assertTrue(passed, evidence)
 
     def test_clean_repo_can_explicitly_preserve_named_artifacts(self):
         import subprocess

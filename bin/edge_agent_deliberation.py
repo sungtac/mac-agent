@@ -133,6 +133,35 @@ class DeliberationStore:
             except FileNotFoundError:
                 pass
 
+    def _drain_final_deliveries(self, session_id: str, roles: tuple[str, ...]) -> dict[str, Any]:
+        """Acknowledge every recipient's final transcript before pass evidence.
+
+        Provider turns render and acknowledge earlier peer messages.  The last
+        round has no subsequent provider prompt, so the final barrier drains
+        those deliveries explicitly and records the result for the completion
+        harness.
+        """
+        claimed = 0
+        acknowledged = 0
+        errors: list[str] = []
+        for role in roles:
+            owner = f"barrier-finalizer-{role}"
+            try:
+                items = self._bus.claim(role, session_id=session_id, owner=owner, limit=100)
+                claimed += len(items)
+                for item in items:
+                    if self._bus.acknowledge(session_id, str(item["message_id"]), owner=owner):
+                        acknowledged += 1
+            except MessageBusError as exc:
+                errors.append(f"{role}:{type(exc).__name__}")
+        return {
+            "status": "complete" if not errors else "incomplete",
+            "claimed": claimed,
+            "acknowledged": acknowledged,
+            "errors": errors,
+            "recorded_epoch": time.time(),
+        }
+
     def start(self, session_id: str, request: str, *, roles: tuple[str, ...] = EXPECTED_ROLES) -> dict[str, Any]:
         session_id = _safe_session(session_id)
         selected = tuple(dict.fromkeys(roles))
@@ -261,6 +290,10 @@ class DeliberationStore:
                 payload["status"] = "failed"
             elif round_complete and current_round == max_rounds:
                 payload["status"] = "barrier_ready"
+                payload["delivery"] = self._drain_final_deliveries(
+                    session_id,
+                    tuple(payload.get("expected_roles", EXPECTED_ROLES)),
+                )
                 try:
                     self._bus.update_task(session_id, session_id, "completed", summary="all expected peer results collected")
                 except MessageBusError:

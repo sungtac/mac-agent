@@ -339,6 +339,7 @@ def canary_evidence_ok(path: Path, *, minimum_rounds: int = 3) -> tuple[bool, li
     required_roles = {"claude", "codex", "antigravity", "roda"}
     role_count = len(set(roles)) if isinstance(roles, list) else 0
     probes = payload.get("provider_probes") if isinstance(payload, dict) else None
+    session_id = str(payload.get("session_id", "")).strip() if isinstance(payload, dict) else ""
     probe_errors: list[str] = []
     if not isinstance(probes, dict):
         probe_errors.append("provider_probes_missing")
@@ -354,6 +355,58 @@ def canary_evidence_ok(path: Path, *, minimum_rounds: int = 3) -> tuple[bool, li
                 probe_errors.append(f"provider_probe_method_missing={role}")
             if not str(probe.get("observed_at", "")).strip():
                 probe_errors.append(f"provider_probe_time_missing={role}")
+    live_errors: list[str] = []
+    live_session = None
+    if not session_id or any(char in session_id for char in "/\\\x00"):
+        live_errors.append("live_session_id_missing")
+    else:
+        deliberation_root = Path(os.environ.get(
+            "EDGE_AGENT_DELIBERATION_ROOT",
+            str(Path.home() / ".edge-agent" / "state" / "deliberations"),
+        )).expanduser()
+        try:
+            live_session = json.loads((deliberation_root / f"{session_id}.json").read_text(encoding="utf-8"))
+            if not isinstance(live_session, dict):
+                raise ValueError("session payload is not an object")
+        except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+            live_errors.append(f"live_session_unreadable={type(exc).__name__}")
+        if isinstance(live_session, dict):
+            expected = {"claude", "codex", "antigravity", "roda"}
+            observed_roles = set(live_session.get("expected_roles") or ())
+            if observed_roles != expected:
+                live_errors.append("live_roles_mismatch")
+            if live_session.get("status") != "barrier_ready":
+                live_errors.append(f"live_status={live_session.get('status')}")
+            rounds_payload = live_session.get("rounds") or {}
+            for round_number in range(1, minimum_rounds + 1):
+                entries = rounds_payload.get(str(round_number)) or {}
+                if any(entries.get(role) != "completed" for role in expected):
+                    live_errors.append(f"live_round_{round_number}_incomplete")
+            results_payload = live_session.get("results") or {}
+            for role in expected:
+                result = results_payload.get(role) or {}
+                message = result.get("agent_message") or {}
+                if result.get("status") != "completed" or result.get("trusted") is not True:
+                    live_errors.append(f"live_result_untrusted={role}")
+                if not result.get("evidence_refs") or not message.get("signature") or not message.get("source_event_id"):
+                    live_errors.append(f"live_provenance_missing={role}")
+            delivery = live_session.get("delivery") or {}
+            if delivery.get("status") != "complete":
+                live_errors.append(f"live_delivery={delivery.get('status', 'missing')}")
+            bus_path = deliberation_root / "message-bus" / f"{session_id}.json"
+            try:
+                bus = json.loads(bus_path.read_text(encoding="utf-8"))
+                messages = bus.get("messages") or []
+                if len(messages) < len(expected) * minimum_rounds:
+                    live_errors.append(f"live_bus_messages={len(messages)}")
+                if any(
+                    delivery.get("status") != "acked"
+                    for item in messages
+                    for delivery in (item.get("deliveries") or {}).values()
+                ):
+                    live_errors.append("live_bus_ack_incomplete")
+            except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
+                live_errors.append(f"live_bus_unreadable={type(exc).__name__}")
     passed = bool(
         isinstance(payload, dict)
         and payload.get("passed") is True
@@ -361,14 +414,17 @@ def canary_evidence_ok(path: Path, *, minimum_rounds: int = 3) -> tuple[bool, li
         and required_roles.issubset(set(roles))
         and round_count >= minimum_rounds
         and not probe_errors
+        and not live_errors
     )
     evidence = [
         f"canary_passed={bool(payload.get('passed')) if isinstance(payload, dict) else False}",
         f"rounds={rounds}",
         f"roles={role_count}",
         f"provider_probes={4 - len([error for error in probe_errors if error.startswith(('provider_probe_missing=', 'provider_probe_not_available='))])}/4",
+        f"live_session={session_id or 'missing'}",
     ]
     evidence.extend(probe_errors)
+    evidence.extend(live_errors)
     return passed, evidence
 
 
