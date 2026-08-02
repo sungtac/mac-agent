@@ -22,6 +22,15 @@ EXPECTED_ROLES = ("claude", "codex", "antigravity", "roda")
 TERMINAL_STATUSES = frozenset({"completed", "failed", "not_observed"})
 MAX_SUMMARY_CHARS = 1800
 MAX_TIMEOUT_SECONDS = 45.0
+DEFAULT_MAX_ROUNDS = 3
+
+
+def configured_max_rounds() -> int:
+    try:
+        value = int(os.environ.get("EDGE_AGENT_DELIBERATION_MAX_ROUNDS", str(DEFAULT_MAX_ROUNDS)))
+    except ValueError:
+        value = DEFAULT_MAX_ROUNDS
+    return max(1, min(DEFAULT_MAX_ROUNDS, value))
 
 
 def session_id_for_telegram(chat_id: object, message_id: object) -> str:
@@ -122,19 +131,20 @@ class DeliberationStore:
             current = self._read(session_id)
             if current is not None:
                 return current
+            max_rounds = configured_max_rounds()
             payload = {
                 "schema": "edge_agent.deliberation.v1",
                 "session_id": session_id,
                 "request": _bounded(request),
                 "expected_roles": list(selected),
                 "round": 1,
-                "max_rounds": 3,
+                "max_rounds": max_rounds,
                 "status": "collecting",
                 "results": {},
                 "created_epoch": time.time(),
             }
             self._write(session_id, payload)
-            self._bus.create_session(session_id, str(request), max_rounds=3)
+            self._bus.create_session(session_id, str(request), max_rounds=max_rounds)
             self._bus.spawn_task(
                 session_id,
                 session_id,
@@ -162,13 +172,14 @@ class DeliberationStore:
                     "request": "",
                     "expected_roles": list(EXPECTED_ROLES),
                     "round": 1,
-                    "max_rounds": 3,
+                    "max_rounds": configured_max_rounds(),
                     "status": "collecting",
                     "results": {},
                     "created_epoch": time.time(),
                 }
             results = dict(payload.get("results") or {})
-            current_round = max(1, min(3, int(round_number or payload.get("round", 1))))
+            max_rounds = max(1, min(DEFAULT_MAX_ROUNDS, int(payload.get("max_rounds", DEFAULT_MAX_ROUNDS))))
+            current_round = max(1, min(max_rounds, int(round_number or payload.get("round", 1))))
             result = {
                 "status": status,
                 "summary": _bounded(summary),
@@ -232,6 +243,10 @@ class DeliberationStore:
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._read(_safe_session(session_id))
 
+    def max_rounds(self, session_id: str) -> int:
+        payload = self.snapshot(session_id) or {}
+        return max(1, min(DEFAULT_MAX_ROUNDS, int(payload.get("max_rounds", DEFAULT_MAX_ROUNDS))))
+
     def wait(self, session_id: str, *, timeout_seconds: float = 30.0, interval_seconds: float = 0.25) -> dict[str, Any] | None:
         deadline = time.monotonic() + min(MAX_TIMEOUT_SECONDS, max(0.0, timeout_seconds))
         while True:
@@ -267,4 +282,4 @@ class DeliberationStore:
         return "\n".join(lines)[:7200]
 
 
-__all__ = ["DeliberationStore", "EXPECTED_ROLES", "roles_for_request", "session_id_for_telegram"]
+__all__ = ["DeliberationStore", "EXPECTED_ROLES", "configured_max_rounds", "roles_for_request", "session_id_for_telegram"]

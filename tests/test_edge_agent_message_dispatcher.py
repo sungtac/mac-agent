@@ -1,4 +1,8 @@
+import multiprocessing
+import os
+import signal
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -55,6 +59,33 @@ class MessageDispatcherTests(unittest.TestCase):
             result = dispatcher.dispatch_once("claude", lambda _: (_ for _ in ()).throw(RuntimeError("provider down")), owner="worker")
             self.assertEqual(result["failed"], 1)
             self.assertEqual(bus.claim("claude", owner="worker"), [])
+
+    def test_sigkill_recovery_reclaims_expired_lease_and_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            bus = MessageBus(directory)
+            bus.create_session("session-dispatch")
+            bus.publish(self._message(), verification_key=KEY)
+
+            def crash_worker(root):
+                child_bus = MessageBus(root)
+                claims = child_bus.claim("claude", owner="crash-worker", lease_seconds=1)
+                child_bus.checkpoint("session-dispatch", claims[0]["message"]["task_id"], "dispatch", "claimed")
+                os.kill(os.getpid(), signal.SIGKILL)
+
+            context = multiprocessing.get_context("fork")
+            process = context.Process(target=crash_worker, args=(directory,))
+            process.start()
+            process.join(5)
+            self.assertEqual(process.exitcode, -signal.SIGKILL)
+            self.assertTrue(bus.recoverable("session-dispatch"))
+            time.sleep(1.1)
+            result = MessageDispatcher(bus).dispatch_once(
+                "claude",
+                lambda message: DispatchOutcome(summary="recovered after restart"),
+                owner="recovery-worker",
+            )
+            self.assertEqual(result["completed"], 1)
+            self.assertEqual(bus.recoverable("session-dispatch"), [])
 
 
 if __name__ == "__main__":

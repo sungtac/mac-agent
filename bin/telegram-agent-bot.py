@@ -2052,6 +2052,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         summary=reply,
                         round_number=2,
                     )
+                    adjudication_store = DeliberationStore()
+                    if adjudication_store.max_rounds(deliberation_session_id) >= 3:
+                        await asyncio.to_thread(adjudication_store.wait, deliberation_session_id, timeout_seconds=30.0)
+                        reply = await run_provider(
+                            text,
+                            on_wait=_notify_waiting,
+                            context_prompt=preparation.prompt_block if preparation else None,
+                            provider_text=(
+                                "[최종 adjudication 단계]\n"
+                                "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                                f"{text}\n\n{adjudication_store.render(deliberation_session_id)}"
+                            ),
+                            chat_id=message.chat_id,
+                        )
+                        adjudication_store.record(
+                            deliberation_session_id,
+                            ROLE,
+                            status="completed",
+                            summary=reply,
+                            round_number=3,
+                        )
                 else:
                     first_pass = await run_provider(
                         text,
@@ -2082,6 +2103,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         summary=reply,
                         round_number=2,
                     )
+                    adjudication_store = DeliberationStore()
+                    if adjudication_store.max_rounds(deliberation_session_id) >= 3:
+                        await asyncio.to_thread(adjudication_store.wait, deliberation_session_id, timeout_seconds=30.0)
+                        reply = await run_provider(
+                            text,
+                            on_wait=_notify_waiting,
+                            context_prompt=preparation.prompt_block if preparation else None,
+                            provider_text=(
+                                "[최종 adjudication 단계]\n"
+                                "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                                f"{text}\n\n{adjudication_store.render(deliberation_session_id)}"
+                            ),
+                            chat_id=message.chat_id,
+                        )
+                        adjudication_store.record(
+                            deliberation_session_id,
+                            ROLE,
+                            status="completed",
+                            summary=reply,
+                            round_number=3,
+                        )
             else:
                 provider_text = text
                 if coordination_request:

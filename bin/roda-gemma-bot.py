@@ -257,6 +257,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         try:
             answer = await asyncio.to_thread(_ollama_chat, follow_up)
             store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=2)
+            if store.max_rounds(deliberation_session_id) >= 3:
+                await asyncio.to_thread(store.wait, deliberation_session_id, timeout_seconds=30.0)
+                adjudication = (
+                    "[최종 adjudication 단계]\n"
+                    "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                    f"{original_text}\n\n{store.render(deliberation_session_id)}"
+                )
+                answer = await asyncio.to_thread(_ollama_chat, adjudication)
+                store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=3)
         except Exception as exc:
             log.warning("peer follow-up failed; retaining first deliberation answer: %s", type(exc).__name__)
     try:

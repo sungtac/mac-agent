@@ -61,7 +61,7 @@ class DeliberationStoreTests(unittest.TestCase):
                 store.record(session_id, "gemma", status="completed", summary="legacy alias")
                 self.assertEqual(store.snapshot(session_id)["results"]["roda"]["summary"], "legacy alias")
 
-    def test_two_round_peer_follow_up_is_durable(self):
+    def test_three_round_peer_adjudication_is_durable(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
             key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
@@ -80,6 +80,12 @@ class DeliberationStoreTests(unittest.TestCase):
                 self.assertEqual(len(transcript), 8)
                 self.assertTrue(any(message.round == 2 for message in transcript))
                 self.assertIn("round=2", store.render(session_id))
+                for role in ("claude", "codex", "antigravity", "roda"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 최종", round_number=3)
+                transcript = store._bus.transcript(session_id)
+                self.assertEqual(len(transcript), 12)
+                self.assertTrue(any(message.round == 3 for message in transcript))
+                self.assertIn("round=3", store.render(session_id))
 
 
 if __name__ == "__main__":
