@@ -11,7 +11,9 @@
 
 | 작성 주체 | 주요 상태 경로 | 현재 보호 상태 | 판단 |
 |---|---|---|---|
-| Telegram Claude/Anti provider CLI 및 하위 도구 | `~/.edge-agent-worktrees/telegram-bootstrap` | Edge Agent worktree에서 실행 | 현재 정책에 포함 |
+| Telegram Claude provider CLI 및 하위 도구 | `~/.edge-agent-worktrees/telegram-claude` | Claude 전용 Edge Agent workspace | 현재 정책에 포함 |
+| Telegram Antigravity provider CLI 및 하위 도구 | `~/.edge-agent-worktrees/telegram-antigravity` | Antigravity 전용 Edge Agent workspace | 현재 정책에 포함 |
+| Telegram Codex provider CLI | `~/.edge-agent-worktrees/telegram-codex` | Codex 전용 provider workspace | 현재 정책에 포함 |
 | Telegram Codex canonical engine | `/Users/edge_ai/tools/multi-agent-starter/engine-repo` 및 `~/.edge-agent/state/multiagent-engine/` | `com.multiagent.engine` 단일 poller, Edge Agent sandbox·preflight 기준 | Codex token 정본 |
 | Telegram 직접 Codex adapter | `/Users/edge_ai/mac-agent/bin/telegram-agent-bot.py` 및 retired plist | LaunchAgent에서 제거, plist는 `~/.edge-agent/retired-launchagents/2026-08-02/`에 mode 0600 quarantine | canonical engine 전환 완료, shared adapter는 Claude·Antigravity가 사용 |
 | Discord Claude/Codex의 provider CLI 및 하위 도구 | 위와 동일 | 2026-08-02 LaunchAgent bootout + Disabled | 퇴역·quarantine 보존, active 정책에서 제외 |

@@ -21,8 +21,21 @@ from edge_agent_ingress import classify as classify_ingress
 EXPECTED_ROLES = ("claude", "codex", "antigravity", "roda")
 TERMINAL_STATUSES = frozenset({"completed", "failed", "not_observed"})
 MAX_SUMMARY_CHARS = 1800
-MAX_TIMEOUT_SECONDS = 45.0
+MAX_TIMEOUT_SECONDS = 300.0
+DEFAULT_BARRIER_TIMEOUT_SECONDS = 180.0
 DEFAULT_MAX_ROUNDS = 3
+
+
+def configured_barrier_timeout_seconds() -> float:
+    """Return a bounded wait long enough for the slowest provider turn."""
+    try:
+        value = float(os.environ.get(
+            "EDGE_AGENT_DELIBERATION_BARRIER_TIMEOUT_SECONDS",
+            str(DEFAULT_BARRIER_TIMEOUT_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        value = DEFAULT_BARRIER_TIMEOUT_SECONDS
+    return max(30.0, min(MAX_TIMEOUT_SECONDS, value))
 
 
 def configured_max_rounds() -> int:

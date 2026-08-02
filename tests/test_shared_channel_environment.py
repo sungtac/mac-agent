@@ -17,10 +17,11 @@ class SharedChannelEnvironmentTests(unittest.TestCase):
         self.assertIn('"EDGE_AGENT_WORKSPACE": str(EDGE_AGENT_WORKSPACE)', source)
         self.assertNotIn('Path.home() / ".openclaw"', source)
 
-    def test_telegram_uses_the_edge_agent_worktree_by_default(self):
+    def test_telegram_uses_role_scoped_worktrees_by_default(self):
         source = (ROOT / "bin" / "telegram-agent-bot.py").read_text(encoding="utf-8")
         self.assertIn('TELEGRAM_AGENT_WORKSPACE', source)
-        self.assertIn('HOME / ".edge-agent-worktrees" / "telegram-bootstrap"', source)
+        self.assertIn('f"telegram-{_STARTUP_ROLE or \'bootstrap\'}"', source)
+        self.assertIn('HOME / ".edge-agent-worktrees" / "telegram-codex"', source)
         self.assertEqual(EDGE_WORKTREE, Path.home() / ".edge-agent-worktrees" / "telegram-bootstrap")
 
 

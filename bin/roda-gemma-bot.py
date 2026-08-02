@@ -24,7 +24,12 @@ from telegram.ext import Application, ContextTypes, MessageHandler, TypeHandler,
 from agent_profile import render_agent_profile
 from edge_agent_context_envelope import ContextEnvelopeStore
 from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_cancel_request
-from edge_agent_deliberation import DeliberationStore, roles_for_request, session_id_for_telegram
+from edge_agent_deliberation import (
+    DeliberationStore,
+    configured_barrier_timeout_seconds,
+    roles_for_request,
+    session_id_for_telegram,
+)
 from edge_agent_egress_queue import EgressQueueError, SharedEgressQueue
 from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
 from edge_agent_state import write_task_state
@@ -249,7 +254,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         store = DeliberationStore()
         store.record(deliberation_session_id, "roda", status="completed", summary=answer)
         try:
-            await asyncio.to_thread(store.wait_for_round, deliberation_session_id, 1, timeout_seconds=30.0)
+            await asyncio.to_thread(
+                store.wait_for_round,
+                deliberation_session_id,
+                1,
+                timeout_seconds=configured_barrier_timeout_seconds(),
+            )
             if store.round_state(deliberation_session_id, 1) != "ready":
                 raise RuntimeError("deliberation round 1 barrier not ready")
             follow_up = (
@@ -260,7 +270,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             answer = await asyncio.to_thread(_ollama_chat, follow_up)
             store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=2)
             if store.max_rounds(deliberation_session_id) >= 3:
-                await asyncio.to_thread(store.wait_for_round, deliberation_session_id, 2, timeout_seconds=30.0)
+                await asyncio.to_thread(
+                    store.wait_for_round,
+                    deliberation_session_id,
+                    2,
+                    timeout_seconds=configured_barrier_timeout_seconds(),
+                )
                 if store.round_state(deliberation_session_id, 2) != "ready":
                     raise RuntimeError("deliberation round 2 barrier not ready")
                 adjudication = (

@@ -58,7 +58,12 @@ from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
 from edge_agent_coordination import wait_for_peer_results
 from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_cancel_request
-from edge_agent_deliberation import DeliberationStore, roles_for_request, session_id_for_telegram
+from edge_agent_deliberation import (
+    DeliberationStore,
+    configured_barrier_timeout_seconds,
+    roles_for_request,
+    session_id_for_telegram,
+)
 from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
 from weather_adapter import fetch_weather, is_weather_request
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
@@ -72,13 +77,17 @@ from agent_profile import render_agent_profile
 
 HOME = Path.home()
 PROVIDER_SANDBOX = Path(__file__).resolve().with_name("edge-agent-provider-sandbox.sh")
+_STARTUP_ROLE = os.environ.get("TELEGRAM_AGENT_ROLE", "").strip().lower()
 WORKSPACE = Path(
-    os.environ.get("TELEGRAM_AGENT_WORKSPACE", str(HOME / ".edge-agent-worktrees" / "telegram-bootstrap"))
+    os.environ.get(
+        "TELEGRAM_AGENT_WORKSPACE",
+        str(HOME / ".edge-agent-worktrees" / f"telegram-{_STARTUP_ROLE or 'bootstrap'}"),
+    )
 ).expanduser().resolve()
 CODEX_WORKSPACE = Path(
     os.environ.get(
         "TELEGRAM_AGENT_CODEX_WORKSPACE",
-        str(HOME / ".edge-agent-worktrees" / "telegram-bootstrap"),
+        str(HOME / ".edge-agent-worktrees" / "telegram-codex"),
     )
 ).expanduser().resolve()
 CODEX_SOURCE_REPO = Path(
@@ -95,7 +104,7 @@ RUNTIME_CONTRACT = Path(
 ).expanduser().resolve()
 ACTIVE_TASK_WORKSPACE: Path | None = None
 ACTIVE_LOGICAL_SESSION_ID: str | None = None
-ROLE = os.environ.get("TELEGRAM_AGENT_ROLE", "").strip().lower()
+ROLE = _STARTUP_ROLE
 TOKEN_FILE = Path(
     os.environ.get(
         "TELEGRAM_AGENT_TOKEN_FILE",
@@ -1146,8 +1155,8 @@ async def _force_kill_pgid(pgid: int, proc: asyncio.subprocess.Process) -> None:
 
 
 # Cross-process (not just cross-coroutine) lock so provider processes with
-# full write access to the same shared WORKSPACE can't run concurrently and
-# step on each other's file writes. Explicit group-addressed conversation
+# full write access to one provider workspace can't run concurrently and
+# step on that workspace's file writes. Explicit group-addressed conversation
 # can still fan out, so this lock serializes their shared-workspace provider
 # runs. Same lock-file *scheme* as
 # discord_bot_common.try_acquire_repo_lock() (fcntl.flock on a hashed-path
@@ -1515,9 +1524,11 @@ def _looks_like_coding_task(text: str) -> bool:
     return any(keyword.lower() in lowered for keyword in _CODING_TASK_KEYWORDS)
 
 
-def _require_deliberation_round(session_id: str, round_number: int, *, timeout_seconds: float = 30.0) -> None:
+def _require_deliberation_round(session_id: str, round_number: int, *, timeout_seconds: float | None = None) -> None:
     """Do not let a provider publish a later round without every peer."""
     store = DeliberationStore()
+    if timeout_seconds is None:
+        timeout_seconds = configured_barrier_timeout_seconds()
     store.wait_for_round(session_id, round_number, timeout_seconds=timeout_seconds)
     state = store.round_state(session_id, round_number)
     if state != "ready":
@@ -1674,8 +1685,8 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *
 # Guards a single role's own process against launching a second overlapping
 # provider run (e.g. two quick messages, or a plain-chat message arriving
 # mid-task) — fast, in-process, always-on. The separate cross-process
-# concern (claude/codex/antigravity all running against the same shared
-# WORKSPACE at once) is handled by acquire_workspace_lock() inside
+# concern (multiple runs against the same provider workspace at once) is
+# handled by acquire_workspace_lock() inside
 # run_provider() instead: two independent reviews (Codex, Antigravity)
 # both flagged the earlier "accept the race, it's rare" call as a real gap
 # rather than a reasonable tradeoff, so it's now enforced — the second and
@@ -2517,7 +2528,7 @@ def _assert_canonical_codex_owner() -> None:
 
 def main() -> None:
     _harden_log_permissions()
-    log(f"Starting direct Telegram {ROLE} bot; workspace={(CODEX_WORKSPACE if ROLE == 'codex' else WORKSPACE)}; cli={CLI}")
+    log(f"Starting direct Telegram {ROLE} bot; workspace={_provider_workspace(ROLE)}; cli={CLI}")
     _assert_canonical_codex_owner()
     _acquire_singleton_lock()
     _wait_for_conflict_cooldown()

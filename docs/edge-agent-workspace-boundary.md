@@ -8,8 +8,10 @@
 ## 현재 확인된 구조
 
 - 엣지 에이전트 소스: `/Users/edge_ai/mac-agent`
-- Claude·Anti Telegram 봇 workspace: `/Users/edge_ai/.edge-agent-worktrees/telegram-bootstrap`
-- Codex canonical engine workspace: `/Users/edge_ai/tools/multi-agent-starter/engine-repo`
+- Claude Telegram 봇 workspace: `/Users/edge_ai/.edge-agent-worktrees/telegram-claude`
+- Antigravity Telegram 봇 workspace: `/Users/edge_ai/.edge-agent-worktrees/telegram-antigravity`
+- Codex provider workspace: `/Users/edge_ai/.edge-agent-worktrees/telegram-codex`
+- Codex canonical engine source: `/Users/edge_ai/tools/multi-agent-starter/engine-repo`
 - 작업별 격리 worktree: `/Users/edge_ai/.edge-agent-worktrees/telegram-tasks`
 - Roda Gemma workspace: `/Users/edge_ai/mac-agent`
 - 퇴역한 OpenClaw workspace: `/Users/edge_ai/.openclaw` (휴지통으로 이동)
@@ -32,7 +34,7 @@ provider가 진입하는 것을 막기 위한 차단 가드에만 남아 있다.
 
 ## 경계가 아직 강제되지 않는 이유
 
-현재 Telegram Claude/Anti provider 실행과 Codex canonical engine의 provider 호출은
+현재 Telegram Claude/Antigravity provider 실행과 Codex canonical engine의 provider 호출은
 Edge Agent sandbox 계약을 거친다. 이 sandbox는 provider
 CLI와 그 하위 도구의 퇴역한 OpenClaw 경로 쓰기를 차단한다. 단, Codex는 자체
 `workspace-write` sandbox와 외부 `sandbox-exec`를 중첩할 수 없으므로, Codex에
@@ -54,7 +56,9 @@ provider CLI 경계에 포함되지 않는다.
 
 ```bash
 python3 bin/edge-agent-write-policy.py --json \
-  /Users/edge_ai/.edge-agent-worktrees/telegram-bootstrap \
+  /Users/edge_ai/.edge-agent-worktrees/telegram-claude \
+  /Users/edge_ai/.edge-agent-worktrees/telegram-antigravity \
+  /Users/edge_ai/.edge-agent-worktrees/telegram-codex \
   /Users/edge_ai/.openclaw/workspace/team_os
 ```
 
