@@ -63,6 +63,15 @@ class CompletionHarnessTests(unittest.TestCase):
             self.assertEqual(first["task_id"], second["task_id"])
             self.assertEqual(len((Path(directory) / "improvements" / "tasks.jsonl").read_text().splitlines()), 1)
 
+    def test_clean_repo_can_explicitly_preserve_named_artifacts(self):
+        import subprocess
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "preserved.zip").write_bytes(b"archive")
+            self.assertTrue(module.check_clean_repo(repo, allow=["preserved.zip"])[0])
+
 
 if __name__ == "__main__":
     unittest.main()

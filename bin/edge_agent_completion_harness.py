@@ -383,6 +383,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--objective", default="완성된 멀티에이전트 운영체제")
     parser.add_argument("--evidence-file")
     parser.add_argument("--repo", action="append", default=[])
+    parser.add_argument("--allow", action="append", default=[])
     parser.add_argument("--domain", choices=("security_cost", "canonical_parity", "regression"))
     parser.add_argument("--cwd", default=".")
     parser.add_argument("--argv", nargs=argparse.REMAINDER)
@@ -430,7 +431,7 @@ def main(argv: list[str] | None = None) -> int:
             all_ok = True
             evidence: list[str] = []
             for value in args.repo:
-                passed, current = check_clean_repo(Path(value).expanduser().resolve())
+                passed, current = check_clean_repo(Path(value).expanduser().resolve(), allow=args.allow)
                 all_ok = all_ok and passed
                 evidence.extend([f"repo={value}:{item}" for item in current])
             if not all_ok:
