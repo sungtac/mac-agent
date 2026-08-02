@@ -39,13 +39,16 @@
 - [x] cancellation cascade
 - [x] bounded delegation helper
 - [x] DeliberationStore integration and transcript rendering
+- [x] bounded message dispatcher with handler callback, retry/requeue and ack
+- [x] two-round peer follow-up in Claude/Antigravity/Codex/Roda execution paths
 
 ### P0-B — worktree/resilience
 
 - [x] 신규 worktree lifecycle metadata를 외부 private state로 기록
 - [x] 기존 in-tree metadata fallback 유지
 - [x] dirty terminal worktree audit archive 후 reclaim command (`--archive-dirty` 명시 필요)
-- [ ] crash/restart checkpoint replay E2E
+- [x] durable dispatch checkpoints and recoverable checkpoint query
+- [ ] crash/restart checkpoint replay E2E with process termination
 
 ### P0-C — canonical parity
 
@@ -62,7 +65,7 @@
 
 ## 완료 기준
 
-이번 P0-A의 완료 기준은 “모델들이 자동으로 3턴 대화를 했다”가 아니다. bus에 실제로 signed peer message가 저장되고, 다른 프로세스가 lease를 획득해 처리하고, ack 이후 중복 전달되지 않으며, dependency graph가 복구되는 것을 테스트로 증명하는 것이다. 모델 provider 후속 턴 자동 실행은 별도의 dispatcher 구현과 provider별 live canary가 필요하다.
+이번 P0-A의 완료 기준은 “모델들이 무제한으로 대화한다”가 아니다. bus에 실제로 signed peer message가 저장되고, 다른 프로세스가 lease를 획득해 처리하고, ack 이후 중복 전달되지 않으며, dependency graph와 dispatch checkpoint가 복구되는 것을 테스트로 증명하는 것이다. 현재 provider 경로는 2-round follow-up까지 자동 실행하며, 3턴 이상과 live canary는 별도 검증 범위다.
 
 전체 Multi-Agent OS 완료 기준은 다음을 추가로 요구한다.
 

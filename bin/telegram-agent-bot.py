@@ -2045,7 +2045,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         provider_text=provider_text,
                         chat_id=message.chat_id,
                     )
+                    DeliberationStore().record(
+                        deliberation_session_id,
+                        ROLE,
+                        status="completed",
+                        summary=reply,
+                        round_number=2,
+                    )
                 else:
+                    first_pass = await run_provider(
+                        text,
+                        on_wait=_notify_waiting,
+                        context_prompt=preparation.prompt_block if preparation else None,
+                        provider_text=provider_text,
+                        chat_id=message.chat_id,
+                    )
+                    DeliberationStore().record(deliberation_session_id, ROLE, status="completed", summary=first_pass)
+                    await asyncio.to_thread(DeliberationStore().wait, deliberation_session_id, timeout_seconds=30.0)
+                    provider_text = (
+                        "[peer follow-up 단계]\n"
+                        "아래는 다른 역할의 서명된 peer evidence다. 이전 답변을 그대로 반복하지 말고, "
+                        "반론·보완점·실행 가능한 다음 단계를 반영하라.\n\n"
+                        f"{text}\n\n{DeliberationStore().render(deliberation_session_id)}"
+                    )
                     reply = await run_provider(
                         text,
                         on_wait=_notify_waiting,
@@ -2053,7 +2075,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         provider_text=provider_text,
                         chat_id=message.chat_id,
                     )
-                    DeliberationStore().record(deliberation_session_id, ROLE, status="completed", summary=reply)
+                    DeliberationStore().record(
+                        deliberation_session_id,
+                        ROLE,
+                        status="completed",
+                        summary=reply,
+                        round_number=2,
+                    )
             else:
                 provider_text = text
                 if coordination_request:

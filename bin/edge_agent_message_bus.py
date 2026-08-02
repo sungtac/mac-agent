@@ -55,6 +55,11 @@ def _message_from_dict(value: Mapping[str, Any]) -> AgentMessage:
     return AgentMessage(**payload)
 
 
+def message_from_dict(value: Mapping[str, Any]) -> AgentMessage:
+    """Rehydrate a validated bus message for a dispatcher or observer."""
+    return _message_from_dict(value)
+
+
 def _message_id(message: AgentMessage) -> str:
     return hashlib.sha256(
         message.canonical_bytes() + b"|" + message.signature.encode("ascii", "ignore")
@@ -116,6 +121,7 @@ class MessageBus:
             "max_rounds": max(1, min(8, int(max_rounds))),
             "messages": [],
             "tasks": {},
+            "checkpoints": {},
             "events": [],
             "created_epoch": _now(),
             "updated_epoch": _now(),
@@ -252,7 +258,7 @@ class MessageBus:
                     delivery = (item.setdefault("deliveries", {}).setdefault(
                         role, {"status": item.get("status", "queued"), "lease_owner": item.get("lease_owner", ""), "lease_until": item.get("lease_until", 0.0)}
                     ) if role in targets else None)
-                    if delivery is None or delivery.get("status") == "acked":
+                    if delivery is None or delivery.get("status") in {"acked", "failed"}:
                         continue
                     if delivery.get("status") == "leased" and float(delivery.get("lease_until", 0.0)) > now and delivery.get("lease_owner") != owner:
                         continue
@@ -304,6 +310,89 @@ class MessageBus:
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
+
+    def release(
+        self,
+        session_id: str,
+        message_id: str,
+        *,
+        owner: str,
+        error: str = "",
+        requeue: bool = True,
+    ) -> str:
+        """Release a lease after a handler failure without losing the message."""
+        session_id = _safe(session_id, "session_id")
+        owner = _safe(owner, "lease_owner")
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                return ""
+            for item in payload.get("messages") or []:
+                if item.get("message_id") != message_id:
+                    continue
+                deliveries = item.get("deliveries") or {}
+                delivery = next(
+                    (value for value in deliveries.values() if value.get("lease_owner") == owner),
+                    None,
+                )
+                if delivery is None:
+                    raise MessageBusError("message lease owner mismatch")
+                attempts = int(delivery.get("attempts", 0)) + 1
+                delivery["attempts"] = attempts
+                delivery["last_error"] = str(error)[:500]
+                delivery["status"] = "queued" if requeue and attempts < 3 else "failed"
+                delivery["lease_owner"] = ""
+                delivery["lease_until"] = 0.0
+                self._event(payload, "message_released", message_id=message_id, owner=owner, requeue=delivery["status"] == "queued")
+                self._write(session_id, payload)
+                return str(delivery["status"])
+            return ""
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def checkpoint(self, session_id: str, task_id: str, phase: str, status: str, *, summary: str = "") -> dict[str, Any]:
+        """Persist the last safe boundary so a restarted worker can resume."""
+        session_id = _safe(session_id, "session_id")
+        task_id = _safe(task_id, "task_id")
+        phase = _safe(phase, "phase")
+        if status not in {"claimed", "running", "completed", "failed", "cancelled"}:
+            raise MessageBusError("invalid checkpoint status")
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                raise MessageBusError("checkpoint session does not exist")
+            checkpoints = dict(payload.get("checkpoints") or {})
+            key = f"{task_id}:{phase}"
+            value = {
+                "task_id": task_id,
+                "phase": phase,
+                "status": status,
+                "summary": str(summary)[:800],
+                "updated_epoch": _now(),
+            }
+            checkpoints[key] = value
+            payload["checkpoints"] = checkpoints
+            self._event(payload, "checkpoint_written", task_id=task_id, phase=phase, status=status)
+            self._write(session_id, payload)
+            return dict(value)
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def recoverable(self, session_id: str) -> list[dict[str, Any]]:
+        """Return non-terminal task checkpoints suitable for a restarted worker."""
+        payload = self._read(_safe(session_id, "session_id")) or {}
+        checkpoints = payload.get("checkpoints") or {}
+        result = []
+        for value in checkpoints.values():
+            if value.get("status") not in {"completed", "cancelled"}:
+                result.append(dict(value))
+        return sorted(result, key=lambda item: (str(item.get("task_id")), str(item.get("phase"))))
 
     def spawn_task(self, session_id: str, task_id: str, *, owner: str, purpose: str, parent_task_id: str = "", depends_on: Iterable[str] = ()) -> dict[str, Any]:
         session_id = _safe(session_id, "session_id")
@@ -441,4 +530,4 @@ def delegate_message(parent: AgentMessage, *, to_role: str, purpose: str, summar
     )
 
 
-__all__ = ["MessageBus", "MessageBusError", "SCHEMA", "TASK_SCHEMA", "delegate_message"]
+__all__ = ["MessageBus", "MessageBusError", "SCHEMA", "TASK_SCHEMA", "delegate_message", "message_from_dict"]

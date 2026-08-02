@@ -246,7 +246,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
             return
     if deliberation_session_id:
-        DeliberationStore().record(deliberation_session_id, "roda", status="completed", summary=answer)
+        store = DeliberationStore()
+        store.record(deliberation_session_id, "roda", status="completed", summary=answer)
+        await asyncio.to_thread(store.wait, deliberation_session_id, timeout_seconds=30.0)
+        follow_up = (
+            "[peer follow-up 단계]\n"
+            "다른 역할의 서명된 peer evidence를 검토하고, 반론·보완점·현실적인 실행 단계를 반영해 다시 답하라.\n\n"
+            f"{original_text}\n\n{store.render(deliberation_session_id)}"
+        )
+        try:
+            answer = await asyncio.to_thread(_ollama_chat, follow_up)
+            store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=2)
+        except Exception as exc:
+            log.warning("peer follow-up failed; retaining first deliberation answer: %s", type(exc).__name__)
     try:
         for index, part in enumerate(_split_message(answer)):
             sent = await _egress_send(
