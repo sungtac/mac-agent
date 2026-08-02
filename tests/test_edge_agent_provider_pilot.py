@@ -47,6 +47,14 @@ class ProviderPilotTests(unittest.TestCase):
             worktree = next(item for item in dirty_plan["checks"] if item["name"] == "worktree")
             self.assertFalse(worktree["ok"])
 
+            oversized = root / "oversized-prompt.txt"
+            oversized.write_bytes(b"x" * (module.MAX_PROMPT_BYTES + 1))
+            with patch.object(module, "_capability", return_value=(True, "codex_provider: available")), patch.object(module, "_usage_gate", return_value=(True, "PROCEED codex 7d창 잔여 90%")):
+                oversized_plan = module.build_plan("codex", oversized, repo)
+            prompt_check = next(item for item in oversized_plan["checks"] if item["name"] == "prompt")
+            self.assertFalse(prompt_check["ok"])
+            self.assertIn("exceeds", prompt_check["detail"])
+
     def test_execution_requires_explicit_confirmation_without_spawning(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -63,6 +71,35 @@ class ProviderPilotTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertFalse(payload["ok"])
             self.assertIn("confirm-live-provider", payload["errors"][0])
+
+    def test_execution_timeout_has_a_bounded_upper_limit(self):
+        result = subprocess.run(
+            [
+                "python3", str(SCRIPT), "--provider", "codex", "--prompt-file", "/tmp/missing-prompt",
+                "--workdir", "/tmp", "--timeout", str(load_module().MAX_TIMEOUT_SECONDS + 1), "--json",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("must be <=", result.stderr)
+
+    def test_blocked_plan_creates_a_durable_improvement_task(self):
+        module = load_module()
+        with tempfile.TemporaryDirectory() as td:
+            with patch.dict(module.os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": td}, clear=False):
+                plan = module.attach_improvement_task({
+                    "ok": False,
+                    "provider": "claude",
+                    "checks": [
+                        {"name": "worktree", "ok": True},
+                        {"name": "usage_gate", "ok": False, "detail": "usage window unknown"},
+                    ],
+                })
+            self.assertEqual(plan["improvement_task"]["category"], "usage")
+            self.assertEqual(plan["improvement_task"]["record_outcome"], "recorded")
+            self.assertTrue((Path(td) / "tasks.jsonl").is_file())
 
     def test_usage_gate_unknown_is_not_accepted_for_live_pilot(self):
         module = load_module()

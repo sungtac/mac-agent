@@ -166,6 +166,7 @@ class HostOrchestrator:
             "track": result.get("track") or result.get("tier"),
             "passed": result.get("passed") is True,
             "error": result.get("error"),
+            "improvement_task_id": (result.get("improvement_task") or {}).get("task_id"),
             "round": result.get("round"),
             "completed_at": now_utc(),
         }
@@ -193,6 +194,12 @@ class HostOrchestrator:
 
     def persist_result(self, result: dict[str, Any]) -> None:
         try:
+            HARNESS.ensure_improvement_task(result, self.run_dir, source="verify-task-orchestrator")
+        except Exception as exc:
+            result["passed"] = False
+            result["error"] = "improvement_task_persist_failed"
+            result["improvement_error"] = type(exc).__name__
+        try:
             self.append_history(result)
         except (OSError, RuntimeError) as exc:
             # A successful workflow without a durable history record is not a
@@ -201,6 +208,12 @@ class HostOrchestrator:
             result["passed"] = False
             result["error"] = "history_persist_failed"
             result["history_error"] = str(exc)
+            if "improvement_task" not in result:
+                try:
+                    HARNESS.ensure_improvement_task(result, self.run_dir, source="verify-task-orchestrator")
+                except Exception as improvement_exc:
+                    result["error"] = "improvement_task_persist_failed"
+                    result["improvement_error"] = type(improvement_exc).__name__
         HARNESS.write_json(self.run_dir / "final-verdict.json", result)
         if result.get("blocking_issues"):
             HARNESS.write_json(self.run_dir / "blocking-issues.json", result["blocking_issues"])

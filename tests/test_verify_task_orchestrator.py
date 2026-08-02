@@ -108,12 +108,17 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             run_dir = repo / ".verify" / "runs" / "CORRUPT"
             history_file = Path(directory) / "verify-history.jsonl"
             history_file.write_text('{"ok":true}\nnot-json\n', encoding="utf-8")
+            improvement_root = Path(directory) / "improvements"
             runner = MODULE.HostOrchestrator("검증", repo, run_dir, 1, False)
-            with patch.dict(os.environ, {"VERIFY_TASK_HISTORY_FILE": str(history_file)}):
+            with patch.dict(os.environ, {
+                "VERIFY_TASK_HISTORY_FILE": str(history_file),
+                "EDGE_AGENT_IMPROVEMENT_ROOT": str(improvement_root),
+            }):
                 result = {"passed": True, "dry_run": True, "run_dir": str(run_dir)}
                 runner.persist_result(result)
             self.assertFalse(result["passed"])
             self.assertEqual(result["error"], "history_persist_failed")
+            self.assertIn("improvement_task", result)
             self.assertEqual(len(history_file.read_text(encoding="utf-8").splitlines()), 2)
 
 

@@ -166,3 +166,26 @@ Team OS와의 충돌을 막고, 나노 작업·락·전역 상태·provider 실�
 2. 성공 표본과 token/risk 신호를 누적하여 nano 임계값 조정 자격 재평가.
 3. 실제 운영 연결 전 Telegram·Discord 라우팅, 자동 merge, launchd 변경을 별도 승인으로 검토.
 4. Team OS 어댑터는 계속 보류하고, 엣지 에이전트 독립 운영을 유지.
+
+## 17. 2026-08-02 후속 검증
+
+- 전용 clean worktree에서 Codex read-only canary를 실제 실행했다.
+- 결과는 `returncode=0`, timeout 없음, 변경 파일 0개, `git diff --check` 통과였다.
+- 원문 출력은 저장하지 않고 출력 해시·바이트 수만 계산했으며, 효율성 원장에
+  멱등 이벤트를 기록했다.
+- 병렬 worktree 감사 결과는 finding 0건이며, 실제 병렬 Provider·자동 merge는
+  계속 비활성 상태다.
+- Nano 이벤트 원장은 현재 0건이므로 임계값 변경 자격은 여전히 `false`다.
+- 당시 검증 시점에는 Claude/dual이 5시간 잔여 4%의 알려진 `SKIP` 상태라
+  호출하지 않았다. 이후 사용량 회복 및 `coach` 수정 후 Claude canary를 별도
+  실행했으며, 최신 결과는 아래 18절에 기록한다.
+
+## 18. 2026-08-02 Claude 사용량 복구 후속 검증
+
+- `coach`의 `reset_min=null` 직렬화 오류를 수정하고 null-reset 회귀 테스트를
+  통과시켰다.
+- Claude 사용량 게이트는 5시간 100%·7일 91%로 정상 `PROCEED`를 반환했다.
+- 전용 clean worktree에서 Claude read-only canary를 실행해 종료코드 0,
+  변경 파일 0개, timeout 없음, `git diff --check` 통과를 확인했다.
+- 관련 개선 task 2건은 재검증 증거와 함께 완료 처리했다.
+- 현재 실제 남은 운영 작업은 nano 이벤트 표본 누적과 병렬/자동 merge의 별도 승인이다.

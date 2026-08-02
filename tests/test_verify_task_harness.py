@@ -60,6 +60,23 @@ class VerifyTaskHarnessTests(unittest.TestCase):
             self.assertEqual(len(summary["results"]), 2)
             self.assertTrue(all(item["status"] == "passed" for item in summary["results"]))
 
+    def test_failed_direct_harness_tests_create_improvement_task(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            tests = repo / "tests"
+            tests.mkdir()
+            (tests / "test_unit.py").write_text(
+                "import unittest\n\nclass TestUnit(unittest.TestCase):\n"
+                "    def test_fail(self):\n        self.assertTrue(False)\n",
+                encoding="utf-8",
+            )
+            run_dir = repo / ".verify" / "runs" / "TASK-FAILED-TESTS"
+            with patch.dict(MODULE.os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": str(Path(directory) / "improvements")}, clear=False):
+                summary = MODULE.run_tests(repo, run_dir)
+            self.assertEqual(summary["status"], "failed")
+            self.assertEqual(summary["improvement_task"]["status"], "queued")
+            self.assertTrue((run_dir / "improvement-task.json").is_file())
+
     def test_test_command_argv_expands_globs_without_shell_execution(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
@@ -104,6 +121,15 @@ class VerifyTaskHarnessTests(unittest.TestCase):
             "summary": "not configured in searched scope",
             "discovery_evidence": {"searched_scopes": ["environment", "launch agents"]},
         })
+
+    def test_failed_result_is_forced_into_improvement_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory) / "run"
+            with patch.dict(MODULE.os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": str(Path(directory) / "improvements")}, clear=False):
+                result = MODULE.ensure_improvement_task({"passed": False, "error": "usage_gate_unknown"}, run_dir)
+            self.assertEqual(result["improvement_task"]["status"], "queued")
+            self.assertTrue((run_dir / "improvement-task.json").is_file())
+            self.assertIn("task_id", result["improvement_task"])
 
     def test_init_and_snapshot_write_file_handoff(self):
         with tempfile.TemporaryDirectory() as directory:

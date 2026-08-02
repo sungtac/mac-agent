@@ -32,6 +32,14 @@ ABSENCE_GUARD = importlib.util.module_from_spec(ABSENCE_GUARD_SPEC)
 sys.modules[ABSENCE_GUARD_SPEC.name] = ABSENCE_GUARD
 ABSENCE_GUARD_SPEC.loader.exec_module(ABSENCE_GUARD)
 
+IMPROVEMENT_PATH = Path(__file__).with_name("edge_agent_improvement.py")
+IMPROVEMENT_SPEC = importlib.util.spec_from_file_location("edge_agent_improvement", IMPROVEMENT_PATH)
+if IMPROVEMENT_SPEC is None or IMPROVEMENT_SPEC.loader is None:
+    raise RuntimeError(f"improvement task module unavailable: {IMPROVEMENT_PATH}")
+IMPROVEMENT = importlib.util.module_from_spec(IMPROVEMENT_SPEC)
+sys.modules[IMPROVEMENT_SPEC.name] = IMPROVEMENT
+IMPROVEMENT_SPEC.loader.exec_module(IMPROVEMENT)
+
 
 SCHEMA = "edge_agent.verify_task_handoff.v1"
 MAX_RULE_CHARS = 2400
@@ -282,6 +290,25 @@ def write_json(path: Path, value: Any) -> None:
     temporary.replace(path)
 
 
+def ensure_improvement_task(result: dict[str, Any], run_dir: Path, *, source: str = "verify-task-harness") -> dict[str, Any]:
+    """Convert every failed workflow into a durable, actionable task.
+
+    A blocked/failed result without an improvement handoff is not a complete
+    harness result.  The task is idempotent and contains only bounded,
+    non-sensitive facts; provider transcripts never enter the task.
+    """
+    if result.get("passed") is True:
+        return result
+    task, outcome = IMPROVEMENT.improvement_for_result(
+        result,
+        source=source,
+        root=os.environ.get("EDGE_AGENT_IMPROVEMENT_ROOT") or None,
+    )
+    result["improvement_task"] = {**task, "record_outcome": outcome}
+    write_json(run_dir / "improvement-task.json", result["improvement_task"])
+    return result
+
+
 def append_metric(run_dir: Path, record: dict[str, Any]) -> None:
     path = run_dir / "metrics.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -527,6 +554,14 @@ def run_tests(cwd: Path, run_dir: Path) -> dict[str, Any]:
         "failures": all_failures[:10],
         "full_log_path": str(log_path),
     }
+    if status != "passed":
+        task, outcome = IMPROVEMENT.improvement_for_result(
+            {"passed": False, "error": "harness_tests_failed", "blocking_issues": [f"failure_count={len(all_failures)}"]},
+            source="verify-task-harness.tests",
+            root=os.environ.get("EDGE_AGENT_IMPROVEMENT_ROOT") or None,
+        )
+        result["improvement_task"] = {**task, "record_outcome": outcome}
+        write_json(run_dir / "improvement-task.json", result["improvement_task"])
     write_json(run_dir / "test-summary.json", result)
     append_metric(run_dir, {"task_id": run_dir.name, "track": None, "agent": "harness", "role": "test_runner", "round": 0, "model": None, "effort": None, "input_tokens": 0, "output_tokens": 0, "package_bytes": 0, "package_tokens": 0})
     return result
