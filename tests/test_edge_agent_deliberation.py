@@ -24,7 +24,8 @@ class DeliberationStoreTests(unittest.TestCase):
                     store.record(session_id, role, status="completed", summary=f"{role} 의견")
                 self.assertEqual(store.snapshot(session_id)["status"], "collecting")
                 store.record(session_id, "roda", status="completed", summary="roda 의견")
-                self.assertEqual(store.snapshot(session_id)["status"], "barrier_ready")
+                self.assertEqual(store.snapshot(session_id)["status"], "collecting")
+                self.assertEqual(store.round_state(session_id, 1), "ready")
                 self.assertIn("codex 의견", store.render(session_id))
 
     def test_same_telegram_message_has_same_session_id(self):
@@ -73,7 +74,8 @@ class DeliberationStoreTests(unittest.TestCase):
                 for role in ("claude", "codex", "antigravity", "roda"):
                     store.record(session_id, role, status="completed", summary=f"{role} 1차")
                 self.assertEqual(len(store._bus.transcript(session_id)), 4)
-                self.assertEqual(store.wait(session_id, timeout_seconds=0)["status"], "barrier_ready")
+                self.assertEqual(store.wait_for_round(session_id, 1, timeout_seconds=0)["status"], "collecting")
+                self.assertEqual(store.round_state(session_id, 1), "ready")
                 for role in ("claude", "codex", "antigravity", "roda"):
                     store.record(session_id, role, status="completed", summary=f"{role} 2차", round_number=2)
                 transcript = store._bus.transcript(session_id)
@@ -86,6 +88,23 @@ class DeliberationStoreTests(unittest.TestCase):
                 self.assertEqual(len(transcript), 12)
                 self.assertTrue(any(message.round == 3 for message in transcript))
                 self.assertIn("round=3", store.render(session_id))
+                self.assertEqual(store.snapshot(session_id)["status"], "barrier_ready")
+
+    def test_failed_round_blocks_final_barrier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 102)
+                store.start(session_id, "실패 전파")
+                for role in ("claude", "codex", "antigravity"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 1차")
+                store.record(session_id, "roda", status="completed", summary="roda 1차")
+                store.record(session_id, "claude", status="failed", summary="provider usage limit", round_number=2)
+                self.assertEqual(store.round_state(session_id, 2), "failed")
+                self.assertNotEqual(store.snapshot(session_id)["status"], "barrier_ready")
 
 
 if __name__ == "__main__":

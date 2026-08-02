@@ -141,6 +141,7 @@ class DeliberationStore:
                 "max_rounds": max_rounds,
                 "status": "collecting",
                 "results": {},
+                "rounds": {},
                 "created_epoch": time.time(),
             }
             self._write(session_id, payload)
@@ -175,6 +176,7 @@ class DeliberationStore:
                     "max_rounds": configured_max_rounds(),
                     "status": "collecting",
                     "results": {},
+                    "rounds": {},
                     "created_epoch": time.time(),
                 }
             results = dict(payload.get("results") or {})
@@ -219,6 +221,11 @@ class DeliberationStore:
             result["handled_by"] = [role]
             results[role] = result
             payload["results"] = results
+            rounds = dict(payload.get("rounds") or {})
+            round_results = dict(rounds.get(str(current_round)) or {})
+            round_results[role] = status
+            rounds[str(current_round)] = round_results
+            payload["rounds"] = rounds
             payload["round"] = max(int(payload.get("round", 1)), current_round)
             try:
                 self._bus.update_task(session_id, session_id, "running", summary="peer results collecting")
@@ -228,7 +235,13 @@ class DeliberationStore:
                 # A legacy session may predate the bus projection.  The
                 # signed result remains durable in the compatibility store.
                 pass
-            if all(str(results.get(item, {}).get("status")) in TERMINAL_STATUSES for item in payload["expected_roles"]):
+            round_complete = all(
+                str(round_results.get(item)) == "completed"
+                for item in payload["expected_roles"]
+            )
+            if status == "failed":
+                payload["status"] = "failed"
+            elif round_complete and current_round == max_rounds:
                 payload["status"] = "barrier_ready"
                 try:
                     self._bus.update_task(session_id, session_id, "completed", summary="all expected peer results collected")
@@ -247,15 +260,36 @@ class DeliberationStore:
         payload = self.snapshot(session_id) or {}
         return max(1, min(DEFAULT_MAX_ROUNDS, int(payload.get("max_rounds", DEFAULT_MAX_ROUNDS))))
 
-    def wait(self, session_id: str, *, timeout_seconds: float = 30.0, interval_seconds: float = 0.25) -> dict[str, Any] | None:
+    def round_state(self, session_id: str, round_number: int) -> str:
+        payload = self.snapshot(session_id) or {}
+        if payload.get("status") == "failed":
+            return "failed"
+        entries = (payload.get("rounds") or {}).get(str(int(round_number))) or {}
+        if any(str(entries.get(role)) == "failed" for role in payload.get("expected_roles", EXPECTED_ROLES)):
+            return "failed"
+        if all(str(entries.get(role)) == "completed" for role in payload.get("expected_roles", EXPECTED_ROLES)):
+            return "ready"
+        return "collecting"
+
+    def wait_for_round(self, session_id: str, round_number: int, *, timeout_seconds: float = 30.0, interval_seconds: float = 0.25) -> dict[str, Any] | None:
         deadline = time.monotonic() + min(MAX_TIMEOUT_SECONDS, max(0.0, timeout_seconds))
         while True:
             payload = self.snapshot(session_id)
-            if payload and payload.get("status") == "barrier_ready":
+            if self.round_state(session_id, round_number) in {"ready", "failed"}:
                 return payload
             if time.monotonic() >= deadline:
                 return payload
             time.sleep(max(0.05, interval_seconds))
+
+    def wait(self, session_id: str, *, timeout_seconds: float = 30.0, interval_seconds: float = 0.25) -> dict[str, Any] | None:
+        """Backward-compatible round-aware wait for the current round."""
+        payload = self.snapshot(session_id) or {}
+        return self.wait_for_round(
+            session_id,
+            max(1, int(payload.get("round", 1))),
+            timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+        )
 
     def render(self, session_id: str) -> str:
         payload = self.snapshot(session_id) or {}
