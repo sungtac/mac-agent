@@ -161,6 +161,8 @@ class CompletionStore:
             payload["updated_epoch"] = time.time()
             if not passed:
                 payload["last_failure"] = {"domain": domain, "blocker": _bounded(blocker), "next_action": _bounded(next_action)}
+            elif (payload.get("last_failure") or {}).get("domain") == domain:
+                payload["last_failure"] = None
             self._write(payload)
             self._event({
                 "schema": EVENT_SCHEMA,

@@ -72,6 +72,15 @@ class CompletionHarnessTests(unittest.TestCase):
             (repo / "preserved.zip").write_bytes(b"archive")
             self.assertTrue(module.check_clean_repo(repo, allow=["preserved.zip"])[0])
 
+    def test_passing_domain_clears_its_stale_last_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = module.CompletionStore(Path(directory) / "completion")
+            store.init_goal("goal-3", "OS upgrade")
+            with patch.dict(os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": str(Path(directory) / "improvements")}):
+                module.register_failure(store, "goal-3", "canonical_parity", blocker="dirty", evidence=["repo=dirty"], next_action="commit")
+            store.record_check("goal-3", "canonical_parity", passed=True, evidence=["repo=clean"])
+            self.assertIsNone(store.state()["last_failure"])
+
 
 if __name__ == "__main__":
     unittest.main()
