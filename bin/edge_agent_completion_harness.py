@@ -207,7 +207,18 @@ class CompletionStore:
             os.close(descriptor)
 
 
-def unresolved_improvement_tasks(root: str | os.PathLike[str] | None = None) -> list[dict[str, Any]]:
+def _task_belongs_to_goal(item: dict[str, Any], goal_id: str | None) -> bool:
+    if not goal_id:
+        return True
+    if item.get("goal_id") == goal_id:
+        return True
+    # Older completion-harness records predate goal_id.  Keep those scoped
+    # records for backward compatibility, but do not let unrelated historical
+    # tasks (for example a separate nano-threshold review) block this goal.
+    return item.get("goal_id") is None and str(item.get("source", "")).startswith("completion-harness")
+
+
+def unresolved_improvement_tasks(root: str | os.PathLike[str] | None = None, *, goal_id: str | None = None) -> list[dict[str, Any]]:
     ledger_root = Path(root or os.environ.get("EDGE_AGENT_IMPROVEMENT_ROOT", str(Path.home() / ".edge-agent" / "improvements"))).expanduser()
     path = ledger_root / "tasks.jsonl"
     if not path.is_file():
@@ -221,12 +232,12 @@ def unresolved_improvement_tasks(root: str | os.PathLike[str] | None = None) -> 
         except json.JSONDecodeError:
             unresolved.append({"status": "malformed"})
             continue
-        if isinstance(item, dict) and item.get("status", "queued") not in TERMINAL_TASK_STATUSES:
+        if isinstance(item, dict) and _task_belongs_to_goal(item, goal_id) and item.get("status", "queued") not in TERMINAL_TASK_STATUSES:
             unresolved.append(item)
     return unresolved
 
 
-def resolve_completion_tasks(domain: str, evidence: Iterable[str], root: str | os.PathLike[str] | None = None) -> int:
+def resolve_completion_tasks(domain: str, evidence: Iterable[str], root: str | os.PathLike[str] | None = None, *, goal_id: str | None = None) -> int:
     """Close completion-harness tasks after the exact domain is revalidated."""
     ledger_root = Path(root or os.environ.get("EDGE_AGENT_IMPROVEMENT_ROOT", str(Path.home() / ".edge-agent" / "improvements"))).expanduser()
     path = ledger_root / "tasks.jsonl"
@@ -250,7 +261,8 @@ def resolve_completion_tasks(domain: str, evidence: Iterable[str], root: str | o
             if isinstance(item, dict):
                 acceptance = str(item.get("acceptance", ""))
                 matches = (
-                    item.get("source") == "completion-harness"
+                    str(item.get("source", "")).startswith("completion-harness")
+                    and _task_belongs_to_goal(item, goal_id)
                     and item.get("status", "queued") not in TERMINAL_TASK_STATUSES
                     and (item.get("completion_domain") == domain or f"completion domain {domain}" in acceptance)
                 )
@@ -339,6 +351,7 @@ def register_failure(store: CompletionStore, goal_id: str, domain: str, *, block
         "schema": "edge_agent.improvement_task.v1",
         "task_id": task_id,
         "source": "completion-harness",
+        "goal_id": goal_id,
         "category": "integration" if domain == "canonical_parity" else "runtime",
         "status": "queued",
         "completion_domain": domain,
@@ -366,7 +379,7 @@ def evaluate_goal(store: CompletionStore, goal_id: str) -> dict[str, Any]:
     state = store.state()
     if not state or state.get("goal_id") != goal_id:
         raise CompletionError("goal is not initialized")
-    unresolved = unresolved_improvement_tasks()
+    unresolved = unresolved_improvement_tasks(goal_id=goal_id)
     open_domains = [name for name, item in (state.get("domains") or {}).items() if item.get("status") != "passed"]
     return {
         "schema": SCHEMA,
@@ -397,14 +410,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "status":
             output = evaluate_goal(store, args.goal_id)
         elif args.command == "complete":
-            output = store.complete(args.goal_id, unresolved_tasks=unresolved_improvement_tasks())
+            output = store.complete(args.goal_id, unresolved_tasks=unresolved_improvement_tasks(goal_id=args.goal_id))
         elif args.command == "check-services":
             labels = ("com.macagent.telegram-claude", "com.multiagent.engine", "com.macagent.telegram-antigravity", "com.macagent.telegram-roda-gemma")
             passed, evidence = check_services(labels)
             if not passed:
                 register_failure(store, args.goal_id, "lifecycle", blocker="service not running", evidence=evidence, next_action="restart the failed LaunchAgent with the drain-aware helper")
             else:
-                resolve_completion_tasks("lifecycle", evidence)
+                resolve_completion_tasks("lifecycle", evidence, goal_id=args.goal_id)
             output = store.record_check(args.goal_id, "lifecycle", passed=passed, evidence=evidence, blocker="service not running", next_action="restart the failed LaunchAgent with the drain-aware helper")
         elif args.command == "check-canary":
             if not args.evidence_file:
@@ -413,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
             if not passed:
                 register_failure(store, args.goal_id, "telegram_canary", blocker="Telegram 3-round canary evidence is missing or failed", evidence=evidence, next_action="run the canary and persist signed bounded evidence")
             else:
-                resolve_completion_tasks("telegram_canary", evidence)
+                resolve_completion_tasks("telegram_canary", evidence, goal_id=args.goal_id)
             output = store.record_check(args.goal_id, "telegram_canary", passed=passed, evidence=evidence, blocker="Telegram 3-round canary evidence is missing or failed", next_action="run the canary and persist signed bounded evidence")
         elif args.command == "check-command":
             if not args.domain or not args.argv:
@@ -425,7 +438,7 @@ def main(argv: list[str] | None = None) -> int:
             if not passed:
                 register_failure(store, args.goal_id, args.domain, blocker=blocker, evidence=evidence, next_action=next_action)
             else:
-                resolve_completion_tasks(args.domain, evidence)
+                resolve_completion_tasks(args.domain, evidence, goal_id=args.goal_id)
             output = store.record_check(args.goal_id, args.domain, passed=passed, evidence=evidence, blocker=blocker, next_action=next_action)
         else:
             if not args.repo:
@@ -439,7 +452,7 @@ def main(argv: list[str] | None = None) -> int:
             if not all_ok:
                 register_failure(store, args.goal_id, "canonical_parity", blocker="repository has unresolved changes", evidence=evidence, next_action="finish or explicitly resolve every repository change, then rerun parity checks")
             else:
-                resolve_completion_tasks("canonical_parity", evidence)
+                resolve_completion_tasks("canonical_parity", evidence, goal_id=args.goal_id)
             output = store.record_check(args.goal_id, "canonical_parity", passed=all_ok, evidence=evidence, blocker="repository has unresolved changes", next_action="finish or explicitly resolve every repository change, then rerun parity checks")
         print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
         return 0

@@ -23,6 +23,7 @@ class CompletionHarnessTests(unittest.TestCase):
                 encoding="utf-8",
             )
             self.assertEqual(module.unresolved_improvement_tasks(ledger.parent), [{"task_id": "open", "status": "queued"}])
+            self.assertEqual(module.unresolved_improvement_tasks(ledger.parent, goal_id="goal-x"), [])
 
     def test_completion_is_blocked_until_all_domains_and_tasks_are_closed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -80,6 +81,18 @@ class CompletionHarnessTests(unittest.TestCase):
                 module.register_failure(store, "goal-3", "canonical_parity", blocker="dirty", evidence=["repo=dirty"], next_action="commit")
             store.record_check("goal-3", "canonical_parity", passed=True, evidence=["repo=clean"])
             self.assertIsNone(store.state()["last_failure"])
+
+    def test_unrelated_legacy_improvement_does_not_block_goal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "improvements" / "tasks.jsonl"
+            ledger.parent.mkdir()
+            ledger.write_text(
+                json.dumps({"task_id": "nano", "source": "nano-threshold-review", "status": "queued"}) + "\n"
+                + json.dumps({"task_id": "completion", "source": "completion-harness", "status": "queued"}) + "\n",
+                encoding="utf-8",
+            )
+            tasks = module.unresolved_improvement_tasks(ledger.parent, goal_id="goal-x")
+            self.assertEqual([item["task_id"] for item in tasks], ["completion"])
 
 
 if __name__ == "__main__":

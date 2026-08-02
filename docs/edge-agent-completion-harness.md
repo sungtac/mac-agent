@@ -10,6 +10,8 @@
 - 서비스가 하나라도 중단되거나 대상 저장소에 미해결 변경이 있으면 완료할 수 없다.
 - 새로운 실패는 개선 task ledger에 idempotent하게 기록되고, 해당 goal은 계속 `open` 상태다.
 - 완료 시점에 unresolved improvement task가 하나라도 있으면 `complete`가 거부된다.
+- 개선 task는 goal ID로 범위가 묶인다. 이전 goal의 unrelated task는 보존되지만
+  현재 goal을 차단하지 않으며, 현재 goal에서 발견된 task는 반드시 닫아야 한다.
 - `--allow`는 삭제하지 않고 보존할 것으로 명시된 정확한 Git 경로에만 사용할 수
   있다. 허용 목록 밖의 변경은 계속 완료를 차단한다.
 
