@@ -10,6 +10,6 @@
     {"id":"hermes_runtime","manifest":"hermes_runtime/SKILL.md","category":"operations","status":"active","runtime_consumers":["Hermes lifecycle workflows"],"tests":["hermes_runtime/tests/test_hermes_runtime_skill.py"],"state_root":"workspace Hermes ledger","auth_root":null},
     {"id":"product_research","manifest":"product_research/SKILL.md","category":"domain","status":"active","runtime_consumers":["provider skill context"],"tests":["product_research/tests/"],"state_root":null,"auth_root":null},
     {"id":"quota_resume","manifest":"quota_resume/SKILL.md","category":"operations","status":"active","runtime_consumers":["quota and resume workflows"],"tests":["quota_resume/tests/"],"state_root":"~/.edge-agent/state/skills/quota_resume.json","auth_root":null},
-    {"id":"roda-public-search","manifest":"roda_public_search/SKILL.md","category":"domain","status":"active","runtime_consumers":["Roda Gemma"],"tests":["tests/test_edge_agent_skill_connector.py"],"state_root":null,"auth_root":null}
+    {"id":"roda-public-search","manifest":"roda_public_search/SKILL.md","category":"domain","status":"active","runtime_consumers":["Roda Gemma"],"tests":["roda_public_search/tests/test_roda_public_search_skill.py"],"state_root":null,"auth_root":null}
   ]
 }

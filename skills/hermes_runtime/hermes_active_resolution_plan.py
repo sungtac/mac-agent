@@ -19,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from skills.hermes_runtime.hermes_lifecycle_common import ACTIVE_STAGES, high_priority_records, raw_status, record_text
+from skills.hermes_runtime.hermes_lifecycle_common import ACTIVE_STAGES, high_priority_records, raw_status, record_text, redact_text
 from skills.hermes_runtime.hermes_lifecycle_gate import DEFAULT_LOG
 
 
@@ -101,7 +101,7 @@ def evaluate(path: str | Path = DEFAULT_LOG, *, limit: int = 100) -> ActiveResol
         reason, safe, blocked, required = _classify(record)
         items.append(ActivePlanItem(
             index=idx,
-            title=str(record.get("title") or "untitled"),
+            title=redact_text(str(record.get("title") or "untitled")),
             status=status,
             priority=priority,
             reason_active=reason,

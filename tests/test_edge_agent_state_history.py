@@ -14,6 +14,18 @@ import edge_agent_state as state  # noqa: E402
 
 
 class TaskStateHistoryTests(unittest.TestCase):
+    def test_explicit_ingress_task_id_is_preserved(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"EDGE_AGENT_STATE_DIR": temp}, clear=False):
+                task_id = state.write_task_state(
+                    role="claude", chat_id="chat-1", text="same request", status="started",
+                    task_id="child-root-claude", root_task_id="root-1",
+                )
+                record = state.latest_task_state(chat_id="chat-1")
+            self.assertEqual(task_id, "child-root-claude")
+            self.assertEqual(record["task_id"], "child-root-claude")
+            self.assertEqual(record["root_task_id"], "root-1")
+
     def test_history_has_ordered_timestamps_tails_and_redaction(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"EDGE_AGENT_STATE_DIR": temp}, clear=False):

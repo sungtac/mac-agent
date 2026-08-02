@@ -60,6 +60,20 @@ class VerifyTaskHarnessTests(unittest.TestCase):
             self.assertEqual(len(summary["results"]), 2)
             self.assertTrue(all(item["status"] == "passed" for item in summary["results"]))
 
+    def test_test_command_argv_expands_globs_without_shell_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            tests = repo / "tests"
+            tests.mkdir()
+            (tests / "smoke.test.js").write_text("", encoding="utf-8")
+
+            argv = MODULE.test_command_argv("node --test tests/*.test.js", repo)
+
+            self.assertEqual(argv, ["node", "--test", "tests/smoke.test.js"])
+            self.assertEqual(MODULE.test_command_argv("node --test tests/*.missing.js", repo), [
+                "node", "--test", "tests/*.missing.js",
+            ])
+
     def test_agent_bridge_metric_keeps_unknown_usage_unknown(self):
         with tempfile.TemporaryDirectory() as directory:
             run_dir = Path(directory) / "TASK-METRICS"

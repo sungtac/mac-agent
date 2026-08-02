@@ -21,6 +21,7 @@ import json
 import os
 import socketserver
 import sys
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -185,6 +186,8 @@ def parse_natural_event(date_text: str, time_text: str | None, *, duration_text:
     if all_day or not time_text:
         return {"date": event_date.isoformat()}, {"date": (event_date + dt.timedelta(days=1)).isoformat()}, True
     hour, minute = parse_korean_time(time_text)
+    if duration_min is not None and duration_min <= 0:
+        raise ValueError("duration must be positive")
     tz = ZoneInfo(timezone)
     start = dt.datetime(event_date.year, event_date.month, event_date.day, hour, minute, tzinfo=tz)
     mins = duration_min if duration_min is not None else parse_duration_minutes(duration_text)
@@ -202,16 +205,33 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def require_private_secret_file(path: Path) -> None:
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as exc:
+        raise SystemExit(f"Cannot inspect credential file permissions: {path}") from exc
+    if mode & 0o077:
+        raise SystemExit(f"Credential file must be owner-only (0600): {path}")
+
+
 def save_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
     try:
-        path.chmod(0o600)
-    except OSError:
-        pass
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def client_config() -> dict[str, str]:
+    require_private_secret_file(CLIENT_FILE)
     raw = load_json(CLIENT_FILE)
     cfg = raw.get("installed") or raw.get("web") or raw
     client_id = cfg.get("client_id")
@@ -314,6 +334,7 @@ def cmd_exchange(args: argparse.Namespace) -> None:
 
 
 def load_token() -> dict[str, Any]:
+    require_private_secret_file(TOKEN_FILE)
     token = load_json(TOKEN_FILE)
     if not token.get("access_token"):
         raise SystemExit(f"No access_token in {TOKEN_FILE}; run auth-url/exchange first")

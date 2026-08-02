@@ -90,6 +90,16 @@ class ShadowKeyRotationTests(unittest.TestCase):
             with self.assertRaises(ShadowKeyError):
                 HMACKeyring(path)
 
+    def test_broad_key_parent_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp) / "keys"
+            parent.mkdir(mode=0o755)
+            path = parent / "key"
+            path.write_bytes(b"a" * 32)
+            path.chmod(0o600)
+            with self.assertRaises(ShadowKeyError):
+                HMACKeyring(path)
+
     def test_symlink_key_is_rejected(self):
         with tempfile.TemporaryDirectory() as temp:
             real = create_test_key(Path(temp) / "real")

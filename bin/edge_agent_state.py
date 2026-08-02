@@ -18,6 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
+from edge_agent_secure_paths import append_text, ensure_private_directory, open_lock, read_text
+
 
 HISTORY_FILE = "history.jsonl"
 LOCK_FILE = ".state.lock"
@@ -84,8 +86,8 @@ def _record_key(record: Mapping[str, Any]) -> tuple[float, int, str, str]:
 
 def _read_json(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = json.loads(read_text(path))
+    except (OSError, UnicodeError, RuntimeError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
 
@@ -96,8 +98,8 @@ def _read_history(root: Path) -> list[dict[str, Any]]:
         return []
     records: list[dict[str, Any]] = []
     try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeError):
+        lines = read_text(path).splitlines()
+    except (OSError, UnicodeError, RuntimeError):
         return []
     for line in lines:
         try:
@@ -182,9 +184,51 @@ def _next_sequence(root: Path) -> int:
 
 def write_task_state(*, role: str, chat_id: object, text: str, status: str, **extra: Any) -> str:
     """Write one state snapshot and append an immutable, ordered history event."""
-    root = _state_dir()
-    root.mkdir(parents=True, exist_ok=True)
-    task_id = _task_id(role, chat_id, text)
+    root = ensure_private_directory(_state_dir())
+    explicit_task_id = str(extra.get("task_id") or "")
+    if explicit_task_id and (
+        explicit_task_id in {".", ".."}
+        or any(char in explicit_task_id for char in "/\\\x00")
+    ):
+        raise ValueError("task_id must be a safe path component")
+    task_id = explicit_task_id or _task_id(role, chat_id, text)
+    record_extra = dict(extra)
+    if not explicit_task_id:
+        record_extra.pop("task_id", None)
+    if status in {"completed", "failed", "delivery_pending"} and "agent_message" not in record_extra:
+        # Shared-state consumers must never treat an unsigned provider result
+        # as peer evidence.  LaunchAgents provision the key; local/test runs
+        # without it remain valid task-state writes but are not consumable as
+        # trusted coordination results.
+        key_path = os.environ.get("EDGE_AGENT_MESSAGE_KEY_FILE", "").strip()
+        keyring_path = os.environ.get("EDGE_AGENT_MESSAGE_KEYRING_DIR", "").strip()
+        if key_path or keyring_path:
+            try:
+                from edge_agent_agent_message import AgentMessageKeyring, build_message, load_signing_key
+
+                sender = "roda" if role == "gemma" else role
+                summary = str(record_extra.get("response_tail") or record_extra.get("response_preview") or status)
+                if keyring_path:
+                    active_key_id, signing_key = AgentMessageKeyring(keyring_path).active_key()
+                else:
+                    active_key_id = os.environ.get("EDGE_AGENT_MESSAGE_KEY_ID", "agent-message-v1").strip() or "agent-message-v1"
+                    signing_key = load_signing_key(key_path)
+                envelope = build_message(
+                    session_id=f"telegram-{chat_id}",
+                    task_id=task_id,
+                    from_role=sender,
+                    to=("claude",),
+                    purpose="peer_result",
+                    summary=summary[-1600:],
+                    source_event_id=f"{task_id}-{status}",
+                    key_id=active_key_id,
+                    signing_key=signing_key,
+                )
+                record_extra["agent_message"] = envelope.to_dict()
+            except (OSError, ValueError, TypeError):
+                # The record remains useful for local lifecycle diagnostics,
+                # but the coordination reader will reject it as untrusted.
+                pass
     updated_at, updated_epoch = _now()
     record = _redact({
         "schema": "edge_agent.task_state_event.v2",
@@ -197,16 +241,16 @@ def write_task_state(*, role: str, chat_id: object, text: str, status: str, **ex
         "updated_at": updated_at,
         "updated_epoch": updated_epoch,
         "sequence": 0,
-        **extra,
+        **record_extra,
     })
     lock_path = root / LOCK_FILE
-    descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+    descriptor = open_lock(lock_path)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         record["sequence"] = _next_sequence(root)
         target = root / f"{task_id}.json"
         history = root / HISTORY_FILE
-        with history.open("a", encoding="utf-8") as stream:
+        with append_text(history) as stream:
             stream.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())

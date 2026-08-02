@@ -12,7 +12,7 @@ from skills.quota_resume import quota_resume
 
 def build_fallback_switch_preview(event: dict | None = None) -> dict:
     event = event or {}
-    return {
+    return quota_resume._redact({
         "preview_id": f"FALLBACK_{int(datetime.now().timestamp())}",
         "task_id": event.get("task_id") or "UNKNOWN_TASK",
         "event_id": event.get("event_id"),
@@ -25,7 +25,7 @@ def build_fallback_switch_preview(event: dict | None = None) -> dict:
         "auto_execute": False,
         "requires_user_review": True,
         "safe_policy": "preview_only_until_user_approval",
-    }
+    })
 
 
 def _store_path(base_dir: str | Path) -> Path:
@@ -34,28 +34,42 @@ def _store_path(base_dir: str | Path) -> Path:
 
 
 def _load(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {"previews": []}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {"previews": []}
-    except Exception:
-        return {"previews": []}
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"fallback preview state is unreadable: {path}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"fallback preview state must be an object: {path}")
+    return data
 
 
 def save_fallback_switch_preview(base_dir: str | Path, preview: dict) -> dict:
     path = _store_path(base_dir)
-    data = _load(path)
-    data.setdefault("previews", [])
-    data["previews"].append(dict(preview, auto_execute=False, requires_user_review=True))
-    data["updated_at"] = datetime.now().isoformat()
-    quota_resume._atomic_write_json(path, data)
-    return {"status": "success", "preview_id": preview.get("preview_id")}
+    safe_preview = quota_resume._redact(dict(preview, auto_execute=False, requires_user_review=True))
+
+    def update(data: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise ValueError(f"fallback preview state must be an object: {path}")
+        previews = data.setdefault("previews", [])
+        if not isinstance(previews, list):
+            raise ValueError(f"fallback preview list is invalid: {path}")
+        if any(isinstance(item, dict) and item.get("preview_id") == safe_preview.get("preview_id") for item in previews):
+            return {"status": "success", "preview_id": safe_preview.get("preview_id"), "duplicate": True}
+        previews.append(safe_preview)
+        data["updated_at"] = datetime.now().isoformat()
+        return {"status": "success", "preview_id": safe_preview.get("preview_id"), "duplicate": False}
+
+    result = quota_resume._locked_json_update(path, {"previews": []}, update)
+    return result
 
 
 def latest_pending_preview(base_dir: str | Path) -> dict | None:
     data = _load(_store_path(base_dir))
     for preview in reversed(data.get("previews", [])):
         if isinstance(preview, dict) and preview.get("status") in ("pending_approval", "preview_ready"):
-            return preview
+            return quota_resume._redact(preview)
     return None
 
 

@@ -37,11 +37,11 @@ class RouterContractTests(unittest.TestCase):
         self.assertEqual(decision.providers, (Provider.CODEX,))
 
 
-    def test_router_rejects_more_than_three_providers(self):
+    def test_router_rejects_more_than_four_providers(self):
         roles = tuple(RoleAssignment(RouterRole.WRITER, provider) for provider in (Provider.CODEX, Provider.GEMMA, Provider.ANTIGRAVITY))
         roles = roles + (RoleAssignment(RouterRole.REVIEWER, Provider.CLAUDE),)
-        with self.assertRaisesRegex(ValueError, "at most 3 providers"):
-            RouterDecision(TaskType.DOCUMENT, RiskLevel.MEDIUM, ExecutionMode.TEAM, roles)
+        decision = RouterDecision(TaskType.DOCUMENT, RiskLevel.MEDIUM, ExecutionMode.TEAM, roles)
+        self.assertEqual(len(decision.providers), 4)
 
 
 if __name__ == "__main__":

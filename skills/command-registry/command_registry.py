@@ -22,11 +22,27 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+import re
 
 DEFAULT_STORE = Path(
     os.environ.get("EDGE_AGENT_STATE_ROOT", "~/.edge-agent/state")
 ).expanduser().resolve() / "skills" / "command_registry_records.json"
 LOCK_TIMEOUT_SECONDS = 5.0
+SENSITIVE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b(?:ghp|github_pat)[_-][A-Za-z0-9_-]+\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:token|secret|password|api[_ -]?key|authorization)\s*[:=]\s*[^\s,'\"]+",
+        re.IGNORECASE,
+    ),
+)
+SENSITIVE_KEYS = {
+    "token", "secret", "password", "api_key", "authorization", "cookie",
+    "private_key", "client_secret", "access_token", "refresh_token", "credential",
+}
 
 
 def store_path() -> Path:
@@ -64,6 +80,27 @@ def normalize_command(command: str) -> str:
     return " ".join(command.strip().split())
 
 
+def is_sensitive_key(key: Any) -> bool:
+    return str(key).strip().casefold().replace("-", "_").replace(" ", "_") in SENSITIVE_KEYS
+
+
+def contains_sensitive(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in SENSITIVE_PATTERNS)
+    if isinstance(value, dict):
+        return any(is_sensitive_key(key) or contains_sensitive(key) or contains_sensitive(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(contains_sensitive(item) for item in value)
+    return False
+
+
+def redact_text(value: str) -> str:
+    redacted = value
+    for pattern in SENSITIVE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
 def default_store() -> dict[str, Any]:
     return {"verified": [], "blacklisted": []}
 
@@ -86,15 +123,20 @@ def load_store(path: Path | None = None) -> dict[str, Any]:
 
 
 def write_store(data: dict[str, Any], path: Path | None = None) -> None:
+    if contains_sensitive(data):
+        raise ValueError("command registry refuses sensitive values")
     path = path or store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
         tmp = Path(tmp_name)
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
                 f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         finally:
             if tmp.exists():
@@ -120,11 +162,13 @@ def _is_verified(data: dict[str, Any], command: str) -> bool:
 
 
 def check_command(command: str, *, path: Path | None = None) -> str:
+    if contains_sensitive(command):
+        raise ValueError("command registry refuses sensitive values")
     data = load_store(path)
     blacklisted = _blacklisted_entry(data, command)
     if blacklisted is not None:
         replacement = str(blacklisted.get("replacement", "")).strip()
-        return f"BLACKLISTED -> 대체: {replacement}" if replacement else "BLACKLISTED -> 대체: <none>"
+        return f"BLACKLISTED -> 대체: {redact_text(replacement)}" if replacement else "BLACKLISTED -> 대체: <none>"
     if _is_verified(data, command):
         return "VALID"
     return "UNKNOWN"
@@ -135,6 +179,8 @@ def update_success(command: str, *, path: Path | None = None) -> None:
     command = normalize_command(command)
     if not command:
         raise ValueError("command must not be empty")
+    if contains_sensitive(command):
+        raise ValueError("command registry refuses sensitive values")
     with file_lock(path):
         data = load_store(path)
         if not _is_verified(data, command):
@@ -151,6 +197,8 @@ def update_fail(command: str, reason: str, replacement: str, *, path: Path | Non
         raise ValueError("failed command must not be empty")
     if not replacement:
         raise ValueError("replacement command must not be empty")
+    if contains_sensitive((command, reason, replacement)):
+        raise ValueError("command registry refuses sensitive values")
     with file_lock(path):
         data = load_store(path)
         existing = _blacklisted_entry(data, command)
@@ -163,13 +211,18 @@ def update_fail(command: str, reason: str, replacement: str, *, path: Path | Non
 
 
 def write_store_without_lock(data: dict[str, Any], path: Path) -> None:
+    if contains_sensitive(data):
+        raise ValueError("command registry refuses sensitive values")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
     tmp = Path(tmp_name)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
             f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
     finally:
         if tmp.exists():

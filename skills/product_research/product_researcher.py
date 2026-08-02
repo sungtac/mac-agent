@@ -10,8 +10,12 @@ from __future__ import annotations
 
 import argparse
 import html
+import ipaddress
 import json
+import os
 import re
+import socket
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -20,6 +24,14 @@ from pathlib import Path
 from typing import Iterable
 
 USER_AGENT = "Mozilla/5.0 (product-researcher; Edge-Agent)"
+PUBLIC_SOURCE_HOSTS = frozenset({
+    "search.danawa.com",
+    "search.shopping.naver.com",
+    "www.coupang.com",
+    "search.naver.com",
+    "brand.naver.com",
+    "smartstore.naver.com",
+})
 ACCESSORY_TERMS = ("호환", "날개", "부품", "리모컨", "커버", "어댑터", "케이블", "충전기", "전용", "보호회로", "12.6v")
 
 CONFIDENCE_ORDER = {
@@ -56,10 +68,74 @@ class ProductCandidate:
     notes: str = ""
 
 
-def fetch_text(url: str, timeout: int = 20) -> tuple[int, str]:
+def fetch_text(url: str, timeout: int = 20, *, allowed_hosts: set[str] | frozenset[str] = PUBLIC_SOURCE_HOSTS) -> tuple[int, str]:
+    _validate_public_http_url(url, allowed_hosts=set(allowed_hosts))
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as res:  # noqa: S310 - public read-only fetch
-        return int(getattr(res, "status", 200)), res.read().decode("utf-8", "ignore")
+    opener = urllib.request.build_opener(_PublicRedirectHandler(allowed_hosts=set(allowed_hosts)))
+    with opener.open(req, timeout=timeout) as res:  # noqa: S310 - public read-only fetch
+        return int(getattr(res, "status", 200) or 200), res.read().decode("utf-8", "ignore")
+
+
+def _validate_public_http_url(url: str, *, allowed_hosts: set[str] | None = None) -> None:
+    """Reject non-HTTP and local/private destinations before fetching.
+
+    Product research accepts a user-supplied brand-store URL, so URL validation
+    belongs at the network boundary rather than only in the prompt contract.
+    The DNS result is checked as well as the literal hostname to block the usual
+    loopback/private-network SSRF targets.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("only http(s) public URLs are allowed")
+    if parsed.username or parsed.password:
+        raise ValueError("URL credentials are not allowed")
+    hostname = parsed.hostname.rstrip(".").casefold()
+    if allowed_hosts is not None and hostname not in {item.casefold() for item in allowed_hosts}:
+        raise ValueError(f"URL host is not allowed: {hostname}")
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(hostname, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)}
+    except OSError as exc:
+        raise ValueError(f"URL host could not be resolved: {hostname}") from exc
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            raise ValueError("private, loopback, link-local, or reserved destinations are not allowed")
+
+
+def _safe_display_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    if not parsed.username and not parsed.password:
+        return url
+    host = parsed.hostname or ""
+    if parsed.port:
+        host = f"{host}:{parsed.port}"
+    return urllib.parse.urlunsplit((parsed.scheme, f"[REDACTED]@{host}", parsed.path, parsed.query, parsed.fragment))
+
+
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+class _PublicRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def __init__(self, *, allowed_hosts: set[str] | None = None) -> None:
+        super().__init__()
+        self.allowed_hosts = set(PUBLIC_SOURCE_HOSTS) if allowed_hosts is None else allowed_hosts
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[no-untyped-def]
+        target = urllib.parse.urljoin(req.full_url, newurl)
+        _validate_public_http_url(target, allowed_hosts=self.allowed_hosts)
+        return super().redirect_request(req, fp, code, msg, headers, target)
 
 
 def clean_text(value: str) -> str:
@@ -180,7 +256,7 @@ def parse_danawa_html(query: str, url: str, text: str, limit: int = 12) -> list[
 def scrape_danawa(query: str, limit: int = 12) -> tuple[list[ProductCandidate], SourceProbe]:
     url = stable_search_urls(query)["danawa"]
     try:
-        status, text = fetch_text(url)
+        status, text = fetch_text(url, allowed_hosts={"search.danawa.com"})
     except Exception as exc:
         return [ProductCandidate(source="danawa", name=query, url=url, confidence="fetch_failed", link_status="stable_search_url_only", notes=f"fetch failed: {exc}")], SourceProbe("danawa", url, "fetch_failed", str(exc))
     return parse_danawa_html(query, url, text, limit), SourceProbe("danawa", url, f"http_{status}", "search page fetched and parsed")
@@ -188,6 +264,7 @@ def scrape_danawa(query: str, limit: int = 12) -> tuple[list[ProductCandidate], 
 
 def parse_naver_brand_html(store_url: str, keywords: Iterable[str], text: str, limit: int = 30, query: str = "") -> list[ProductCandidate]:
     candidates: list[ProductCandidate] = []
+    display_store_url = _safe_display_url(store_url)
     seen: set[str] = set()
     keyword_list = [k for k in keywords if k]
     for keyword in keyword_list:
@@ -217,7 +294,7 @@ def parse_naver_brand_html(store_url: str, keywords: Iterable[str], text: str, l
                 ProductCandidate(
                     source="naver_brand",
                     name=name,
-                    url=f"{store_url.rstrip('/')}/products/{product_no}",
+                    url=f"{display_store_url.rstrip('/')}/products/{product_no}",
                     price=sale_price,
                     conditional_price=condition_price,
                     condition="Official store page data shows discounted/mobile price; login, coupon ownership, store-follow, membership, card, and checkout state are not verified." if condition_price else "",
@@ -231,12 +308,17 @@ def parse_naver_brand_html(store_url: str, keywords: Iterable[str], text: str, l
             )
             if len(candidates) >= limit:
                 return candidates
-    return candidates or [ProductCandidate(source="naver_brand", name=" ".join(keyword_list), url=store_url, confidence="search_path_only", link_status="stable_store_url_only", notes="no matching product data parsed")]
+    return candidates or [ProductCandidate(source="naver_brand", name=" ".join(keyword_list), url=display_store_url, confidence="search_path_only", link_status="stable_store_url_only", notes="no matching product data parsed")]
 
 
 def scrape_naver_brand(store_url: str, keywords: Iterable[str], limit: int = 30) -> tuple[list[ProductCandidate], SourceProbe]:
+    display_url = _safe_display_url(store_url)
     try:
-        status, text = fetch_text(store_url)
+        _validate_public_http_url(store_url, allowed_hosts={"brand.naver.com", "smartstore.naver.com"})
+    except ValueError as exc:
+        return [ProductCandidate(source="naver_brand", name=" ".join(keywords), url=display_url, confidence="fetch_failed", link_status="stable_store_url_only", notes=f"URL rejected: {exc}")], SourceProbe("naver_brand", display_url, "url_rejected", str(exc))
+    try:
+        status, text = fetch_text(store_url, allowed_hosts={"brand.naver.com", "smartstore.naver.com"})
     except Exception as exc:
         return [ProductCandidate(source="naver_brand", name=" ".join(keywords), url=store_url, confidence="fetch_failed", link_status="stable_store_url_only", notes=f"fetch failed: {exc}")], SourceProbe("naver_brand", store_url, "fetch_failed", str(exc))
     keyword_list = list(keywords)
@@ -329,8 +411,7 @@ def write_markdown(path: Path, payload: dict[str, object]) -> None:
     lines.extend(["", "## Caveats"])
     for caveat in summary["caveats"]:
         lines.append(f"- {caveat}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    _atomic_write_text(path, "\n".join(lines) + "\n")
 
 
 def run_research(query: str, naver_brand_url: str = "", keywords: list[str] | None = None, probe_all: bool = True) -> dict[str, object]:
@@ -377,8 +458,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.out:
         out = Path(args.out)
         if out.suffix.lower() == ".json":
-            out.parent.mkdir(parents=True, exist_ok=True)
-            out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            _atomic_write_text(out, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
         else:
             write_markdown(out, payload)
     if args.json:

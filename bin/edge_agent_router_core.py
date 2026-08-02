@@ -51,6 +51,7 @@ _HIGH_RISK_WORDS = ("토큰", "secret", "비밀번호", "삭제", "커밋", "푸
 _SENSITIVE_REVIEW_WORDS = ("계약", "법률", "재무", "보안", "개인정보")
 _MUTATION_WORDS = ("수정", "변경", "추가", "삭제", "구현", "고쳐", "작성", "만들")
 _TEAM_WORDS = ("각각", "여러", "다수", "독립", "교차", "비교", "검토까지", "분석해서", "통합", "누락")
+_DELIBERATION_WORDS = ("논의", "토론", "각자 의견", "너희들이", "실현 가능한 대화", "회의")
 _CLAUDE_FORBID = ("claude는 사용하지", "클로드는 사용하지", "claude 없이", "클로드 없이", "no claude")
 
 
@@ -127,6 +128,19 @@ def _default_roles(task_type: TaskType, mode: ExecutionMode, providers: tuple[Pr
             TaskType.EXPLANATION: RouterRole.EXPLAINER,
         }.get(task_type, RouterRole.WRITER)
         return (RoleAssignment(role, selected),)
+    if mode == ExecutionMode.TEAM:
+        # Four independent first-pass roles plus a Claude integration node.
+        # The coordinator is a logical control-plane role, not a fifth model.
+        return (
+            RoleAssignment(RouterRole.SOURCE_EXTRACTOR, Provider.GEMMA),
+            RoleAssignment(RouterRole.RESEARCHER, Provider.ANTIGRAVITY),
+            RoleAssignment(RouterRole.IMPLEMENTER, Provider.CODEX),
+            RoleAssignment(
+                RouterRole.INTEGRATOR,
+                Provider.CLAUDE,
+                ("source_extractor", "researcher", "implementer"),
+            ),
+        )
     if mode == ExecutionMode.SINGLE:
         defaults = {
             TaskType.RESEARCH: (RoleAssignment(RouterRole.RESEARCHER, Provider.ANTIGRAVITY),),
@@ -176,6 +190,8 @@ def _execution_mode(text: str, task_type: TaskType, attachment_count: int, expli
     if len(explicit_roles) >= 3 or attachment_count >= 3:
         return ExecutionMode.TEAM
     lowered = normalize_text(text).casefold()
+    if any(word.casefold() in lowered for word in _DELIBERATION_WORDS):
+        return ExecutionMode.TEAM
     review_plus_write = any(word in lowered for word in ("작성", "작성하고", "개선", "수정")) and any(word in lowered for word in ("검토", "리뷰", "검증"))
     team_signal = any(word.casefold() in lowered for word in _TEAM_WORDS)
     improvement_signal = any(word in lowered for word in ("개선", "보완", "부족한", "향상"))

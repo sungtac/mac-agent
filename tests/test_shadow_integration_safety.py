@@ -97,6 +97,17 @@ class ShadowIntegrationSafetyTests(unittest.TestCase):
             for path in (store.database_path, store.event_log_path, store.manifest_path):
                 self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
 
+    def test_managed_shadow_symlinks_are_rejected(self):
+        for managed_name in ("shadow.db", "shadow-events.jsonl", "manifest.yaml", "rotation.lock"):
+            with self.subTest(managed_name=managed_name), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp) / "shadow"
+                root.mkdir(mode=0o700)
+                outside = Path(temp) / f"outside-{managed_name}"
+                outside.write_text("outside", encoding="utf-8")
+                (root / managed_name).symlink_to(outside)
+                with self.assertRaises(ShadowEventError):
+                    ShadowEventStore(root)
+
 
 if __name__ == "__main__":
     unittest.main()

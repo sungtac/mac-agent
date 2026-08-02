@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import fcntl
 import subprocess
 import tempfile
 import unittest
@@ -13,6 +14,10 @@ PROTECTED_TARGET = PROTECTED_ROOT / ".edge-agent-canary-probe"
 
 class ProviderSandboxCanaryTests(unittest.TestCase):
     def setUp(self):
+        lock_path = Path.home() / ".edge-agent" / "protected-canary.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self._fixture_lock = lock_path.open("a+")
+        fcntl.flock(self._fixture_lock.fileno(), fcntl.LOCK_EX)
         PROTECTED_ROOT.mkdir(parents=True, exist_ok=True)
 
     def tearDown(self):
@@ -20,6 +25,8 @@ class ProviderSandboxCanaryTests(unittest.TestCase):
             PROTECTED_ROOT.rmdir()
         except OSError:
             pass
+        fcntl.flock(self._fixture_lock.fileno(), fcntl.LOCK_UN)
+        self._fixture_lock.close()
 
     def _make_worktree(self, temp_dir: str) -> Path:
         root = Path(temp_dir) / "repo"

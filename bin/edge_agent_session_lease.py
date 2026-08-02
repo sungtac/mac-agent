@@ -14,7 +14,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator
 
+from edge_agent_provenance import sign_provenance, verify_provenance
 from edge_agent_session_contract import _check_safe_text, _require_id
+from edge_agent_secure_paths import ensure_private_directory, open_lock, read_text
 
 
 class SessionLeaseBusy(RuntimeError):
@@ -38,6 +40,8 @@ class SessionLease:
     acquired_at: str
     expires_at: str
     state: str = "active"
+    key_id: str = ""
+    signature: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -46,8 +50,9 @@ class SessionLease:
 class SessionLeaseManager:
     """OS-backed lease; stale metadata never blocks a new flock owner."""
 
-    def __init__(self, root: str | Path | None = None):
-        self.root = Path(root or Path.home() / ".edge-agent" / "sessions" / "leases").expanduser().resolve()
+    def __init__(self, root: str | Path | None = None, *, provenance_key_path: str | Path | None = None):
+        self.root = ensure_private_directory(Path(root or Path.home() / ".edge-agent" / "sessions" / "leases").expanduser())
+        self.provenance_key_path = provenance_key_path
 
     def _paths(self, session_id: str) -> tuple[Path, Path]:
         safe = _require_id("logical_session_id", session_id)
@@ -55,7 +60,7 @@ class SessionLeaseManager:
 
     @staticmethod
     def _write_metadata(path: Path, payload: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(path.parent)
         descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -80,8 +85,7 @@ class SessionLeaseManager:
             raise ValueError("ttl_seconds must be between 1 and 86400")
 
         lock_path, metadata_path = self._paths(session_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = open_lock(lock_path)
         lease: SessionLease | None = None
         try:
             try:
@@ -98,6 +102,10 @@ class SessionLeaseManager:
                 acquired_at=_iso(acquired),
                 expires_at=_iso(acquired + timedelta(seconds=ttl_seconds)),
             )
+            active_payload = lease.to_dict()
+            active_payload["key_id"] = os.environ.get("EDGE_AGENT_MESSAGE_KEY_ID", "agent-message-v1").strip() or "agent-message-v1"
+            key_id, signature = sign_provenance("session_lease", active_payload, key_path=self.provenance_key_path, key_id=active_payload["key_id"])
+            lease = SessionLease(**{**active_payload, "key_id": key_id, "signature": signature})
             self._write_metadata(metadata_path, lease.to_dict())
             yield lease
         finally:
@@ -105,6 +113,8 @@ class SessionLeaseManager:
                 released = lease.to_dict()
                 released["state"] = "released"
                 released["released_at"] = _iso(_now())
+                released["signature"] = ""
+                released["key_id"], released["signature"] = sign_provenance("session_lease", released, key_path=self.provenance_key_path, key_id=str(released.get("key_id", "")))
                 self._write_metadata(metadata_path, released)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -114,7 +124,15 @@ class SessionLeaseManager:
     def current_metadata(self, session_id: str) -> dict | None:
         _, metadata_path = self._paths(session_id)
         try:
-            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
-        except (FileNotFoundError, json.JSONDecodeError):
+            payload = json.loads(read_text(metadata_path))
+        except (FileNotFoundError, OSError, RuntimeError, json.JSONDecodeError):
             return None
-        return payload if isinstance(payload, dict) else None
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("signature"):
+            signature = str(payload.pop("signature"))
+            try:
+                verify_provenance("session_lease", payload, key_id=str(payload.get("key_id", "")), signature=signature, key_path=self.provenance_key_path)
+            finally:
+                payload["signature"] = signature
+        return payload

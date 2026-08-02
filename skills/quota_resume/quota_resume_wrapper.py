@@ -11,10 +11,12 @@ from skills.quota_resume import quota_resume
 
 
 def _load_json(path: Path, default: Any) -> Any:
+    if not path.exists():
+        return default
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return default
+    except (OSError, ValueError, TypeError) as exc:
+        raise ValueError(f"quota resume state is unreadable: {path}") from exc
 
 
 def _context_packet(base_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
@@ -43,7 +45,7 @@ def _context_packet(base_dir: Path, task: dict[str, Any]) -> dict[str, Any]:
         "",
         "이 문서는 재개 검토용이며 자동 실행을 승인하지 않습니다.",
     ]) + "\n"
-    markdown_path.write_text(markdown, encoding="utf-8")
+    quota_resume._atomic_write_text(markdown_path, markdown)
     return {"json_path": str(json_path), "markdown_path": str(markdown_path)}
 
 
@@ -70,22 +72,26 @@ def build_ready_resume_previews(base_dir: str | Path) -> dict[str, Any]:
     ready = quota_resume.ready_queue_items(base)
     active = quota_resume.load_active_task(base)
     previews_path = quota_resume.state_dir(base) / "resume_previews.json"
-    store = _load_json(previews_path, {"previews": []})
-    if not isinstance(store, dict):
-        store = {"previews": []}
-    store.setdefault("previews", [])
-    existing = {(p.get("task_id"), p.get("event_id")) for p in store["previews"] if isinstance(p, dict)}
     built = []
     for item in ready:
         key = (item.get("task_id"), item.get("event_id"))
-        if key in existing:
-            continue
         preview = _preview_from_item(base, item, active)
-        store["previews"].append(preview)
-        built.append(preview)
+        def add_preview(store: Any) -> dict[str, Any] | None:
+            if not isinstance(store, dict):
+                raise ValueError(f"quota resume preview state must be an object: {previews_path}")
+            previews = store.setdefault("previews", [])
+            if not isinstance(previews, list):
+                raise ValueError(f"quota resume preview list is invalid: {previews_path}")
+            if any(isinstance(existing, dict) and (existing.get("task_id"), existing.get("event_id")) == key for existing in previews):
+                return None
+            previews.append(preview)
+            store["updated_at"] = datetime.now().isoformat()
+            return preview
+
+        added = quota_resume._locked_json_update(previews_path, {"previews": []}, add_preview)
+        if added is not None:
+            built.append(added)
         quota_resume.update_resume_queue_item_status(base, str(item.get("task_id")), "preview_ready", event_id=item.get("event_id"))
-    store["updated_at"] = datetime.now().isoformat()
-    quota_resume._atomic_write_json(previews_path, store)
     return {
         "status": "success",
         "preview_count": len(built),
@@ -99,7 +105,7 @@ def build_ready_resume_previews(base_dir: str | Path) -> dict[str, Any]:
 
 def list_resume_previews(base_dir: str | Path) -> list[dict[str, Any]]:
     data = _load_json(quota_resume.state_dir(base_dir) / "resume_previews.json", {"previews": []})
-    return [item for item in data.get("previews", []) if isinstance(item, dict)] if isinstance(data, dict) else []
+    return [quota_resume._redact(item) for item in data.get("previews", []) if isinstance(item, dict)] if isinstance(data, dict) else []
 
 
 def render_resume_list(base_dir: str | Path) -> str:

@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from edge_agent_secure_paths import ensure_private_directory, read_text
+
 
 SCHEMA = "edge_agent.telegram_delivery.v1"
 DEFAULT_ROOT = Path(
@@ -52,7 +54,7 @@ def _safe_id(value: object) -> str:
 
 def _root(root: str | Path | None = None) -> Path:
     configured = os.environ.get("EDGE_AGENT_TELEGRAM_DELIVERY_ROOT") if root is None else None
-    return Path(root or configured or DEFAULT_ROOT).expanduser().resolve()
+    return ensure_private_directory(Path(root or configured or DEFAULT_ROOT).expanduser())
 
 
 def _path(delivery_id: str, root: str | Path | None = None) -> Path:
@@ -60,8 +62,7 @@ def _path(delivery_id: str, root: str | Path | None = None) -> Path:
 
 
 def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(path.parent, 0o700)
+    ensure_private_directory(path.parent)
     descriptor, temporary = tempfile.mkstemp(prefix=".delivery-", dir=path.parent)
     try:
         os.fchmod(descriptor, 0o600)
@@ -81,10 +82,10 @@ def _atomic_write(path: Path, payload: dict[str, Any]) -> None:
 
 def _read(path: Path) -> dict[str, Any]:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(read_text(path))
     except FileNotFoundError:
         raise DeliveryStoreError(f"delivery record not found: {path.stem}") from None
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, RuntimeError, json.JSONDecodeError) as exc:
         raise DeliveryStoreError(f"delivery record is corrupt: {path}") from exc
     if not isinstance(payload, dict) or payload.get("schema") != SCHEMA:
         raise DeliveryStoreError(f"unsupported delivery schema: {path}")
@@ -176,7 +177,7 @@ def list_pending_deliveries(
     if not directory.is_dir():
         return []
     result: list[dict[str, Any]] = []
-    for path in sorted(directory.glob("*.json"), key=lambda item: item.stat().st_mtime):
+    for path in sorted(directory.glob("*.json"), key=lambda item: item.lstat().st_mtime):
         payload = load_delivery(path.stem, root=directory)
         if payload.get("status") != "pending":
             continue

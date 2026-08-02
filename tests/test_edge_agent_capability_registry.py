@@ -24,6 +24,14 @@ class CapabilityRegistryTests(unittest.TestCase):
         result = resolve("코드 리뷰와 검증을 해줘", max_chars=1200)
         self.assertLessEqual(len(result.context), 1200)
         self.assertIn("edge-agent-behavior", result.capability_ids)
+        self.assertIn("truncated: incomplete skill contract", result.context)
+
+    def test_english_triggers_and_catalog_id_are_supported(self):
+        self.assertIn("code-review", select_skill_ids("Please do a code review of this diff"))
+        self.assertIn("product_research", select_skill_ids("Recommend a product at the lowest price"))
+        self.assertIn("harness-memory", select_skill_ids("Debug this test failure"))
+        self.assertIn("hermes_runtime", select_skill_ids("Check Hermes lifecycle status"))
+        self.assertIn("roda-public-search", select_skill_ids("Find public sources for this company"))
 
     def test_provider_argv_preserves_flags_and_replaces_only_prompt(self):
         args = ["claude", "-p", "최저가 제품 추천해줘", "--output-format", "text"]

@@ -39,6 +39,19 @@ class SessionLeaseTests(unittest.TestCase):
                 with manager.acquire("sess-1", "terminal", ttl_seconds=0):
                     pass
 
+    def test_signed_lease_metadata_is_verifiable(self):
+        with tempfile.TemporaryDirectory() as temp:
+            key = Path(temp) / "lease.key"
+            key.write_bytes(b"session-lease-key-with-more-than-16-bytes")
+            key.chmod(0o600)
+            manager = SessionLeaseManager(Path(temp) / "leases", provenance_key_path=key)
+            with manager.acquire("signed", "terminal") as lease:
+                self.assertTrue(lease.signature)
+                self.assertTrue(manager.current_metadata("signed")["signature"])
+            released = manager.current_metadata("signed")
+            self.assertEqual(released["state"], "released")
+            self.assertTrue(released["signature"])
+
 
 if __name__ == "__main__":
     unittest.main()

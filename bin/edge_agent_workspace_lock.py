@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Iterator
 
 from edge_agent_locks import canonical_repository_root
+from edge_agent_secure_paths import ensure_private_directory, open_lock
 
 
 REPO_LOCK_DIR = Path.home() / ".claude" / "discord-bot" / "repo-locks"
@@ -29,8 +30,8 @@ def repo_lock_path(resolved_path: str | Path) -> Path:
 
 @contextlib.contextmanager
 def try_acquire_repo_lock(resolved_path: str | Path) -> Iterator[None]:
-    REPO_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(repo_lock_path(resolved_path)), os.O_CREAT | os.O_RDWR, 0o600)
+    ensure_private_directory(REPO_LOCK_DIR)
+    fd = open_lock(repo_lock_path(resolved_path))
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -47,8 +48,8 @@ def try_acquire_repo_lock(resolved_path: str | Path) -> Iterator[None]:
 @contextlib.asynccontextmanager
 async def acquire_repo_lock(resolved_path: str | Path, *, wait_seconds: int = 1800, on_wait=None):
     """Wait for the same lock used by synchronous terminal/Discord callers."""
-    REPO_LOCK_DIR.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(repo_lock_path(resolved_path)), os.O_CREAT | os.O_RDWR, 0o600)
+    ensure_private_directory(REPO_LOCK_DIR)
+    fd = open_lock(repo_lock_path(resolved_path))
     acquired = False
     try:
         deadline = time.monotonic() + max(1, int(wait_seconds))

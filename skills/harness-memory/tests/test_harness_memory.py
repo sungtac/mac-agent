@@ -75,10 +75,41 @@ def test_module_parse_steps_requires_array() -> None:
         raise AssertionError("expected ValueError")
 
 
+def test_sensitive_values_are_rejected_and_legacy_output_is_redacted() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "memory.json"
+        secret = "password=super-secret-value"
+        proc = run_cli(store, "add_success", "2026-06-18", "bad", '["keep"]', secret)
+        assert proc.returncode != 0
+        assert secret not in proc.stderr
+        assert not store.exists()
+
+        store.write_text(
+            '[{"type":"success","date":"2026-06-18","situation":"legacy token=sk-1234567890abcdef","steps":[],"result":"done"}]\n',
+            encoding="utf-8",
+        )
+        proc = run_cli(store, "search", "legacy")
+        assert proc.returncode == 0, proc.stderr
+        assert "sk-1234567890abcdef" not in proc.stdout
+        assert "[REDACTED]" in proc.stdout
+
+        proc = run_cli(store, "add_fail", "2026-06-18", "local", '["http://127.0.0.1:8080"]', "failed")
+        assert proc.returncode != 0
+
+        proc = run_cli(store, "add_success", "2026-06-18", "short key", '["sk-test"]', "failed")
+        assert proc.returncode != 0
+
+        store.write_text('[{"type":"success","api_key":"short-value","situation":"legacy"}]\n', encoding="utf-8")
+        proc = run_cli(store, "search", "legacy")
+        assert "short-value" not in proc.stdout
+        assert "[REDACTED]" in proc.stdout
+
+
 def main() -> int:
     test_search_and_query_alias()
     test_add_fail_and_invalid_steps_are_safe()
     test_module_parse_steps_requires_array()
+    test_sensitive_values_are_rejected_and_legacy_output_is_redacted()
     print("PASS: harness-memory tests")
     return 0
 

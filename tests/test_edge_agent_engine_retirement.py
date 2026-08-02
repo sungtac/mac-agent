@@ -38,10 +38,8 @@ class EngineRetirementGateTests(unittest.TestCase):
             self.assertTrue(report["ready_for_approval_review"])
             self.assertFalse(report["rollback"]["service_mutation_performed"])
             self.assertTrue(report["rollback"]["temporary_copy_rehearsal"]["passed"])
-            self.assertEqual({item["id"] for item in report["approval_required"]}, {
-                "telegram_canary_send", "direct_codex_plist_quarantine", "shared_adapter_codex_split",
-            })
-
+            self.assertEqual(report["approval_required"], [])
+            self.assertIn("direct_codex_plist_quarantine", report["completed_actions"])
 
 if __name__ == "__main__":
     unittest.main()

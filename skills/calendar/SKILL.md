@@ -43,4 +43,4 @@ For Telegram, use compact bullet cards, not markdown tables.
 
 ## Quality follow-up
 
-Run `python3 scripts/skill_quality_audit.py --skill <this-skill> --run-tests --json` after creating or changing this skill.
+Run `PYTHONPATH=. python3 skills/calendar/tests/test_calendar.py` after creating or changing this skill.

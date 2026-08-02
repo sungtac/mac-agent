@@ -109,8 +109,8 @@ class RouterDecision:
         roles = tuple(self.roles)
         if not roles or len(roles) > 6:
             raise ValueError("roles must contain 1 to 6 assignments")
-        if len({item.provider for item in roles}) > 3:
-            raise ValueError("a plan may use at most 3 providers")
+        if len({item.provider for item in roles}) > 4:
+            raise ValueError("a plan may use at most 4 providers")
         if self.claude_required and self.claude_forbidden:
             raise ValueError("claude cannot be both required and forbidden")
         object.__setattr__(self, "roles", roles)

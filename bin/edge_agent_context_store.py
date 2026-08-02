@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Iterator, Mapping
 
 from edge_agent_session_contract import LogicalSession, Provider, SessionChannel, SessionStatus, load_logical_session
+from edge_agent_secure_paths import append_text, ensure_private_directory, open_lock, read_text
 
 
 EVENT_SCHEMA = "edge_agent.context_event.v1"
@@ -60,7 +61,7 @@ def _contains_sensitive(value: Any) -> bool:
 
 
 def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
@@ -80,22 +81,25 @@ class ContextStore:
     """Persist session snapshots and bounded handoff events under one root."""
 
     def __init__(self, root: str | Path | None = None, *, max_context_chars: int = DEFAULT_MAX_CONTEXT_CHARS):
-        self.root = Path(root or Path.home() / ".edge-agent" / "sessions").expanduser().resolve()
+        self.root = Path(root or Path.home() / ".edge-agent" / "sessions").expanduser()
         self.max_context_chars = max(1000, int(max_context_chars))
 
     def _paths(self, session_id: str) -> tuple[Path, Path, Path]:
+        ensure_private_directory(self.root)
         safe = _safe_component(session_id)
+        snapshot_root = ensure_private_directory(self.root / "snapshots")
+        event_root = ensure_private_directory(self.root / "events")
+        lock_root = ensure_private_directory(self.root / "locks")
         return (
-            self.root / "snapshots" / f"{safe}.json",
-            self.root / "events" / f"{safe}.jsonl",
-            self.root / "locks" / f"{safe}.lock",
+            snapshot_root / f"{safe}.json",
+            event_root / f"{safe}.jsonl",
+            lock_root / f"{safe}.lock",
         )
 
     @contextlib.contextmanager
     def _locked(self, session_id: str) -> Iterator[None]:
         _, _, lock_path = self._paths(session_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = open_lock(lock_path)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
@@ -124,8 +128,7 @@ class ContextStore:
             "payload": dict(payload),
         }
         _, event_path, _ = self._paths(session.logical_session_id)
-        event_path.parent.mkdir(parents=True, exist_ok=True)
-        with event_path.open("a", encoding="utf-8") as stream:
+        with append_text(event_path) as stream:
             stream.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
             stream.flush()
             os.fsync(stream.fileno())
@@ -143,7 +146,7 @@ class ContextStore:
     def load(self, session_id: str) -> LogicalSession:
         snapshot_path, _, _ = self._paths(session_id)
         try:
-            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+            payload = json.loads(read_text(snapshot_path))
         except FileNotFoundError:
             raise FileNotFoundError(f"logical session not found: {session_id}") from None
         except json.JSONDecodeError as exc:
@@ -168,6 +171,7 @@ class ContextStore:
         include_failed: bool = True,
     ) -> list[LogicalSession]:
         """List snapshots ordered by explicit ``updated_at`` metadata."""
+        ensure_private_directory(self.root)
         selected_provider = Provider(provider).value if provider is not None else ""
         selected_channel = SessionChannel(channel).value if channel is not None else ""
         sessions: list[LogicalSession] = []
@@ -253,7 +257,7 @@ class ContextStore:
         if not event_path.exists():
             return []
         events = []
-        for line in event_path.read_text(encoding="utf-8").splitlines():
+        for line in read_text(event_path).splitlines():
             try:
                 event = json.loads(line)
             except json.JSONDecodeError as exc:

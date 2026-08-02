@@ -13,7 +13,7 @@
 |---|---|---|---|
 | Telegram Claude/Anti provider CLI 및 하위 도구 | `~/.edge-agent-worktrees/telegram-bootstrap` | Edge Agent worktree에서 실행 | 현재 정책에 포함 |
 | Telegram Codex canonical engine | `/Users/edge_ai/tools/multi-agent-starter/engine-repo` 및 `~/.edge-agent/state/multiagent-engine/` | `com.multiagent.engine` 단일 poller, Edge Agent sandbox·preflight 기준 | Codex token 정본 |
-| Telegram 직접 Codex adapter | `/Users/edge_ai/mac-agent/bin/telegram-agent-bot.py` 및 기존 plist | LaunchAgent `Disabled=true`, 소스·테스트 보존 | 패리티 확인 전 quarantine |
+| Telegram 직접 Codex adapter | `/Users/edge_ai/mac-agent/bin/telegram-agent-bot.py` 및 retired plist | LaunchAgent에서 제거, plist는 `~/.edge-agent/retired-launchagents/2026-08-02/`에 mode 0600 quarantine | canonical engine 전환 완료, shared adapter는 Claude·Antigravity가 사용 |
 | Discord Claude/Codex의 provider CLI 및 하위 도구 | 위와 동일 | 2026-08-02 LaunchAgent bootout + Disabled | 퇴역·quarantine 보존, active 정책에서 제외 |
 | Telegram 봇 프로세스 자체 | `~/.claude/hooks-state/`, `repo-locks/`, singleton lock | sandbox 바깥 | 운영 상태·재시작에 필요 |
 | Claude Stop hook·주간보고 등 사용자 세션/launchd 보조 작업 | `~/.claude/hooks-state/*`, `verify-task-v2-history.jsonl` 등 | sandbox 바깥 | provider 경계와 별도 감사 필요 |

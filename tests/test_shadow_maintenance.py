@@ -2,6 +2,8 @@ from pathlib import Path
 import os
 import shutil
 import sys
+import json
+import subprocess
 import tempfile
 import unittest
 
@@ -69,6 +71,18 @@ class ShadowMaintenanceTests(unittest.TestCase):
     def test_generated_health_permissions_are_private(self):
         self.maintenance.write_health_snapshot()
         self.assertEqual(os.stat(self.maintenance.health_path).st_mode & 0o777, 0o600)
+
+    def test_maintenance_cli_emits_status(self):
+        result = subprocess.run(
+            [sys.executable, str(ROOT / "bin" / "edge_agent_shadow_maintenance.py"),
+             "--root", str(self.store.root), "status", "--json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        payload = json.loads(result.stdout)
+        self.assertIn("sqlite_bytes", payload)
+        self.assertTrue(self.maintenance.health_path.exists())
 
     def test_canary_defaults_are_safe(self):
         config = ShadowCanaryConfig()

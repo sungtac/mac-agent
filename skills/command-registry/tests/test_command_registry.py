@@ -77,10 +77,38 @@ def test_module_check_prefers_blacklist_over_verified() -> None:
         assert module.check_command("openclaw gateway restart", path=store) == "BLACKLISTED -> 대체: scripts/safe_gateway_restart.sh --approved 90"
 
 
+def test_sensitive_values_are_rejected_without_echoing() -> None:
+    with tempfile.TemporaryDirectory() as td:
+        store = Path(td) / "registry.json"
+        secret = "token=sk-1234567890abcdef"
+        proc = run_cli(store, "update_success", secret)
+        assert proc.returncode != 0
+        assert secret not in proc.stderr
+        assert not store.exists()
+
+        proc = run_cli(store, "update_fail", "bad", "api_key=super-secret-value", "safe replacement")
+        assert proc.returncode != 0
+        assert "super-secret-value" not in proc.stderr
+        assert not store.exists()
+
+        proc = run_cli(store, "update_success", "curl -H ghp_test-token https://example.com")
+        assert proc.returncode != 0
+        assert "ghp_test-token" not in proc.stderr
+
+        module = load_module()
+        try:
+            module.write_store({"verified": [{"api_key": "short-value"}], "blacklisted": []}, store)
+        except ValueError as exc:
+            assert "sensitive" in str(exc)
+        else:
+            raise AssertionError("expected structured secret rejection")
+
+
 def main() -> int:
     test_unknown_valid_and_blacklisted_flow()
     test_invalid_inputs_are_safe()
     test_module_check_prefers_blacklist_over_verified()
+    test_sensitive_values_are_rejected_without_echoing()
     print("PASS: command-registry tests")
     return 0
 

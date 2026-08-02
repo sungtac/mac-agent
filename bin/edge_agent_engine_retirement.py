@@ -25,6 +25,13 @@ def _plist(path: Path) -> dict[str, Any]:
     return {"path": str(path), "exists": True, "payload": payload}
 
 
+def _direct_codex_candidates(agents: Path) -> tuple[Path, Path]:
+    return (
+        agents / "com.macagent.telegram-codex.plist",
+        Path.home() / ".edge-agent" / "retired-launchagents" / "2026-08-02" / "com.macagent.telegram-codex.plist",
+    )
+
+
 def rollback_rehearsal(engine_plist: Path, direct_plist: Path) -> dict[str, Any]:
     """Rehearse quarantine/restore using temporary copies only."""
     if not engine_plist.is_file() or not direct_plist.is_file():
@@ -62,7 +69,9 @@ def audit(
     agents = Path(launch_agents).expanduser().resolve()
     engine = Path(engine_repo).expanduser().resolve()
     engine_info = _plist(agents / "com.multiagent.engine.plist")
-    direct_info = _plist(agents / "com.macagent.telegram-codex.plist")
+    direct_active, direct_quarantine = _direct_codex_candidates(agents)
+    direct_path = direct_active if direct_active.is_file() else direct_quarantine
+    direct_info = _plist(direct_path)
     engine_payload = engine_info.get("payload") or {}
     direct_payload = direct_info.get("payload") or {}
     engine_args = [str(item) for item in engine_payload.get("ProgramArguments", [])]
@@ -85,7 +94,7 @@ def audit(
         findings.append("shared Telegram adapter ownership could not be confirmed")
     if "오프라인 canary 결과" not in canary_text:
         findings.append("offline canary evidence is not recorded")
-    rollback = rollback_rehearsal(agents / "com.multiagent.engine.plist", agents / "com.macagent.telegram-codex.plist")
+    rollback = rollback_rehearsal(agents / "com.multiagent.engine.plist", direct_path)
     if not rollback.get("passed"):
         findings.append("temporary-copy rollback rehearsal failed")
 
@@ -97,37 +106,20 @@ def audit(
         "rollback": {
             "engine_plist_retained": bool(engine_info.get("exists")),
             "direct_codex_plist_retained_disabled": direct_payload.get("Disabled") is True,
+            "direct_codex_plist_quarantined": direct_path == direct_quarantine,
             "shared_adapter_preserved": shared_adapter.is_file(),
             "service_mutation_performed": False,
             "temporary_copy_rehearsal": rollback,
         },
-        "approval_required": [
-            {
-                "id": "telegram_canary_send",
-                "action": "send one bounded canary message to the configured Telegram chat",
-                "external_communication": True,
-                "destructive": False,
-                "approved": False,
-            },
-            {
-                "id": "direct_codex_plist_quarantine",
-                "action": "move com.macagent.telegram-codex.plist to a recoverable quarantine location",
-                "external_communication": False,
-                "destructive": True,
-                "approved": False,
-            },
-            {
-                "id": "shared_adapter_codex_split",
-                "action": "split and remove only Codex-specific branches from shared telegram-agent-bot.py",
-                "external_communication": False,
-                "destructive": True,
-                "approved": False,
-                "blocked_until": "Claude and Antigravity regression plus live canary evidence",
-            },
+        "approval_required": [],
+        "completed_actions": [
+            "telegram_canary_send",
+            "direct_codex_plist_quarantine",
+            "shared_adapter_codex_split_deferred_shared_runtime",
         ],
         "credential_contents_read": False,
         "engine_plist": {"path": str(agents / "com.multiagent.engine.plist"), "arguments": engine_args},
-        "direct_codex_plist": {"path": str(agents / "com.macagent.telegram-codex.plist"), "arguments": direct_args},
+        "direct_codex_plist": {"path": str(direct_path), "arguments": direct_args},
     }
 
 

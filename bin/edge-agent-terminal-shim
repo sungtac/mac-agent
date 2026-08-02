@@ -52,7 +52,19 @@ fi
 set +e
 case "$ROLE" in
   claude)
-    "$REAL" "$@" --append-system-prompt "$CONTEXT"
+    # Management subcommands do not start a model session. Appending the
+    # session-context flag to them makes otherwise valid commands such as
+    # `claude auth status` fail with "unknown option --append-system-prompt".
+    # Pass those commands through untouched; only an interactive/model
+    # invocation receives the bounded context.
+    case "${1:-}" in
+      auth|agents|doctor|help|install|mcp|plugin|update|uninstall|--help|-h|--version|-v)
+        "$REAL" "$@"
+        ;;
+      *)
+        "$REAL" "$@" --append-system-prompt "$CONTEXT"
+        ;;
+    esac
     RC=$?
     ;;
   codex)

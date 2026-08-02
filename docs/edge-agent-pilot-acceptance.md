@@ -49,6 +49,32 @@
 4. 실행 후 diff·검증·이벤트 원장·lease 해제를 확인한다.
 5. 성공 표본을 누적한 뒤에만 제한적 병렬 실행을 별도로 승인한다.
 
+승인된 단일 canary는 다음 launcher를 사용한다. 기본 실행은 계획만 만들며,
+실제 provider 호출은 `--execute --confirm-live-provider`를 모두 지정해야 한다.
+clean worktree와 usage gate가 통과되지 않으면 provider를 시작하지 않는다.
+
+```bash
+python3 bin/edge_agent_provider_pilot.py \
+  --provider codex \
+  --prompt-file /path/to/read-only-pilot-prompt.txt \
+  --workdir /path/to/clean-worktree \
+  --json
+```
+
+실제 호출이 승인된 경우에만 위 명령에 `--execute --confirm-live-provider`를
+추가한다. 결과에는 provider 원문 대신 종료코드·출력 해시·변경 파일만 남는다.
+provider 출력은 메모리에 누적하지 않고 임시 파일에서 해시·바이트 수만 계산하며,
+실행 성공 판정에는 worktree 상태 확인과 `git diff --check` 통과도 포함된다.
+
+## 2026-08-02 안전 경로 검증
+
+- fake provider 통합 테스트로 프로세스 실행·종료코드·변경 파일 수집을 검증했다.
+- provider 원문은 결과 JSON에 없고, 비밀 문자열도 결과에 남지 않음을 검증했다.
+- provider 출력은 임시 파일로 스트리밍되어 Python 메모리에 누적되지 않는다.
+- 실행 후 `git diff --check`가 실패하면 파일럿 전체를 실패로 판정한다.
+- [x] fake provider 기반 실행·출력 비노출·diff 검증
+- [x] 사용량 창 미확인·dirty worktree에서 실제 provider 시작 차단
+
 ## 2026-08-01 사용량 게이트 상태
 
 - Claude: 5시간창 0%, 전체 상태 red — 실제 파일럿 차단

@@ -27,10 +27,20 @@ class RouterCoreTests(unittest.TestCase):
     def test_complex_document_request_becomes_team(self):
         decision = route("공고문, 사업계획서, 견적서를 분석해서 제출용 제안서를 작성하고 검토해줘.", attachment_count=3)
         self.assertEqual(decision.execution_mode, "team")
-        self.assertEqual({item.provider.value for item in decision.roles}, {"gemma", "antigravity", "codex"})
+        self.assertEqual({item.provider.value for item in decision.roles}, {"gemma", "antigravity", "codex", "claude"})
         self.assertEqual([item.role.value for item in decision.roles], [
-            "source_extractor", "requirement_analyst", "writer", "reviewer", "integrator"
+            "source_extractor", "researcher", "implementer", "integrator"
         ])
+
+    def test_explicit_deliberation_assigns_all_four_providers(self):
+        decision = route("지금부터 30일 안에 100만원 수익을 만들 방법들을 너희들이 논의해")
+        self.assertEqual(decision.execution_mode, "team")
+        self.assertEqual(
+            {item.provider.value for item in decision.roles},
+            {"claude", "codex", "antigravity", "gemma"},
+        )
+        self.assertEqual(decision.roles[-1].provider.value, "claude")
+        self.assertEqual(decision.roles[-1].role.value, "integrator")
 
 
     def test_claude_forbidden_is_honored(self):

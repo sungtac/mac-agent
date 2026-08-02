@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from edge_agent_secure_paths import ensure_private_directory, read_text
+
 
 PLAN_DIR = Path(os.environ.get("EDGE_AGENT_PLAN_DIR", str(Path.home() / ".edge-agent" / "plans"))).expanduser()
 _APPROVAL_RE = re.compile(r"^\s*(?:실행\s*)?(?:승인|계속\s*진행|진행해)\s*[.!。]?\s*$", re.IGNORECASE)
@@ -26,13 +28,14 @@ def _path(chat_id: object) -> Path:
 
 
 def save_pending(*, chat_id: object, task_id: str, request: str, plan: str, workspace: str) -> None:
-    PLAN_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(PLAN_DIR)
     record = {
         "chat_id": str(chat_id),
         "task_id": task_id,
         "request": request,
         "plan": plan,
         "workspace": workspace,
+        "approval_ref": f"approval-{task_id}",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "awaiting_approval",
     }
@@ -55,8 +58,8 @@ def save_pending(*, chat_id: object, task_id: str, request: str, plan: str, work
 def load_pending(chat_id: object) -> dict[str, Any] | None:
     target = _path(chat_id)
     try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        data = json.loads(read_text(target))
+    except (FileNotFoundError, OSError, RuntimeError, json.JSONDecodeError):
         return None
     return data if data.get("status") == "awaiting_approval" else None
 

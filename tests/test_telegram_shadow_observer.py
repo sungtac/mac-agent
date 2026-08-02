@@ -75,6 +75,20 @@ class ShadowObserverTests(unittest.TestCase):
         self.assertFalse(config.enabled)
         self.assertEqual(config.reason, "invalid configuration")
 
+    def test_nonfinite_runtime_settings_disable_observer(self):
+        for name, value in (
+            ("EDGE_AGENT_SHADOW_FLUSH_TIMEOUT_MS", "nan"),
+            ("EDGE_AGENT_SHADOW_MAINTENANCE_INTERVAL_SECONDS", "inf"),
+        ):
+            with self.subTest(name=name):
+                config = load_config({
+                    "EDGE_AGENT_SHADOW_OBSERVER_ENABLED": "1",
+                    "EDGE_AGENT_SHADOW_ROOT": "/tmp/shadow-test",
+                    name: value,
+                })
+                self.assertFalse(config.enabled)
+                self.assertEqual(config.reason, "invalid configuration")
+
     def test_empty_root_is_invalid_and_does_not_select_cwd(self):
         config = load_config({
             "EDGE_AGENT_SHADOW_OBSERVER_ENABLED": "1",
@@ -92,6 +106,7 @@ class ShadowObserverTests(unittest.TestCase):
             self.assertTrue(observer.record_update(update, bot_id="bot-a", bot_role="codex", legacy_target="codex"))
             observer.stop(timeout=1.0)
             self.assertTrue((Path(temp) / "shadow" / "shadow.db").exists())
+            self.assertTrue((Path(temp) / "shadow" / "health.yaml").exists())
             self.assertEqual(observer.stats["processed"], 1)
 
     def test_group_root_is_same_across_bots_and_private_is_scoped(self):

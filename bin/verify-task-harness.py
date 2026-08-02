@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import glob
 import hashlib
 import importlib.util
 import json
@@ -234,6 +235,28 @@ def test_commands(cwd: Path) -> list[str]:
         if has_js_tests:
             commands.append("node --test tests/*.test.js")
     return list(dict.fromkeys(commands))
+
+
+def test_command_argv(command: str, cwd: Path) -> list[str]:
+    """Parse a harness-owned test command without invoking a shell.
+
+    The command list is generated from bounded repository metadata above.  We
+    still keep shell metacharacters inert by using ``shlex.split`` and expand
+    only the test globs that the generated Node command needs.
+    """
+    argv = shlex.split(command)
+    expanded: list[str] = []
+    for token in argv:
+        if glob.has_magic(token):
+            pattern = token if os.path.isabs(token) else str(cwd / token)
+            matches = sorted(glob.glob(pattern))
+            if matches:
+                for match in matches:
+                    path = Path(match)
+                    expanded.append(str(path.relative_to(cwd)) if path.is_relative_to(cwd) else str(path))
+                continue
+        expanded.append(token)
+    return expanded
 
 
 def classify(task: str, files: list[str], explicit_full: bool = False) -> dict[str, Any]:
@@ -481,11 +504,12 @@ def run_tests(cwd: Path, run_dir: Path) -> dict[str, Any]:
     log_chunks: list[str] = []
     for index, command in enumerate(commands, start=1):
         try:
-            proc = subprocess.run(command, cwd=cwd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+            argv = test_command_argv(command, cwd)
+            proc = subprocess.run(argv, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
             output = proc.stdout or ""
             failures = summarize_failure_lines(output)
             command_status = "passed" if proc.returncode == 0 else "failed"
-            result = {"command": command, "status": command_status, "exit_code": proc.returncode, "failures": failures}
+            result = {"command": command, "argv": argv, "status": command_status, "exit_code": proc.returncode, "failures": failures}
         except subprocess.TimeoutExpired as exc:
             output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
             result = {"command": command, "status": "error", "failures": ["test command timed out"]}

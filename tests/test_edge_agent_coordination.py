@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import sys
 import tempfile
 import unittest
@@ -22,12 +23,19 @@ class CoordinationCollectorTests(unittest.TestCase):
         self.assertIn("not confirmed", report)
 
     def test_matching_peer_results_are_collected(self):
-        records = {
-            "antigravity": [{"role": "antigravity", "status": "completed", "request_tail": "요청", "response_tail": "안티 결과", "updated_at": "now"}],
-            "gemma": [{"role": "gemma", "status": "failed", "request_tail": "요청", "error": "Ollama 오류", "updated_at": "now"}],
-        }
-        with patch("edge_agent_coordination.list_task_states", side_effect=lambda *, role, chat_id: records[role]):
-            report = collect_report(chat_id="-1", request="요청")
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict(os.environ, {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                from edge_agent_agent_message import build_message
+
+                records = {
+                    "antigravity": [{"role": "antigravity", "status": "completed", "task_id": "anti-task", "request_tail": "요청", "response_tail": "안티 결과", "updated_at": "now", "agent_message": build_message(session_id="telegram--1", task_id="anti-task", from_role="antigravity", to=("claude",), purpose="peer_result", summary="안티 결과", source_event_id="anti-task-completed", key_id="agent-message-v1", signing_key=b"local-test-key-with-more-than-16-bytes").to_dict()}],
+                    "gemma": [{"role": "gemma", "status": "failed", "task_id": "gemma-task", "request_tail": "요청", "error": "Ollama 오류", "updated_at": "now", "agent_message": build_message(session_id="telegram--1", task_id="gemma-task", from_role="roda", to=("claude",), purpose="peer_result", summary="failed", source_event_id="gemma-task-failed", key_id="agent-message-v1", signing_key=b"local-test-key-with-more-than-16-bytes").to_dict()}],
+                }
+                with patch("edge_agent_coordination.list_task_states", side_effect=lambda *, role, chat_id: records[role]):
+                    report = collect_report(chat_id="-1", request="요청")
         self.assertIn("antigravity: status=completed", report)
         self.assertIn("gemma: status=failed", report)
         self.assertNotIn("Ollama 오류", report)

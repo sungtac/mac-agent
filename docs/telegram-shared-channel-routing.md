@@ -30,6 +30,11 @@ LaunchAgent가 변경할 수 없으므로 운영자가 Telegram UI/BotFather에�
 확인한다. 2026-08-02 05:28 KST `canary`에서 Claude·Codex·Antigravity·Roda
 모두 처리 완료했고, 네 응답 모두 원본 메시지에 reply로 연결됐다.
 
+2026-08-02 post-restart canonical Codex delivery canary도 성공했다:
+`canonical-canary-20260802-r2`, Telegram `message_id=285`, durable delivery
+status `succeeded`. 이는 canonical outbound/API 경로의 실측이며, 사용자 발화에
+대한 네 모델 fan-out 자체의 새 live canary와는 구분한다.
+
 ## 검증 명령
 
 ```bash

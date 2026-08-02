@@ -16,6 +16,7 @@ from edge_agent_claim_store import (  # noqa: E402
     FENCING_REJECTED,
     RECOVERY_CANDIDATE,
     ClaimStore,
+    ClaimStoreError,
 )
 
 
@@ -44,6 +45,11 @@ class ClaimLeaseTests(unittest.TestCase):
         self.assertTrue(result.acquired)
         self.assertEqual(result.status, CLAIMED)
         self.assertEqual(result.fencing_token, 1)
+
+    def test_configured_store_rejects_unregistered_owner(self):
+        store = ClaimStore(Path(self.tempdir.name) / "scoped.db", allowed_owners={"telegram-claude"})
+        with self.assertRaises(ClaimStoreError):
+            store.claim("message", "root", "telegram-antigravity")
 
     def test_valid_lease_blocks_other_owner(self):
         self.store.claim("message", "root", "owner-a")
@@ -122,6 +128,18 @@ class ClaimLeaseTests(unittest.TestCase):
         duplicate = self.store.claim("message", "root", "owner-a")
         self.assertFalse(duplicate.acquired)
         self.assertEqual(duplicate.status, COMPLETED)
+
+    def test_signed_provenance_journal_records_fencing_lifecycle(self):
+        key = Path(self.tempdir.name) / "provenance.key"
+        key.write_bytes(b"claim-provenance-key-with-more-than-16-bytes")
+        key.chmod(0o600)
+        store = ClaimStore(Path(self.tempdir.name) / "signed.db", ttl_seconds=10, clock=self.clock, provenance_key_path=key)
+        claimed = store.claim("message", "root", "owner-a")
+        store.heartbeat("message", "owner-a", claimed.fencing_token)
+        store.complete("message", "owner-a", claimed.fencing_token)
+        events = store.provenance_events("message")
+        self.assertEqual([event["event_type"] for event in events], ["claim_acquired", "heartbeat", "completed"])
+        self.assertTrue(all(event["signature"] for event in events))
 
 
 if __name__ == "__main__":

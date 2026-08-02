@@ -26,8 +26,15 @@ STATE_FILES: dict[str, Any] = {
 }
 SENSITIVE_PATTERNS = [
     re.compile(r"(?i)sk-[a-z0-9_-]+"),
+    re.compile(r"(?i)\b(?:ghp|github_pat)[_-][a-z0-9_-]+"),
+    re.compile(r"(?i)\bxox[baprs]-[a-z0-9_-]+"),
+    re.compile(r"(?i)bearer\s+[a-z0-9._~+/=-]+"),
     re.compile(r"(?i)(token|secret|password|api[_ -]?key)(\s*[:=]\s*)[^\s,'\"]+"),
 ]
+SENSITIVE_KEYS = {
+    "token", "secret", "password", "api_key", "authorization", "cookie",
+    "private_key", "client_secret", "access_token", "refresh_token", "credential",
+}
 
 
 def _now_iso() -> str:
@@ -45,7 +52,10 @@ def _default_for(name: str) -> Any:
 
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
-        return {str(k): _redact(v) for k, v in value.items()}
+        return {
+            str(k): "[REDACTED]" if str(k).strip().casefold().replace("-", "_").replace(" ", "_") in SENSITIVE_KEYS else _redact(v)
+            for k, v in value.items()
+        }
     if isinstance(value, list):
         return [_redact(v) for v in value]
     text = str(value) if not isinstance(value, (int, float, bool, type(None))) else value
@@ -66,8 +76,10 @@ def _load_json(path: Path, default: Any) -> Any:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         return data if data is not None else json.loads(json.dumps(default))
-    except Exception:
-        return json.loads(json.dumps(default))
+    except (OSError, json.JSONDecodeError) as exc:
+        # Never replace a damaged state file with a fresh default. Callers must
+        # stop and surface the corruption so an operator can recover it.
+        raise ValueError(f"quota state is unreadable: {path}") from exc
 
 
 def _atomic_write_json(path: Path, data: Any) -> None:
@@ -77,6 +89,8 @@ def _atomic_write_json(path: Path, data: Any) -> None:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
             handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(tmp_name, path)
     finally:
         if os.path.exists(tmp_name):
@@ -95,17 +109,35 @@ def _locked_json_update(path: Path, default: Any, updater: Callable[[Any], Any])
         return result
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_name, path)
+    finally:
+        if os.path.exists(tmp_name):
+            os.unlink(tmp_name)
+
+
 def ensure_state_files(base_dir: str | Path) -> dict:
     sdir = state_dir(base_dir)
     sdir.mkdir(parents=True, exist_ok=True)
+    os.chmod(sdir, 0o700)
     created = []
     for name in STATE_FILES:
         path = sdir / name
         if not path.exists():
             _atomic_write_json(path, _default_for(name))
             created.append(str(path))
+        else:
+            os.chmod(path, 0o600)
     packets = sdir / "context_packets"
     packets.mkdir(parents=True, exist_ok=True)
+    os.chmod(packets, 0o700)
     return {"status": "success", "state_dir": str(sdir), "created": created}
 
 
@@ -114,24 +146,33 @@ def save_active_task(base_dir: str | Path, task: dict) -> dict:
     payload = _redact(dict(task or {}))
     payload.setdefault("task_id", f"TASK_{int(datetime.now().timestamp())}")
     payload["updated_at"] = _now_iso()
-    _atomic_write_json(state_dir(base_dir) / "active_task.json", payload)
+    path = state_dir(base_dir) / "active_task.json"
+    def update(data: dict) -> dict:
+        data.clear()
+        data.update(payload)
+        return payload
+
+    _locked_json_update(path, {}, update)
     return {"status": "success", "task_id": payload.get("task_id")}
 
 
 def load_active_task(base_dir: str | Path) -> dict:
     ensure_state_files(base_dir)
     data = _load_json(state_dir(base_dir) / "active_task.json", {})
-    return data if isinstance(data, dict) else {}
+    return _redact(data) if isinstance(data, dict) else {}
 
 
 def record_quota_event(base_dir: str | Path, event: dict) -> dict:
     ensure_state_files(base_dir)
-    event_id = str((event or {}).get("event_id") or f"QEVT_{int(datetime.now().timestamp())}")
     payload = _redact(dict(event or {}))
+    event_id = str(payload.get("event_id") or f"QEVT_{int(datetime.now().timestamp())}")
     payload.update({"event_id": event_id, "recorded_at": _now_iso()})
 
     def update(data: dict) -> dict:
         data.setdefault("events", [])
+        for existing in data["events"]:
+            if isinstance(existing, dict) and existing.get("event_id") == event_id:
+                return existing
         data["events"].append(payload)
         return payload
 
@@ -153,11 +194,18 @@ def add_resume_queue_item(base_dir: str | Path, item: dict) -> dict:
 
     def update(data: dict) -> dict:
         data.setdefault("items", [])
+        for existing in data["items"]:
+            if (
+                isinstance(existing, dict)
+                and existing.get("task_id") == payload.get("task_id")
+                and existing.get("event_id") == payload.get("event_id")
+            ):
+                return {"status": "success", "task_id": existing.get("task_id"), "event_id": existing.get("event_id"), "duplicate": True}
         data["items"].append(payload)
         return payload
 
     written = _locked_json_update(state_dir(base_dir) / "resume_queue.json", {"items": []}, update)
-    return {"status": "success", "task_id": written.get("task_id"), "event_id": written.get("event_id")}
+    return {"status": "success", "task_id": written.get("task_id"), "event_id": written.get("event_id"), "duplicate": bool(written.get("duplicate"))}
 
 
 def update_resume_queue_item_status(base_dir: str | Path, task_id: str, status: str, event_id: str | None = None) -> dict:
@@ -188,12 +236,21 @@ def ready_queue_items(base_dir: str | Path, now: datetime | None = None) -> list
         except Exception:
             resume_after = current
         if resume_after <= current:
-            ready.append(item)
+            ready.append(_redact(item))
     return ready
 
 
 def maybe_resume_autoloop_after_debounce(*, now: datetime | None = None, dry_run: bool = True, state_path: str | Path, context_path: str | Path | None = None) -> dict:
-    from progress_registry import AutoloopRegistry  # imported lazily for jarvis path tests
+    try:
+        from progress_registry import AutoloopRegistry  # optional host integration
+    except ModuleNotFoundError:
+        return {
+            "should_resume": False,
+            "action": "BLOCKED",
+            "reason": "progress_registry integration is unavailable",
+            "auto_execute": False,
+            "requires_user_review": True,
+        }
 
     registry = AutoloopRegistry(state_path=Path(state_path), context_path=Path(context_path) if context_path else None)
     registry.load()
@@ -213,7 +270,7 @@ def maybe_resume_autoloop_after_debounce(*, now: datetime | None = None, dry_run
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("base_dir", nargs="?", default=".")
+    parser.add_argument("base_dir", nargs="?", default=os.environ.get("EDGE_AGENT_RUNTIME_ROOT", "~/.edge-agent"))
     parser.add_argument("--record-event", default="")
     args = parser.parse_args()
     if args.record_event:

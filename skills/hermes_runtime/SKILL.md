@@ -65,7 +65,19 @@ python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_evidence_tickets.py" --jso
 Inspect live-evidence candidates without mutating records:
 
 ```bash
-python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_evidence.py" --plan --json
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_evidence.py" plan --json
+```
+
+Retirement promotion additionally requires explicit approval, retirement evidence, and
+a measured recurrence-free window:
+
+```bash
+python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_lifecycle_evidence.py" apply \
+  --title "<item>" --target-stage retired \
+  --live-evidence "<live proof>" \
+  --retirement-evidence "<retirement proof>" \
+  --recurrence-free-window "14 days without recurrence" \
+  --confirm-approval
 ```
 
 ## safety
@@ -94,5 +106,5 @@ python3 "$HOME/mac-agent/skills/hermes_runtime/hermes_active_resolution_plan.py"
 Run this after creating or changing this skill:
 
 ```bash
-python3 scripts/skill_quality_audit.py --skill skills/hermes-runtime/SKILL.md --run-tests --json
+PYTHONPATH=. python3 skills/hermes_runtime/tests/test_hermes_runtime_skill.py
 ```

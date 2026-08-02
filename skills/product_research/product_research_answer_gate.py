@@ -9,9 +9,13 @@ other non-quantity products need an explicit non-applicable caveat instead.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import ipaddress
 import json
+import socket
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 ALLOWED_CONFIDENCE = {
     "official_store_parsed",
@@ -26,12 +30,41 @@ def _list_of_dicts(value: Any) -> list[dict[str, Any]]:
     return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
+def _valid_public_https_url(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    parsed = urlsplit(value)
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    try:
+        addresses = {item[4][0] for item in socket.getaddrinfo(parsed.hostname, parsed.port or 443, type=socket.SOCK_STREAM)}
+    except (OSError, ValueError):
+        # A report may be validated offline. Host resolution is not required,
+        # but literal private/loopback destinations are always rejected.
+        addresses = set()
+    for address in addresses:
+        ip = ipaddress.ip_address(address)
+        if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast or ip.is_unspecified:
+            return False
+    try:
+        literal = ipaddress.ip_address(parsed.hostname)
+    except ValueError:
+        literal = None
+    return not literal or not (literal.is_private or literal.is_loopback or literal.is_link_local or literal.is_reserved)
+
+
 def validate_report(payload: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     if not payload.get("query"):
         issues.append("missing query")
     if not payload.get("generated_at"):
         issues.append("missing generated_at")
+    else:
+        try:
+            generated = str(payload["generated_at"]).replace("Z", "+00:00")
+            dt.datetime.fromisoformat(generated)
+        except (TypeError, ValueError):
+            issues.append("generated_at is not ISO-8601")
 
     probes = _list_of_dicts(payload.get("sources_checked"))
     if len(probes) < 2:
@@ -39,6 +72,9 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
     probe_sources = {p.get("source") for p in probes}
     if "danawa" not in probe_sources:
         issues.append("danawa probe missing")
+    for probe in probes:
+        if not _valid_public_https_url(probe.get("url")):
+            issues.append(f"source probe URL is not a public HTTPS URL: {probe.get('source')}")
 
     candidates = _list_of_dicts(payload.get("candidates"))
     if not candidates:
@@ -49,6 +85,9 @@ def validate_report(payload: dict[str, Any]) -> list[str]:
         issues.append("no priced candidates")
     if priced and not eligible_priced:
         issues.append("no eligible priced candidates after accessory/low-relevance exclusions")
+    for candidate in candidates:
+        if not _valid_public_https_url(candidate.get("url")):
+            issues.append(f"candidate URL is not a public HTTPS URL: {candidate.get('name')}")
 
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     caveats = "\n".join(str(c) for c in (summary.get("caveats") or []))

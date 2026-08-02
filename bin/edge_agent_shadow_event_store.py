@@ -93,7 +93,55 @@ class ShadowEventStore:
         self._flush_lock = threading.Lock()
         self._connection_count = 0
         self._connection_count_lock = threading.Lock()
+        self._validate_managed_paths()
         self._initialize()
+
+    def _validate_managed_file(self, path: Path, *, allow_missing: bool = True) -> bool:
+        """Validate one Shadow-owned file without following symlinks."""
+
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            if allow_missing:
+                return False
+            raise ShadowEventError(f"managed Shadow file is missing: {path.name}")
+        except OSError as exc:
+            raise ShadowEventError(f"managed Shadow file is unavailable: {path.name}") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ShadowEventError(f"managed Shadow file must be a regular file: {path.name}")
+        if info.st_uid != os.geteuid():
+            raise ShadowEventError(f"managed Shadow file owner mismatch: {path.name}")
+        os.chmod(path, 0o600)
+        return True
+
+    def _validate_managed_paths(self) -> None:
+        for path in (
+            self.database_path,
+            Path(str(self.database_path) + "-wal"),
+            Path(str(self.database_path) + "-shm"),
+            Path(str(self.database_path) + "-journal"),
+            self.event_log_path,
+            self.manifest_path,
+            self.rotation_lock_path,
+            self.maintenance_lock_path,
+        ):
+            self._validate_managed_file(path)
+
+    def _open_private_lock(self, path: Path) -> int:
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(str(path), flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise ShadowEventError(f"managed Shadow lock is unsafe: {path.name}")
+            os.fchmod(descriptor, 0o600)
+            return descriptor
+        except ShadowEventError:
+            raise
+        except OSError as exc:
+            raise ShadowEventError(f"managed Shadow lock is unsafe: {path.name}") from exc
 
     def _secure_root(self) -> None:
         if self.root.exists() or self.root.is_symlink():
@@ -110,6 +158,7 @@ class ShadowEventStore:
                 raise ShadowEventError("Shadow root permissions must be exactly 0700")
 
     def _connect(self) -> sqlite3.Connection:
+        self._validate_managed_file(self.database_path)
         connection = sqlite3.connect(
             str(self.database_path),
             timeout=self.busy_timeout_ms / 1000.0,
@@ -194,17 +243,16 @@ class ShadowEventStore:
                 "UPDATE jsonl_outbox SET status = 'PENDING' WHERE status = 'FLUSHING'"
             )
         os.chmod(self.database_path, 0o600)
+        self._validate_managed_paths()
         # Initialization and rotation both rename/create the current segment;
         # keep their existence and permission checks under the same stable lock.
-        rotation_fd = os.open(str(self.rotation_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        os.fchmod(rotation_fd, 0o600)
+        rotation_fd = self._open_private_lock(self.rotation_lock_path)
         fcntl.flock(rotation_fd, fcntl.LOCK_EX)
         try:
-            if self.event_log_path.exists() and not self.event_log_path.is_symlink():
-                os.chmod(self.event_log_path, 0o600)
+            self._validate_managed_file(self.event_log_path)
             with self._manifest_lock:
                 if not self.manifest_path.exists():
-                    self.manifest_path.write_text(
+                    manifest = (
                         "schema_version: " + SCHEMA_VERSION + "\n"
                         "sqlite: shadow.db\n"
                         "jsonl: shadow-events.jsonl\n"
@@ -212,10 +260,24 @@ class ShadowEventStore:
                         "jsonl_authority: derived_outbox\n"
                         "jsonl_current: shadow-events.jsonl\n"
                         "maintenance_schema: shadow-maintenance.v1\n"
-                        "stores_raw_content: false\n",
-                        encoding="utf-8",
-                    )
-                os.chmod(self.manifest_path, 0o600)
+                        "stores_raw_content: false\n"
+                    ).encode("utf-8")
+                    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        flags |= os.O_NOFOLLOW
+                    try:
+                        manifest_fd = os.open(str(self.manifest_path), flags, 0o600)
+                    except FileExistsError:
+                        self._validate_managed_file(self.manifest_path, allow_missing=False)
+                    except OSError as exc:
+                        raise ShadowEventError("manifest path is unsafe") from exc
+                    else:
+                        try:
+                            os.write(manifest_fd, manifest)
+                            os.fsync(manifest_fd)
+                        finally:
+                            os.close(manifest_fd)
+                self._validate_managed_file(self.manifest_path, allow_missing=False)
         finally:
             fcntl.flock(rotation_fd, fcntl.LOCK_UN)
             os.close(rotation_fd)
@@ -271,11 +333,17 @@ class ShadowEventStore:
 
         if not data:
             return {"written": 0, "skipped": 0}
-        rotation_fd = os.open(str(self.rotation_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        os.fchmod(rotation_fd, 0o600)
+        rotation_fd = self._open_private_lock(self.rotation_lock_path)
         fcntl.flock(rotation_fd, fcntl.LOCK_EX)
         try:
-            with self.event_log_path.open("a+", encoding="utf-8") as handle:
+            flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                event_fd = os.open(str(self.event_log_path), flags, 0o600)
+            except OSError as exc:
+                raise ShadowEventError("event log path is unsafe") from exc
+            with os.fdopen(event_fd, "a+", encoding="utf-8") as handle:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 try:
                     os.fchmod(handle.fileno(), 0o600)
@@ -506,6 +574,7 @@ class ShadowEventStore:
         corrupt_lines: list[int] = []
         if not self.event_log_path.exists():
             return events, corrupt_lines
+        self._validate_managed_file(self.event_log_path, allow_missing=False)
         with self.event_log_path.open("r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
                 if not line.strip():
@@ -557,13 +626,20 @@ class ShadowEventStore:
             return {"rotated": False, "reason": "missing_current", "segment": None}
         # Lock a stable inode.  Locking the current segment itself would lose
         # mutual exclusion immediately after os.replace() creates its successor.
-        lock_fd = os.open(str(self.rotation_lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        os.fchmod(lock_fd, 0o600)
+        lock_fd = self._open_private_lock(self.rotation_lock_path)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         try:
-            if not self.event_log_path.exists() or self.event_log_path.is_symlink():
+            self._validate_managed_file(self.event_log_path)
+            if not self.event_log_path.exists():
                 return {"rotated": False, "reason": "missing_current", "segment": None}
-            with self.event_log_path.open("a+b") as current:
+            flags = os.O_CREAT | os.O_RDWR | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                current_fd = os.open(str(self.event_log_path), flags, 0o600)
+            except OSError as exc:
+                raise ShadowEventError("event log path is unsafe") from exc
+            with os.fdopen(current_fd, "a+b") as current:
                 try:
                     current.flush()
                     os.fsync(current.fileno())
@@ -581,7 +657,10 @@ class ShadowEventStore:
                         sequence += 1
                     os.replace(self.event_log_path, target)
                     os.chmod(target, 0o600)
-                    fd = os.open(str(self.event_log_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                    create_flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                    if hasattr(os, "O_NOFOLLOW"):
+                        create_flags |= os.O_NOFOLLOW
+                    fd = os.open(str(self.event_log_path), create_flags, 0o600)
                     os.close(fd)
                     os.chmod(self.event_log_path, 0o600)
                     return {"rotated": True, "reason": "limit" if not force else "forced", "segment": target.name, "bytes": size}

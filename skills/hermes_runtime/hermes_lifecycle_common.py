@@ -8,6 +8,7 @@ resolution gates without mutating the Hermes ledger.
 from __future__ import annotations
 
 from pathlib import Path
+import re
 from typing import Any, Iterable
 
 from skills.hermes_runtime.hermes_backlog import load_feedback_records, normalize_status, score_priority
@@ -15,6 +16,40 @@ from skills.hermes_runtime.hermes_backlog import load_feedback_records, normaliz
 HIGH_PRIORITY = 90
 ACTIVE_STAGES = {"proposed", "planned", "blocked"}
 RETIRABLE_STAGES = {"mitigated", "live_verified", "retired"}
+SENSITIVE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b(?:ghp|github_pat)[_-][A-Za-z0-9_-]+\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:token|secret|password|api[_ -]?key|authorization)\s*[:=]\s*[^\s,'\"]+",
+        re.IGNORECASE,
+    ),
+)
+SENSITIVE_KEYS = {
+    "token", "secret", "password", "api_key", "authorization", "cookie",
+    "private_key", "client_secret", "access_token", "refresh_token", "credential",
+}
+
+
+def redact_text(value: str) -> str:
+    safe = value
+    for pattern in SENSITIVE_PATTERNS:
+        safe = pattern.sub("[REDACTED]", safe)
+    safe = re.sub(r"https?://[^\s'\"<>/@]+:[^\s'\"<>/@]+@", "https://[REDACTED]@", safe, flags=re.IGNORECASE)
+    return safe
+
+
+def contains_sensitive(value: Any) -> bool:
+    if isinstance(value, str):
+        return any(pattern.search(value) for pattern in SENSITIVE_PATTERNS) or bool(
+            re.search(r"https?://[^\s'\"<>/@]+:[^\s'\"<>/@]+@", value, flags=re.IGNORECASE)
+        )
+    if isinstance(value, dict):
+        return any(str(key).strip().casefold().replace("-", "_").replace(" ", "_") in SENSITIVE_KEYS or contains_sensitive(key) or contains_sensitive(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(contains_sensitive(item) for item in value)
+    return False
 
 
 def record_text(record: dict[str, Any], *keys: str, lowercase: bool = False) -> str:

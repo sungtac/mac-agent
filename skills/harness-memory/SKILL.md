@@ -103,8 +103,8 @@ python3 skills/harness-memory/harness_memory.py search "skill quality audit miss
 python3 skills/harness-memory/harness_memory.py add_success \
   "2026-06-26" \
   "command-registry SKILL.md missing reference" \
-  '["replace stale absolute path", "run skill_quality_audit with SKILL.md path"]' \
-  "skill audit passed with 0 errors and 0 warnings"
+  '["replace stale absolute path", "run the repository skill test command"]' \
+  "repository skill tests passed"
 ```
 
 ## Quality follow-up
@@ -112,5 +112,5 @@ python3 skills/harness-memory/harness_memory.py add_success \
 Run this after creating or changing this skill:
 
 ```bash
-python3 scripts/skill_quality_audit.py --skill skills/harness-memory/SKILL.md --run-tests --json
+PYTHONPATH=. python3 skills/harness-memory/tests/test_harness_memory.py
 ```

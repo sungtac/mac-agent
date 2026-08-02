@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import hmac
 import logging
+import math
 import os
 from pathlib import Path
 import queue
@@ -63,6 +64,17 @@ class ShadowObserverConfig:
     maintenance_interval_seconds: float = 3600.0
     jsonl_rotation_interval_seconds: float = 86400.0
 
+    def __post_init__(self) -> None:
+        for name in (
+            "flush_timeout_seconds",
+            "db_batch_max_wait_seconds",
+            "maintenance_interval_seconds",
+            "jsonl_rotation_interval_seconds",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be a finite positive number")
+
 
 def _bool_setting(value: str | None) -> tuple[bool, str | None]:
     if value is None or value.casefold() in _FALSE_VALUES:
@@ -85,8 +97,8 @@ def _positive_float(value: str | None, default: float) -> float:
     if value is None or value == "":
         return default
     parsed = float(value)
-    if parsed <= 0:
-        raise ValueError("must be positive")
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise ValueError("must be finite and positive")
     return parsed
 
 
@@ -445,6 +457,10 @@ class ShadowObserver:
                 self._stop.clear()
                 self._force_stop.clear()
                 self._set_state(RUNNING)
+                try:
+                    self.maintenance.write_health_snapshot(observer_stats=self.stats)
+                except Exception as exc:
+                    self._record_error(exc)
                 self._thread = threading.Thread(target=self._run, name="edge-agent-shadow-observer", daemon=True)
                 self._thread.start()
                 return True
@@ -539,6 +555,29 @@ class ShadowObserver:
                 self._stats["abandoned_shutdown_timeout"] += abandoned
         return abandoned
 
+    def _maintenance_tick(self) -> str | None:
+        if self.maintenance is None:
+            return None
+        now = time.monotonic()
+        if now - self._last_maintenance_at < self.config.maintenance_interval_seconds:
+            try:
+                return self.maintenance.disk_state()
+            except Exception as exc:
+                self._record_error(exc)
+                return None
+        self._last_maintenance_at = now
+        try:
+            disk_state = self.maintenance.disk_state()
+            if disk_state == SOFT_LIMIT:
+                self.maintenance.enforce_soft_limit()
+                disk_state = self.maintenance.disk_state()
+            self.maintenance.rotate_if_needed()
+            self.maintenance.write_health_snapshot(observer_stats=self.stats)
+            return disk_state
+        except Exception as exc:
+            self._record_error(exc)
+            return None
+
     def _run(self) -> None:
         assert self._queue is not None
         try:
@@ -547,6 +586,7 @@ class ShadowObserver:
                     break
                 batch = self._take_batch()
                 if not batch:
+                    self._maintenance_tick()
                     continue
                 if self._force_stop.is_set():
                     with self._lock:
@@ -558,19 +598,11 @@ class ShadowObserver:
                     if self.store is None:
                         raise RuntimeError("Shadow Event Store unavailable")
                     if self.maintenance is not None:
-                        disk_state = self.maintenance.disk_state()
+                        disk_state = self._maintenance_tick()
                         if disk_state == HARD_LIMIT:
                             with self._lock:
                                 self._stats["dropped_disk_budget"] += len(batch)
                             continue
-                        if disk_state == SOFT_LIMIT:
-                            now = time.monotonic()
-                            if now - self._last_maintenance_at >= self.config.maintenance_interval_seconds:
-                                self._last_maintenance_at = now
-                                try:
-                                    self.maintenance.enforce_soft_limit()
-                                except Exception as exc:
-                                    self._record_error(exc)
                     events: list[dict[str, Any]] = []
                     event_to_item: dict[str, int] = {}
                     for index, metadata in enumerate(batch):
@@ -598,7 +630,7 @@ class ShadowObserver:
                             with self._lock:
                                 self._stats["jsonl_errors"] += int(flush_result["errors"])
                         if self.maintenance is not None:
-                            self.maintenance.rotate_if_needed()
+                            self._maintenance_tick()
                     except Exception as exc:
                         # SQLite is authoritative; JSONL failure leaves the
                         # committed outbox available for recovery.

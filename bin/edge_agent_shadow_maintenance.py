@@ -11,7 +11,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from contextlib import contextmanager
 import fcntl
+import argparse
 import json
+import math
 import os
 from pathlib import Path
 import stat
@@ -52,8 +54,11 @@ class ShadowMaintenanceConfig:
             raise ValueError("file limits must be positive")
         if not (0 < self.total_soft_limit_bytes < self.total_hard_limit_bytes):
             raise ValueError("soft limit must be below hard limit")
-        if self.retention_batch_size <= 0 or self.maintenance_interval_seconds <= 0 or self.jsonl_rotation_interval_seconds <= 0:
+        if self.retention_batch_size <= 0:
             raise ValueError("maintenance settings must be positive")
+        for value in (self.maintenance_interval_seconds, self.jsonl_rotation_interval_seconds):
+            if not math.isfinite(float(value)) or value <= 0:
+                raise ValueError("maintenance settings must be finite and positive")
 
 
 @dataclass(frozen=True)
@@ -127,8 +132,19 @@ class ShadowMaintenance:
     @contextmanager
     def _lock(self) -> Iterator[None]:
         self._assert_root()
-        descriptor = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
-        os.fchmod(descriptor, 0o600)
+        flags = os.O_CREAT | os.O_RDWR
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        try:
+            descriptor = os.open(str(self.lock_path), flags, 0o600)
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                raise ShadowMaintenanceError("maintenance lock is unsafe")
+            os.fchmod(descriptor, 0o600)
+        except ShadowMaintenanceError:
+            raise
+        except OSError as exc:
+            raise ShadowMaintenanceError("maintenance lock is unsafe") from exc
         try:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -255,8 +271,20 @@ class ShadowMaintenance:
                     snapshot[key] = observer_stats[key]
         return snapshot
 
-    def write_health_snapshot(self, snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
-        data = snapshot or self.health_snapshot()
+    def write_health_snapshot(
+        self,
+        snapshot: dict[str, Any] | None = None,
+        *,
+        observer_stats: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._assert_root()
+        if self.health_path.exists() or self.health_path.is_symlink():
+            info = self.health_path.lstat()
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ShadowMaintenanceError("health path must be a regular file")
+            if info.st_uid != os.geteuid():
+                raise ShadowMaintenanceError("health path owner mismatch")
+        data = snapshot or self.health_snapshot(observer_stats=observer_stats)
         lines = [f"{key}: {json.dumps(value, ensure_ascii=False)}" for key, value in sorted(data.items())]
         fd, temporary = tempfile.mkstemp(prefix=".health.", dir=self.store.root)
         try:
@@ -313,11 +341,44 @@ class ShadowMaintenance:
             return self.purge_all(dry_run=True, feature_enabled=feature_enabled, observer_active=observer_active)
         if name == "purge-all-execute":
             return self.purge_all(dry_run=False, feature_enabled=feature_enabled, observer_active=observer_active)
+        if name == "recover":
+            return self.recover()
         raise ShadowMaintenanceError(f"unknown maintenance command: {name}")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Operate on an explicitly selected Shadow root")
+    parser.add_argument("--root", required=True, type=Path, help="isolated Shadow root")
+    parser.add_argument(
+        "command",
+        choices=(
+            "status", "verify", "retention-dry-run", "retention-execute",
+            "purge-all-dry-run", "purge-all-execute", "recover",
+        ),
+    )
+    parser.add_argument("--json", action="store_true", help="emit JSON output")
+    args = parser.parse_args(argv)
+    try:
+        maintenance = ShadowMaintenance(ShadowEventStore(args.root))
+        result = maintenance.command(args.command, execute=args.command.endswith("-execute"))
+        if args.command in {"status", "verify"}:
+            maintenance.write_health_snapshot(result)
+    except (OSError, ShadowMaintenanceError, ShadowEventStoreBusy) as exc:
+        parser.exit(1, f"shadow maintenance failed: {type(exc).__name__}: {exc}\n")
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        for key, value in sorted(result.items()):
+            print(f"{key}: {value}")
+    return 0
 
 
 __all__ = [
     "HARD_LIMIT", "NORMAL", "READ_ONLY_DEGRADED", "RECOVERING", "SOFT_LIMIT",
     "ShadowMaintenance", "ShadowMaintenanceConfig", "ShadowMaintenanceError",
-    "ShadowCanaryConfig",
+    "ShadowCanaryConfig", "main",
 ]
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

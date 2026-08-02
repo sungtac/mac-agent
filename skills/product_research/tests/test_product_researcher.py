@@ -1,6 +1,12 @@
 from __future__ import annotations
 
 import unittest
+import json
+import tempfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from threading import Thread
+from unittest.mock import patch
 
 from skills.product_research.product_researcher import (
     ProductCandidate,
@@ -16,6 +22,64 @@ from skills.product_research.product_researcher import (
 
 
 class ProductResearcherTest(unittest.TestCase):
+    def test_fetch_rejects_local_destinations(self):
+        with self.assertRaises(ValueError):
+            from skills.product_research.product_researcher import fetch_text
+            fetch_text("http://127.0.0.1:9/internal")
+
+    def test_fetch_rejects_url_credentials(self):
+        with self.assertRaises(ValueError):
+            from skills.product_research.product_researcher import fetch_text
+            fetch_text("https://user:password@example.com/products")
+
+    def test_fetch_rejects_hosts_outside_research_allowlist(self):
+        with self.assertRaises(ValueError):
+            from skills.product_research.product_researcher import fetch_text
+            fetch_text("https://example.com/products")
+
+    def test_brand_scrape_rejects_untrusted_host(self):
+        from skills.product_research.product_researcher import scrape_naver_brand
+        candidates, probe = scrape_naver_brand("https://example.com/store", ["제품"])
+        self.assertEqual(probe.status, "url_rejected")
+        self.assertEqual(candidates[0].confidence, "fetch_failed")
+
+    def test_rejected_brand_url_does_not_echo_url_credentials(self):
+        from skills.product_research.product_researcher import scrape_naver_brand
+        candidates, probe = scrape_naver_brand("https://user:password@example.com/store", ["제품"])
+        self.assertNotIn("password", candidates[0].url)
+        self.assertNotIn("password", probe.url)
+
+    def test_fetch_rejects_redirect_to_local_destination(self):
+        from skills.product_research import product_researcher
+
+        class RedirectHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(302)
+                self.send_header("Location", "http://127.0.0.1:9/internal")
+                self.end_headers()
+
+            def log_message(self, *_args):
+                return
+
+        server = HTTPServer(("127.0.0.1", 0), RedirectHandler)
+        Thread(target=server.handle_request, daemon=True).start()
+        original_validate = product_researcher._validate_public_http_url
+        calls = 0
+
+        def validate_after_initial(url, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return None
+            return original_validate(url, **kwargs)
+
+        try:
+            with patch.object(product_researcher, "_validate_public_http_url", side_effect=validate_after_initial):
+                with self.assertRaises(ValueError):
+                    product_researcher.fetch_text(f"http://127.0.0.1:{server.server_port}/redirect")
+        finally:
+            server.server_close()
+
     def test_parse_quantity_kg_single(self):
         self.assertEqual(parse_quantity_kg("하드볼 8.3kg, 1개"), 8.3)
 
@@ -69,6 +133,33 @@ class ProductResearcherTest(unittest.TestCase):
         self.assertEqual(candidates[0].unit_price_per_100g, 307.8)
         self.assertEqual(candidates[0].confidence, "conditional_price_parsed")
         self.assertIn("checkout", candidates[0].condition)
+
+    def test_report_writes_are_atomic_and_owner_only(self):
+        from skills.product_research import product_researcher
+
+        payload = {
+            "query": "sample",
+            "sources_checked": [],
+            "summary": {
+                "candidate_count": 0,
+                "priced_candidate_count": 0,
+                "conditional_price_count": 0,
+                "excluded_candidate_count": 0,
+                "unit_price_applicable": False,
+                "unit_price_candidate_count": 0,
+                "caveats": [],
+            },
+            "candidates": [],
+        }
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "report.md"
+            product_researcher.write_markdown(path, payload)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertIn("Product Research Report", path.read_text(encoding="utf-8"))
+
+            json_path = Path(td) / "report.json"
+            product_researcher._atomic_write_text(json_path, json.dumps(payload) + "\n")
+            self.assertEqual(json_path.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

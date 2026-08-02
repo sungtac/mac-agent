@@ -96,7 +96,9 @@ class PeerCoordinationTests(unittest.TestCase):
             text = "안티랑 로다는 왜 안해?"
             roles = bot._wake_roles(text)
             self.assertEqual(bot._message_route(text, roles), "coordination")
-            self.assertEqual(roda._strip_group_mention(text), "안티랑  왜 안해?")
+            self.assertEqual(roda._strip_group_mention(text), "안티랑 왜 안해?")
+            # Plain group messages are room-wide; direct addresses remain
+            # exclusive and are handled by the shared ingress contract.
             self.assertEqual(roda._strip_group_mention("canary"), "canary")
             self.assertIsNone(roda._strip_group_mention("/status@edgeai_stk_bot"))
             self.assertEqual(roda._strip_group_mention("/status@sukja_hwpx_helper_bot"), "/status")
@@ -106,7 +108,7 @@ class PeerCoordinationTests(unittest.TestCase):
             self.assertEqual(bot._message_route(addressed, addressed_roles), "coordination")
             self.assertEqual(
                 roda._strip_group_mention(addressed),
-                "안티랑  현재 상태를 확인하고 합쳐서 알려줘",
+                "안티랑 현재 상태를 확인하고 합쳐서 알려줘",
             )
         finally:
             token_root.cleanup()

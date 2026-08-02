@@ -43,8 +43,8 @@ Current implementation files:
 Example preview-safe CLI surface:
 
 ```bash
-python3 skills/quota_resume/quota_resume.py .
-python3 skills/quota_resume/quota_resume.py . --record-event '{"type":"rate_limit","message":"429 rate_limit"}'
+python3 skills/quota_resume/quota_resume.py
+python3 skills/quota_resume/quota_resume.py --record-event '{"type":"rate_limit","message":"429 rate_limit"}'
 ```
 
 ### Build resume previews
@@ -104,19 +104,16 @@ Acceptable evidence includes:
 Run these after changing this skill or its implementation:
 
 ```bash
-python3 scripts/skill_quality_audit.py --skill skills/quota_resume --json
-python3 -m py_compile skills/quota_resume/*.py scripts/skill_quality_audit.py
-python3 jarvis/test_sail_33_01_hermes_resume_queue.py
-python3 jarvis/test_sail_35_01_fallback_switch_approval.py
-python3 jarvis/test_sail_62_01_quota_resume_atomic_writes.py
+PYTHONPATH=. python3 -m py_compile skills/quota_resume/*.py
+python3 bin/run-skill-tests.py --quiet
 ```
 
 ## Current limitations
 
-- Skill-local tests under `skills/quota_resume/tests/` are not restored yet.
-- Some stale `__pycache__` entries reference older proactive preview modules whose source files are not present. Do not delete or clean cache artifacts until workspace hygiene policy and user approval are in place.
+- The skill-local tests are deterministic contract tests; they do not prove live provider quota exhaustion or account switching.
+- Corrupt state files are surfaced as errors and must be recovered from an operator-owned backup; they are not silently replaced with defaults.
 - This skill documents preview/readiness behavior only; it does not prove live quota-exhaustion failover.
 
 ## Quality follow-up
 
-Run `python3 scripts/skill_quality_audit.py --skill <this-skill> --run-tests --json` after creating or changing this skill.
+Run the repository skill test command after creating or changing this skill.

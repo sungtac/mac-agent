@@ -17,6 +17,9 @@ class SkillCatalogTests(unittest.TestCase):
         for entry in load_catalog()["skills"]:
             self.assertTrue(entry["manifest"].endswith("/SKILL.md"))
             self.assertFalse(Path(entry["manifest"]).is_absolute())
+            for test_path in entry.get("tests", []):
+                repo_root = Path(__file__).resolve().parents[1]
+                self.assertTrue((repo_root / test_path).exists() or (repo_root / "skills" / test_path).exists(), test_path)
 
 
 if __name__ == "__main__":

@@ -18,12 +18,18 @@ from pathlib import Path
 
 from telegram import Update
 from telegram.constants import ChatType
+from telegram.error import RetryAfter
 from telegram.ext import Application, ContextTypes, MessageHandler, TypeHandler, filters
 
 from agent_profile import render_agent_profile
 from edge_agent_context_envelope import ContextEnvelopeStore
+from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_cancel_request
+from edge_agent_deliberation import DeliberationStore, roles_for_request, session_id_for_telegram
+from edge_agent_egress_queue import EgressQueueError, SharedEgressQueue
+from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
 from edge_agent_state import write_task_state
 from edge_agent_skill_connector import build_skill_context
+from weather_adapter import fetch_weather, is_weather_request
 
 
 HOME = Path.home()
@@ -46,6 +52,7 @@ MAX_PROMPT_CHARS = int(os.environ.get("RODA_GEMMA_MAX_PROMPT_CHARS", "6000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("RODA_GEMMA_MAX_OUTPUT_TOKENS", "512"))
 OLLAMA_TIMEOUT_SECONDS = int(os.environ.get("RODA_GEMMA_OLLAMA_TIMEOUT_SECONDS", "120"))
 OLLAMA_THINK = os.environ.get("RODA_GEMMA_THINK", "0").strip().lower() in {"1", "true", "yes", "on"}
+REQUIRE_FULL_GROUP_INTAKE = os.environ.get("EDGE_AGENT_REQUIRE_FULL_GROUP_INTAKE", "1").strip().casefold() not in {"0", "false", "no", "off"}
 
 RODA_IDENTITY = render_agent_profile("roda")
 SYSTEM_PROMPT = (
@@ -54,8 +61,9 @@ SYSTEM_PROMPT = (
     "현재 역할은 짧고 정확한 대화와 간단한 안내뿐이다. "
     "주입된 스킬 문서는 안전 규칙과 판단 기준일 뿐, 이 봇에 웹 검색이나 외부 도구 권한을 추가하지 않는다. "
     "실제 조회하지 않은 출처·검색 결과·실행 결과를 만들거나 완료했다고 말하지 않는다. "
-    "파일 수정, 셸 명령, 시스템 조작, 외부 전송, 계정·인증 처리, 장기 계획 수립은 하지 않는다. "
-    "그런 요청을 받으면 실행하지 말고 상위 에이전트의 계획과 별도 하네스가 필요하다고 짧게 말한다. "
+    "파일 수정, 셸 명령, 시스템 조작, 외부 전송, 계정·인증 처리는 하지 않는다. "
+    "다만 4인 deliberation에서는 사용자 목표에 대한 현실성·실행 가능성 의견을 낼 수 있고, "
+    "실제 실행 결과를 주장하지 않는다. "
     "확인하지 않은 실행 결과를 완료했다고 말하지 않는다."
 )
 
@@ -64,6 +72,26 @@ log = logging.getLogger("roda-gemma")
 for noisy_logger in ("httpx", "httpcore", "telegram", "telegram.ext"):
     logging.getLogger(noisy_logger).setLevel(logging.WARNING)
 REQUEST_SEMAPHORE = asyncio.Semaphore(1)
+_EGRESS_QUEUE = SharedEgressQueue()
+_CONTROL_PLANE = ControlPlaneStore()
+
+
+async def _egress_send(chat_id: object, delivery_id: object, chunk_index: int, sender):
+    for attempt in range(2):
+        permit = await asyncio.to_thread(
+            _EGRESS_QUEUE.acquire,
+            chat_id,
+            delivery_id=str(delivery_id),
+            chunk_index=chunk_index,
+        )
+        try:
+            return await sender()
+        except RetryAfter as exc:
+            if attempt == 1:
+                raise
+            await asyncio.sleep(min(float(exc.retry_after), 30.0))
+        finally:
+            await asyncio.to_thread(permit.release)
 
 
 def _context_store() -> ContextEnvelopeStore:
@@ -110,25 +138,15 @@ def _split_message(text: str, limit: int = 3800) -> list[str]:
 
 
 def _strip_group_mention(text: str) -> str | None:
-    command = re.match(r"^/(\w+)(?:@([^\s]+))?(?:\s|$)", text)
-    if command:
-        target = command.group(2)
-        # Slash commands addressed to another bot are not ordinary natural
-        # language. In a shared group Roda must stay silent for them; without
-        # this guard, disabling Telegram privacy mode makes Roda answer every
-        # other bot's command as if it were default fan-out text.
-        if not target or target.casefold() != RODA_USERNAME.casefold():
-            return None
-    mention = re.compile(rf"@{re.escape(RODA_USERNAME)}\b", re.IGNORECASE)
-    addressed = mention.search(text) or RODA_WAKE_PATTERN.search(text)
-    broadcast = any(word in " ".join(text.split()) for word in GROUP_ADDRESS_WORDS)
-    if not addressed and not broadcast:
-        # Shared-channel mode: once Telegram privacy mode is disabled (or the
-        # bot is promoted), Roda participates in ordinary natural language too.
-        return text.strip()
-    cleaned = mention.sub("", text, count=1)
-    cleaned = RODA_WAKE_PATTERN.sub("", cleaned, count=1).strip()
-    return cleaned or "안녕하세요. 무엇을 도와드릴까요?"
+    # This must be the same decision used by the three provider bridges.
+    # The shared ingress contract decides whether this room message reaches
+    # Roda. Plain group messages are room-wide; direct addresses remain
+    # exclusive.
+    decision = classify_ingress(text)
+    if not decision.accepts("roda"):
+        return None
+    cleaned = re.sub(r"(?<!\w)로다(?:에게|한테|야|아|는|가|랑|과|와|도|만|님)?(?!\w)", "", decision.cleaned_text, count=1, flags=re.IGNORECASE)
+    return " ".join(cleaned.split()).strip() or "안녕하세요. 무엇을 도와드릴까요?"
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -144,12 +162,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if not text:
         return
     original_text = text
+    deliberation_session_id = None
     if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         if chat.id not in ALLOWED_GROUP_IDS:
             return
         text = _strip_group_mention(text)
         if text is None:
             return
+        if is_deliberation_request(original_text) and classify_ingress(original_text).accepts("claude"):
+            deliberation_session_id = session_id_for_telegram(chat.id, message.message_id)
+            DeliberationStore().start(deliberation_session_id, original_text, roles=roles_for_request(original_text))
     elif chat.type != ChatType.PRIVATE:
         return
     if len(text) > MAX_PROMPT_CHARS:
@@ -173,7 +195,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         guard = "⚠️ 이전 대상을 하나로 특정할 수 없습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요." if preparation.resolution.status == "ambiguous" else "⚠️ 이전 대상이 만료되었습니다. 원본 메시지에 답장하거나 링크를 다시 보내 주세요."
         await message.reply_text(guard)
         return
+    if is_cancel_request(text):
+        try:
+            _CONTROL_PLANE.cancel_chat(chat.id, reason=text, actor="telegram-roda")
+            await message.reply_text("🛑 로다 작업과 대기 중인 하위 작업을 취소했습니다.")
+        except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+            log.warning("control-plane cancellation failed: %s", type(exc).__name__)
+            await message.reply_text("⚠️ 취소 상태를 기록하지 못했습니다. 다시 시도해 주세요.")
+        return
     prompt = f"{preparation.prompt_block}\n\n[사용자 요청]\n{text}" if preparation is not None else text
+    if deliberation_session_id:
+        prompt = "[이번 deliberation의 Roda 1차 의견: 현실성·사용자 관점]\n" + prompt
 
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     task_id = ""
@@ -184,27 +216,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except (OSError, ValueError, TypeError) as exc:
         log.warning("coordination state start failed: %s", type(exc).__name__)
+    if task_id:
+        try:
+            _CONTROL_PLANE.start_task(chat.id, task_id, roles=tuple(roles_for_request(original_text)))
+        except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+            log.warning("control-plane task start failed: %s", type(exc).__name__)
     async with REQUEST_SEMAPHORE:
         log.info("request started chat=%s", chat.id)
         try:
-            answer = await asyncio.to_thread(_ollama_chat, prompt)
+            if is_weather_request(text):
+                try:
+                    answer = (await asyncio.to_thread(fetch_weather, text)).as_text()
+                except Exception as weather_exc:
+                    log.warning("weather lookup failed; refusing an unverified model guess: %s", type(weather_exc).__name__)
+                    answer = "⚠️ 실시간 날씨 조회에 실패했습니다. 잠시 후 다시 요청해 주세요."
+            else:
+                answer = await asyncio.to_thread(_ollama_chat, prompt)
         except Exception as exc:  # keep Telegram polling alive on provider errors
             log.warning("request failed chat=%s: %s", chat.id, exc)
             try:
                 write_task_state(role="gemma", chat_id=chat.id, text=original_text, status="failed", task_id=task_id, error=str(exc)[-500:])
             except (OSError, ValueError, TypeError):
                 pass
+            if task_id:
+                try:
+                    _CONTROL_PLANE.mark_task(chat.id, task_id, "failed", summary=str(exc))
+                except (ControlPlaneError, OSError, ValueError, TypeError):
+                    pass
             await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
             return
-    for part in _split_message(answer):
-        sent = await message.reply_text(part)
-        if preparation is not None and preparation.resolution.anchor is not None and getattr(sent, "message_id", None) is not None:
-            _context_store().bind_response_message(
-                channel="telegram",
-                chat_id=chat.id,
-                source_message_id=preparation.resolution.anchor.source_message_id,
-                response_message_id=sent.message_id,
+    if deliberation_session_id:
+        DeliberationStore().record(deliberation_session_id, "roda", status="completed", summary=answer)
+    try:
+        for index, part in enumerate(_split_message(answer)):
+            sent = await _egress_send(
+                chat.id,
+                task_id,
+                index,
+                lambda: message.reply_text(part),
             )
+            if preparation is not None and preparation.resolution.anchor is not None and getattr(sent, "message_id", None) is not None:
+                _context_store().bind_response_message(
+                    channel="telegram",
+                    chat_id=chat.id,
+                    source_message_id=preparation.resolution.anchor.source_message_id,
+                    response_message_id=sent.message_id,
+                )
+    except EgressQueueError as exc:
+        log.warning("egress queue backpressure chat=%s: %s", chat.id, type(exc).__name__)
+        try:
+            write_task_state(role="gemma", chat_id=chat.id, text=original_text, status="delivery_pending", task_id=task_id, response_tail=answer[-1000:], error=str(exc))
+        except (OSError, ValueError, TypeError):
+            pass
+        return
     try:
         write_task_state(
             role="gemma", chat_id=chat.id, text=original_text, status="completed", task_id=task_id,
@@ -212,6 +276,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
     except (OSError, ValueError, TypeError) as exc:
         log.warning("coordination state completion failed: %s", type(exc).__name__)
+    if task_id:
+        try:
+            _CONTROL_PLANE.mark_task(chat.id, task_id, "completed", summary=answer)
+        except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+            log.warning("control-plane task completion failed: %s", type(exc).__name__)
     log.info("request completed chat=%s", chat.id)
 
 
@@ -266,12 +335,15 @@ async def post_init(application: Application) -> None:
                 direct_mentions_expected,
             )
             if not all_group_messages and direct_mentions_expected:
-                log.warning(
-                    "group=%s privacy mode may filter unmentioned text; use @%s or promote the bot for full group intake",
-                    group_id,
-                    actual,
-                )
+                message = "group=%s privacy mode may filter unmentioned text; use @%s or promote the bot for full group intake"
+                if REQUIRE_FULL_GROUP_INTAKE:
+                    raise RuntimeError(message % (group_id, actual))
+                log.warning(message, group_id, actual)
         except Exception as exc:  # keep polling alive; health is still logged
+            if REQUIRE_FULL_GROUP_INTAKE:
+                log.error("group=%s privacy/intake verification failed: %s", group_id, type(exc).__name__)
+                application.stop_running()
+                os._exit(1)
             log.warning("group=%s membership check unavailable: %s", group_id, type(exc).__name__)
 
 

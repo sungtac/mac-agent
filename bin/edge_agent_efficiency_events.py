@@ -13,6 +13,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
+from edge_agent_secure_paths import ensure_private_directory, open_lock, read_text
+
 
 SCHEMA = "edge_agent.efficiency_event.v1"
 _SENSITIVE = ("token=", "api_key", "authorization:", "bearer ", "password=", "cookie:", "secret=")
@@ -61,14 +63,13 @@ class EfficiencyEvent:
 
 class EfficiencyStore:
     def __init__(self, root: str | Path | None = None):
-        self.root = Path(root or Path.home() / ".edge-agent" / "efficiency").expanduser().resolve()
+        self.root = ensure_private_directory(Path(root or Path.home() / ".edge-agent" / "efficiency").expanduser())
         self.path = self.root / "events.jsonl"
         self.lock_path = self.root / "events.lock"
 
     @contextlib.contextmanager
     def _lock(self) -> Iterator[None]:
-        self.root.mkdir(parents=True, exist_ok=True)
-        descriptor = os.open(str(self.lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        descriptor = open_lock(self.lock_path)
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
@@ -80,7 +81,7 @@ class EfficiencyStore:
         with self._lock():
             existing = []
             if self.path.exists():
-                for line in self.path.read_text(encoding="utf-8").splitlines():
+                for line in read_text(self.path).splitlines():
                     existing.append(json.loads(line))
             for item in existing:
                 if item.get("event_idempotency_key") == event.event_idempotency_key:

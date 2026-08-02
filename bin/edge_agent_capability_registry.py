@@ -8,19 +8,35 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from edge_agent_capability_preflight import render_prompt
-from edge_agent_skill_catalog import catalog_skill_ids
+from edge_agent_skill_catalog import catalog_skill_ids, load_catalog
 
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
 CORE_SKILL = "edge-agent-behavior"
 SKILL_TRIGGERS = {
-    "quota_resume": ("quota", "rate_limit", "429", "토큰 한도", "재개", "fallback"),
-    "product_research": ("추천제품", "제품 추천", "최저가", "가성비", "쿠폰", "가격비교", "구매 링크"),
-    "calendar": ("일정", "캘린더", "calendar", "회의 일정", "약속"),
-    "roda_public_search": ("공개자료", "공개 검색", "출처", "논문 찾아", "사이트 찾아"),
-    "harness-memory": ("디버그", "디버깅", "반복 오류", "재현", "실패 원인"),
-    "hermes_runtime": ("반복 장애", "회귀", "퇴역", "live_verified", "증거 티켓"),
-    "code-review": ("코드리뷰", "코드 리뷰", "코드 점검", "코드점검", "코드 품질", "코드품질"),
+    "quota_resume": (
+        "quota", "rate_limit", "rate limit", "429", "insufficient_quota", "토큰 한도", "재개", "fallback",
+    ),
+    "product_research": (
+        "추천제품", "제품 추천", "최저가", "가성비", "쿠폰", "가격비교", "구매 링크",
+        "product recommendation", "recommend a product", "lowest price", "price comparison", "buying link",
+    ),
+    "calendar": ("일정", "캘린더", "calendar", "schedule", "meeting", "appointment", "회의 일정", "약속"),
+    "roda-public-search": (
+        "공개자료", "공개 검색", "공개 출처", "논문 찾아", "사이트 찾아", "public source", "public sources",
+        "web search", "find sources", "find a paper",
+    ),
+    "harness-memory": (
+        "디버그", "디버깅", "반복 오류", "재현", "실패 원인", "debug", "debugging", "troubleshoot",
+        "test failure", "regression", "retry failure",
+    ),
+    "hermes_runtime": (
+        "반복 장애", "회귀", "퇴역", "live_verified", "증거 티켓", "hermes", "lifecycle", "retirement evidence",
+    ),
+    "code-review": (
+        "코드리뷰", "코드 리뷰", "코드 점검", "코드점검", "코드 품질", "코드품질", "code review",
+        "review this code", "review this diff", "pull request review", "quality review",
+    ),
 }
 
 # These bounded policy signals are not portable skills in skills/catalog.json.
@@ -61,27 +77,42 @@ def select_policy_skill_ids(prompt: str) -> tuple[str, ...]:
 def resolve(prompt: str, *, max_chars: int = 6000, include_core: bool = True) -> CapabilityResolution:
     if max_chars < 100:
         raise ValueError("max_chars must be at least 100")
+    catalog = load_catalog()
+    manifest_paths = {
+        entry["id"]: SKILLS_ROOT / entry["manifest"]
+        for entry in catalog["skills"]
+        if entry["status"] == "active"
+    }
+    discovered = set(manifest_paths)
     selected: list[str] = []
-    if include_core and CORE_SKILL in discover_skill_ids():
+    if include_core and CORE_SKILL in discovered:
         selected.append(CORE_SKILL)
     for skill in select_skill_ids(prompt):
-        if skill in discover_skill_ids() and skill not in selected:
+        if skill in discovered and skill not in selected:
             selected.append(skill)
     sections: list[str] = []
     omitted: list[str] = []
     remaining = max_chars
     for skill in selected:
-        path = SKILLS_ROOT / skill / "SKILL.md"
+        path = manifest_paths[skill]
         text = path.read_text(encoding="utf-8")
         block = f"\n[Edge Agent skill: {skill}]\n{text.strip()}\n"
         if remaining <= 0:
             omitted.append(skill)
             continue
-        limit = min(remaining, 700) if skill == CORE_SKILL else remaining
-        sections.append(block[:limit])
-        remaining -= min(len(block), limit)
+        # Keep the old bounded behavior, but make truncation explicit and cut at
+        # a line boundary. A provider must not mistake a partial contract for a
+        # complete skill document.
+        core_budget = 700 if max_chars < 2400 else 2200
+        limit = min(remaining, core_budget) if skill == CORE_SKILL else remaining
         if len(block) > limit:
+            excerpt_limit = max(0, limit - len("\n[truncated: incomplete skill contract]\n"))
+            excerpt = block[:excerpt_limit].rsplit("\n", 1)[0]
+            sections.append(excerpt + "\n[truncated: incomplete skill contract]\n")
             omitted.append(skill)
+        else:
+            sections.append(block)
+        remaining -= min(len(block), limit)
     return CapabilityResolution(tuple(selected), "".join(sections), tuple(omitted))
 
 

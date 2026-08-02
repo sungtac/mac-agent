@@ -20,16 +20,89 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
+import ipaddress
+import re
+from urllib.parse import urlsplit
 
 DEFAULT_STORE = Path(
     os.environ.get("EDGE_AGENT_STATE_ROOT", "~/.edge-agent/state")
 ).expanduser().resolve() / "skills" / "harness_memory_records.json"
 LOCK_TIMEOUT_SECONDS = 5.0
+SENSITIVE_PATTERNS = (
+    re.compile(r"\bsk-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b(?:ghp|github_pat)[_-][A-Za-z0-9_-]+\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9_-]+\b"),
+    re.compile(r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bbearer\s+[A-Za-z0-9._~+/=-]{12,}\b", re.IGNORECASE),
+    re.compile(
+        r"\b(?:token|secret|password|api[_ -]?key|authorization)\s*[:=]\s*[^\s,'\"]+",
+        re.IGNORECASE,
+    ),
+)
+URL_PATTERN = re.compile(r"https?://[^\s'\"<>]+", re.IGNORECASE)
+SENSITIVE_KEYS = {
+    "token", "secret", "password", "api_key", "authorization", "cookie",
+    "private_key", "client_secret", "access_token", "refresh_token", "credential",
+}
 
 
 def store_path() -> Path:
     raw = os.environ.get("HARNESS_MEMORY_STORE")
     return Path(raw).expanduser().resolve() if raw else DEFAULT_STORE
+
+
+def is_sensitive_key(key: Any) -> bool:
+    return str(key).strip().casefold().replace("-", "_").replace(" ", "_") in SENSITIVE_KEYS
+
+
+def is_private_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+        if parsed.username or parsed.password:
+            return True
+        if hostname.lower() in {"localhost", "localhost.localdomain"} or hostname.lower().endswith(".local"):
+            return True
+        try:
+            return ipaddress.ip_address(hostname).is_private or ipaddress.ip_address(hostname).is_loopback or ipaddress.ip_address(hostname).is_link_local or ipaddress.ip_address(hostname).is_reserved
+        except ValueError:
+            return False
+    except ValueError:
+        return False
+
+
+def contains_sensitive(value: Any) -> bool:
+    if isinstance(value, str):
+        if any(pattern.search(value) for pattern in SENSITIVE_PATTERNS):
+            return True
+        return any(is_private_url(match.group(0)) for match in URL_PATTERN.finditer(value))
+    if isinstance(value, dict):
+        return any(is_sensitive_key(key) or contains_sensitive(key) or contains_sensitive(item) for key, item in value.items())
+    if isinstance(value, (list, tuple)):
+        return any(contains_sensitive(item) for item in value)
+    return False
+
+
+def redact_text(value: str) -> str:
+    def redact_url(match: re.Match[str]) -> str:
+        return "[REDACTED_URL]" if is_private_url(match.group(0)) else match.group(0)
+
+    redacted = URL_PATTERN.sub(redact_url, value)
+    for pattern in SENSITIVE_PATTERNS:
+        redacted = pattern.sub("[REDACTED]", redacted)
+    return redacted
+
+
+def redact_value(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: "[REDACTED]" if is_sensitive_key(key) else redact_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_value(item) for item in value]
+    return value
 
 
 @contextmanager
@@ -71,20 +144,25 @@ def load_records(path: Path | None = None) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for item in data:
         if isinstance(item, dict):
-            records.append(item)
+            records.append(redact_value(item))
     return records
 
 
 def write_records(records: list[dict[str, Any]], path: Path | None = None) -> None:
+    if contains_sensitive(records):
+        raise ValueError("harness memory refuses sensitive values")
     path = path or store_path()
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
         tmp = Path(tmp_name)
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
                 f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         finally:
             if tmp.exists():
@@ -128,6 +206,8 @@ def search(query: str, *, path: Path | None = None) -> list[dict[str, Any]]:
 
 
 def append_record(record: dict[str, Any], *, path: Path | None = None) -> None:
+    if contains_sensitive(record):
+        raise ValueError("harness memory refuses sensitive values")
     path = path or store_path()
     with file_lock(path):
         records = load_records(path)
@@ -136,9 +216,12 @@ def append_record(record: dict[str, Any], *, path: Path | None = None) -> None:
         fd, tmp_name = tempfile.mkstemp(prefix=path.name + ".", suffix=".tmp", dir=str(path.parent))
         tmp = Path(tmp_name)
         try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(records, f, ensure_ascii=False, indent=2)
                 f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, path)
         finally:
             if tmp.exists():

@@ -22,7 +22,8 @@ provider sandbox, capability preflight, skill resolver, auth/boundary/audit 계�
 - `config/edge-agent-boundary.json`의 Codex service: `com.multiagent.engine`
 - `com.multiagent.engine.plist`: `TELEGRAM_BOT_TOKEN_FILE`은 canonical secret,
   `MULTIAGENT_ENGINE_ROOT`는 `/Users/edge_ai/mac-agent`
-- `com.macagent.telegram-codex.plist`: 디스크에 보존되지만 disabled
+- `com.macagent.telegram-codex.plist`: `~/.edge-agent/retired-launchagents/2026-08-02/`로
+  이동한 recoverable quarantine 보존본이며 LaunchAgents에서 제거됨
 - auth boundary: 두 plist의 기대 경로를 알고, disabled direct plist는 active
   duplicate로 세지 않음
 - boundary audit: engine의 `telegram/adapter.py`를 Codex process script로 인정
@@ -73,8 +74,8 @@ provider sandbox, capability preflight, skill resolver, auth/boundary/audit 계�
 6. 두 저장소의 dirty 변경과 기준 commit을 별도 checkpoint로 기록하고 운영자
    승인을 받는다.
 
-조건이 충족되기 전까지 Codex LaunchAgent plist와 Codex 전용 호환 테스트는
-quarantine 상태로 보존한다. 공유 `telegram-agent-bot.py`와 Claude·Antigravity
+조건 충족 후 Codex LaunchAgent plist는 recoverable quarantine 상태로 보존한다.
+공유 `telegram-agent-bot.py`와 Claude·Antigravity
 경로는 계속 active로 유지한다. 삭제나 worktree prune은 이 기록의 범위에
 포함하지 않는다.
 
@@ -97,15 +98,14 @@ read-only 판정 명령:
 python3 bin/edge_agent_engine_retirement.py --json
 ```
 
-현재 gate는 rollback 대상 보존과 shared adapter 소유권을 확인했고, 다음 세 가지를
-승인 대상으로 명시한다.
+현재 gate는 rollback 대상 보존과 shared adapter 소유권을 확인했고, 다음 조치를
+완료했다.
 
 - 실제 Telegram canary 1회 전송
 - Codex 전용 LaunchAgent plist의 recoverable quarantine 이동
-- Claude·Antigravity 경로를 건드리지 않는 Codex 전용 분기 분리·제거
+- Claude·Antigravity 경로를 건드리지 않는 shared adapter 보존
 
-gate 자체는 서비스·파일·credential을 변경하지 않는다. 실제 canary와 quarantine는
-운영자 승인 후 별도 단계로 실행한다.
+gate는 실제 변경을 수행하지 않으며, 위 조치는 별도 운영 절차로 완료했다.
 
 현재 gate 실행 결과의 temporary-copy rollback rehearsal는 `passed: true`다.
 엔진 plist와 disabled direct plist의 복사본을 quarantine→restore하고 byte equality를
@@ -118,6 +118,29 @@ gate 자체는 서비스·파일·credential을 변경하지 않는다. 실제 c
 - auth boundary: `ready: true`, duplicate 0개
 - boundary audit: `findings: []`
 - `com.multiagent.engine`: running
-- `com.macagent.telegram-codex`: disabled / loaded 아님
+- `com.macagent.telegram-codex`: LaunchAgents에서 제거, quarantine 보존 / loaded 아님
+
+## 2026-08-02 live follow-up
+
+다음 운영 절차를 실제 실행했다.
+
+- Claude·Antigravity drain-aware 재기동 성공
+- 두 provider의 restricted permission lifecycle smoke 성공
+- canonical Codex engine provider smoke 성공
+- bounded Telegram canary 전송 성공(message id `283`)
+- 동시 active runner + unittest discovery 실행에서 두 suite 모두 exit 0
+
+이는 provider 시작·단일 실제 turn·전송 경로의 live evidence다. 다중 시간
+관찰을 이미 완료했다고 의미하지 않으며, 장시간 canary는 별도 elapsed-time
+관찰 기록이 필요하다.
 
 credential 값 자체는 어느 출력에도 포함하지 않는다.
+
+## 운영 보존 상태 최종화 (2026-08-02)
+
+- canonical `com.multiagent.engine`만 active Codex poller로 유지한다.
+- legacy direct plist는 `/Users/edge_ai/.edge-agent/retired-launchagents/2026-08-02/`
+  아래에 mode `0600`으로 이동했고, rollback 시 원래 LaunchAgents 위치로 복원할 수
+  있다.
+- retirement gate 결과는 `findings=[]`, `approval_required=[]`,
+  `direct_codex_plist_quarantined=true`다.

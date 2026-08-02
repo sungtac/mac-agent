@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from skills.hermes_runtime.hermes_lifecycle_common import high_priority_records, lifecycle_stage
+from skills.hermes_runtime.hermes_lifecycle_common import high_priority_records, lifecycle_stage, redact_text
 
 DEFAULT_LOG = Path(
     __import__("os").environ.get("EDGE_AGENT_HERMES_LOG", "~/.edge-agent/state/hermes-feedback.jsonl")
@@ -66,17 +67,31 @@ def _text(record: dict[str, Any], *keys: str) -> str:
 
 def mitigation_evidence(record: dict[str, Any]) -> bool:
     text = _text(record, "validation", "harnessChanges", "harness", "required_gate", "requiredGate", "evidence_path", "evidencePath")
-    return bool(text.strip())
+    return _adequate_evidence(text, minimum=8)
 
 
 def live_evidence(record: dict[str, Any]) -> bool:
     text = _text(record, "liveEvidence", "live_evidence", "messageId", "message_id", "runtimeEvidence", "runtime_evidence")
-    return bool(text.strip())
+    return _adequate_evidence(text, minimum=20)
 
 
 def retirement_evidence(record: dict[str, Any]) -> bool:
     text = _text(record, "retirementEvidence", "retirement_evidence", "retiredAt", "retired_at")
-    return bool(text.strip())
+    return _adequate_evidence(text, minimum=8)
+
+
+def recurrence_free_window(record: dict[str, Any]) -> bool:
+    text = _text(record, "recurrenceFreeWindow", "recurrence_free_window", "retirementWindow", "retirement_window")
+    if not _adequate_evidence(text, minimum=3):
+        return False
+    return bool(re.search(r"\d+\s*(?:minutes?|hours?|days?|weeks?|months?|분|시간|일|주|개월)", text, re.IGNORECASE))
+
+
+def _adequate_evidence(text: str, *, minimum: int) -> bool:
+    normalized = " ".join(text.split()).casefold()
+    if len(normalized) < minimum:
+        return False
+    return normalized not in {"x", "ok", "done", "verified", "true", "test"}
 
 
 def static_evidence(record: dict[str, Any]) -> bool:
@@ -90,7 +105,7 @@ def evaluate(path: str | Path = DEFAULT_LOG) -> LifecycleReport:
     active = mitigated = live_verified = retired = static_verified = 0
 
     for _, record, _, stage in rows:
-        title = str(record.get("title") or "untitled")
+        title = redact_text(str(record.get("title") or "untitled"))
         if stage in ACTIVE_STATUSES:
             active += 1
             missing = []
@@ -127,6 +142,8 @@ def evaluate(path: str | Path = DEFAULT_LOG) -> LifecycleReport:
                 missing.append("live evidence")
             if not retirement_evidence(record):
                 missing.append("retirement evidence/retiredAt")
+            if not recurrence_free_window(record):
+                missing.append("recurrence-free window")
             if missing:
                 issues.append(LifecycleIssue("error", "retired.evidence-missing", title, "retired items require mitigation, live, and retirement evidence", missing))
             continue

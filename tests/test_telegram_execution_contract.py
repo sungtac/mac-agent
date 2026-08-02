@@ -87,6 +87,26 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         self.delivery_root.cleanup()
 
+    def test_ingress_identity_is_message_stable_and_role_scoped(self):
+        message = SimpleNamespace(chat_id=-1003952617795, message_id=42)
+        update = SimpleNamespace(
+            update_id=100,
+            effective_chat=SimpleNamespace(type=BOT.ChatType.GROUP, id=message.chat_id),
+        )
+        with patch.object(BOT, "ROLE", "claude"):
+            claude_task, claude_key, root = BOT._ingress_identity(update, message, bot_id="claude")
+        with patch.object(BOT, "ROLE", "antigravity"):
+            agy_task, agy_key, agy_root = BOT._ingress_identity(update, message, bot_id="antigravity")
+        self.assertEqual(root, agy_root)
+        self.assertEqual(claude_key, agy_key)
+        self.assertNotEqual(claude_task, agy_task)
+
+    def test_live_router_produces_risk_and_worktree_metadata(self):
+        decision = BOT.deterministic_route(BOT.RouterInput("코드 수정 후 검토해줘"))
+        self.assertTrue(decision.requires_worktree)
+        self.assertTrue(decision.requires_approval)
+        self.assertIn("task_type:coding", decision.reason_codes)
+
     def test_conflict_burst_persists_a_bounded_restart_cooldown(self):
         with tempfile.TemporaryDirectory() as directory:
             original_file = BOT._CONFLICT_COOLDOWN_FILE
@@ -126,6 +146,27 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
             and node.func.value.id == "Application"
         )
         self.assertLess(lock_line, builder_line)
+
+    def test_singleton_lock_startup_path_executes_without_unresolved_dependencies(self):
+        original_directory = BOT._SINGLETON_LOCK_DIR
+        original_fd = BOT._singleton_lock_fd
+        with tempfile.TemporaryDirectory() as directory:
+            BOT._SINGLETON_LOCK_DIR = Path(directory)
+            BOT._singleton_lock_fd = None
+            try:
+                BOT._acquire_singleton_lock()
+                self.assertIsInstance(BOT._singleton_lock_fd, int)
+            finally:
+                if BOT._singleton_lock_fd is not None:
+                    os.close(BOT._singleton_lock_fd)
+                BOT._singleton_lock_fd = original_fd
+                BOT._SINGLETON_LOCK_DIR = original_directory
+
+    def test_provider_permission_contract_does_not_use_global_bypass(self):
+        source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")
+        self.assertNotIn("--dangerously-skip-permissions", source)
+        self.assertIn('"--permission-mode", "acceptEdits"', source)
+        self.assertIn('"--sandbox", "--mode", "accept-edits"', source)
 
     async def test_existing_worktree_requires_matching_owner_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

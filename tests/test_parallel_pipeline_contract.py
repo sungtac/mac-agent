@@ -99,6 +99,25 @@ class ParallelPipelineContractTests(unittest.TestCase):
         self.assertTrue(reservation.heartbeat("heartbeat"))
         self.assertFalse(reservation.heartbeat("missing"))
 
+    def test_stale_active_reservation_is_quarantined_before_conflict_check(self):
+        reservation = FileReservation(self.root, state_root=self.state, ttl_seconds=60)
+        reservation.registry.parent.mkdir(parents=True, exist_ok=True)
+        reservation.registry.write_text(json.dumps([{
+            "schema": "edge_agent_parallel_reservation.v1",
+            "task_id": "stale-task",
+            "repo_root": str(self.root),
+            "owner": "test",
+            "files": ["a.txt"],
+            "dependency_keys": [],
+            "state": "active",
+            "created_at": "2000-01-01T00:00:00+00:00",
+            "heartbeat_at": "2000-01-01T00:00:00+00:00",
+        }]), encoding="utf-8")
+        created = reservation.reserve(task_id="new-task", files=("a.txt",))
+        self.assertEqual(created["task_id"], "new-task")
+        records = json.loads(reservation.registry.read_text(encoding="utf-8"))
+        self.assertEqual({record["state"] for record in records}, {"stale", "active"})
+
     def test_executor_starts_and_stops_reservation_heartbeat(self):
         spec = self._spec("heartbeat-executor", "a.txt")
         self.manager.create(spec)

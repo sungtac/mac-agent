@@ -15,6 +15,7 @@ class SkillConnectorTests(unittest.TestCase):
     def test_selects_domain_skill_without_external_access(self):
         self.assertIn("product_research", select_skill_ids("최저가 제품 추천해줘"))
         self.assertIn("calendar", select_skill_ids("내일 일정 추가"))
+        self.assertIn("roda-public-search", select_skill_ids("Find public sources"))
 
     def test_all_code_review_aliases_select_the_same_skill(self):
         aliases = (

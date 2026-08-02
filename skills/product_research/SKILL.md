@@ -33,6 +33,9 @@ python3 "$HOME/mac-agent/skills/product_research/product_research_answer_gate.py
 
 Do not present a final recommendation as researched if the answer gate fails. Say what is blocked or downgrade to a non-price-verified general suggestion.
 
+The network helper is read-only and restricts requests and redirects to the
+known shopping-source host allowlist; arbitrary user-supplied hosts are rejected.
+
 ## Required workflow
 
 1. Verify exact product identity before recommending.
@@ -72,4 +75,4 @@ Do not present a final recommendation as researched if the answer gate fails. Sa
 
 ## Quality follow-up
 
-Run `python3 scripts/skill_quality_audit.py --skill <this-skill> --run-tests --json` after creating or changing this skill.
+Run `PYTHONPATH=. python3 skills/product_research/tests/test_product_researcher.py` and the answer-gate tests after creating or changing this skill.

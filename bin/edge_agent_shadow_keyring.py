@@ -42,6 +42,27 @@ def _secure_file(path: Path) -> None:
         raise ShadowKeyError("HMAC key permissions are too broad")
 
 
+def _secure_parent(path: Path, *, create: bool = False) -> None:
+    """Require the key's containing directory to be private and real."""
+
+    parent = path.parent
+    if create:
+        try:
+            parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        except OSError as exc:
+            raise ShadowKeyError("HMAC key parent is unavailable") from exc
+    try:
+        info = parent.lstat()
+    except OSError as exc:
+        raise ShadowKeyError("HMAC key parent is unavailable") from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise ShadowKeyError("HMAC key parent must be a real directory")
+    if info.st_uid != os.geteuid():
+        raise ShadowKeyError("HMAC key parent owner mismatch")
+    if stat.S_IMODE(info.st_mode) != 0o700:
+        raise ShadowKeyError("HMAC key parent permissions must be exactly 0700")
+
+
 def _key_id(key: bytes) -> str:
     return "hmac-" + hashlib.sha256(key).hexdigest()[:16]
 
@@ -106,6 +127,7 @@ class HMACKeyring:
         return self._metadata.as_dict() if self._metadata else None
 
     def reload(self) -> ShadowKeyMetadata:
+        _secure_parent(self.path)
         _secure_file(self.path)
         key = self.path.read_bytes()
         if len(key) < 16:
@@ -113,7 +135,8 @@ class HMACKeyring:
         now = _utc(self.clock())
         metadata_path = self.path.with_name(self.path.name + ".metadata.json")
         metadata: dict[str, str | None] = {}
-        if metadata_path.exists():
+        if metadata_path.exists() or metadata_path.is_symlink():
+            _secure_parent(metadata_path)
             _secure_file(metadata_path)
             try:
                 loaded = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -155,7 +178,7 @@ class HMACKeyring:
         created = _utc(timestamp)
         expires = _utc(timestamp + self.rotation_days * 86400)
         metadata = ShadowKeyMetadata(_key_id(value), created, created, expires, "active")
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        _secure_parent(self.path, create=True)
         fd, temp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", dir=self.path.parent)
         try:
             os.fchmod(fd, 0o600)
@@ -188,7 +211,7 @@ def create_test_key(path: str | Path, *, value: bytes | None = None) -> Path:
     """Create a private test key only; never called by production startup."""
 
     target = Path(path).expanduser()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    _secure_parent(target, create=True)
     target.write_bytes(value or secrets.token_bytes(32))
     os.chmod(target, 0o600)
     return target

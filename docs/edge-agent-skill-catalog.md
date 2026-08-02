@@ -25,4 +25,6 @@
 - `openclaw-backups/**`: 백업·보존 자료. 활성 스킬로 로드하지 않으며 삭제하지 않는다.
 
 새 저장소 스킬을 추가할 때는 `SKILL.md`, 직접 테스트, 카탈로그 항목을 함께 추가하고
-`tests.test_skill_catalog`를 통과시켜야 한다.
+`python3 bin/run-skill-tests.py`와 `tests.test_skill_catalog`를 통과시켜야 한다.
+`run-skill-tests.py`는 카탈로그의 `tests` 항목을 정본으로 사용하므로 별도 실행 목록을
+수동으로 갱신하지 않는다.

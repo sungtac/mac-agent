@@ -87,6 +87,16 @@ class ProductResearchAnswerGateTest(unittest.TestCase):
         self.assertIn("no candidates", issues)
         self.assertIn("fewer than two source probes", issues)
 
+    def test_invalid_timestamp_and_private_urls_fail_closed(self):
+        payload = self.valid_payload()
+        payload["generated_at"] = "not-a-timestamp"
+        payload["sources_checked"][0]["url"] = "https://127.0.0.1/internal"
+        payload["candidates"][0]["url"] = "http://127.0.0.1/product"
+        issues = validate_report(payload)
+        self.assertIn("generated_at is not ISO-8601", issues)
+        self.assertTrue(any("source probe URL" in issue for issue in issues))
+        self.assertTrue(any("candidate URL" in issue for issue in issues))
+
 
 if __name__ == "__main__":
     unittest.main()

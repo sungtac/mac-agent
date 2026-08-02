@@ -19,6 +19,8 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
+
+from edge_agent_secure_paths import ensure_private_directory, open_lock, read_text, reject_symlink_components
 from urllib.parse import urlsplit, urlunsplit
 
 from edge_agent_session_contract import new_logical_session_id
@@ -257,20 +259,22 @@ def resolve_anchor(
 
 class ContextEnvelopeStore:
     def __init__(self, root: str | Path | None = None, *, ttl_seconds: int = DEFAULT_ANCHOR_TTL_SECONDS, retention_seconds: int = DEFAULT_ANCHOR_RETENTION_SECONDS):
-        self.root = Path(root or DEFAULT_CONTEXT_ROOT).expanduser().resolve()
+        self.root = Path(root or DEFAULT_CONTEXT_ROOT).expanduser()
         self.ttl_seconds = int(ttl_seconds)
         self.retention_seconds = int(retention_seconds)
 
     def _paths(self, channel: str, chat_id: str | int) -> tuple[Path, Path]:
+        ensure_private_directory(self.root)
         component = _safe_component(str(chat_id).replace("-", "m"))
         channel_component = _safe_component(channel)
-        return (self.root / "records" / channel_component / f"{component}.json", self.root / "locks" / channel_component / f"{component}.lock")
+        record_root = ensure_private_directory(self.root / "records" / channel_component)
+        lock_root = ensure_private_directory(self.root / "locks" / channel_component)
+        return (record_root / f"{component}.json", lock_root / f"{component}.lock")
 
     @contextlib.contextmanager
     def _locked(self, channel: str, chat_id: str | int):
         _, lock_path = self._paths(channel, chat_id)
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o600)
+        fd = open_lock(lock_path)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX)
             yield
@@ -282,7 +286,7 @@ class ContextEnvelopeStore:
         path, _ = self._paths(channel, chat_id)
         if not path.exists():
             return {"schema_version": SCHEMA_VERSION, "logical_session_id": new_logical_session_id(), "envelope": None, "anchors": []}
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(read_text(path))
         if payload.get("schema_version") != SCHEMA_VERSION:
             raise ValueError("unsupported context record schema")
         payload.setdefault("anchors", [])
@@ -290,7 +294,7 @@ class ContextEnvelopeStore:
 
     def _write_unlocked(self, channel: str, chat_id: str | int, payload: Mapping[str, Any]) -> None:
         path, _ = self._paths(channel, chat_id)
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(path.parent)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -411,10 +415,13 @@ def render_prompt_context(envelope: ContextEnvelope, resolution: AnchorResolutio
 
 def native_session_path(base: str | Path | None, *, role: str, chat_id: str | int | None = None) -> Path:
     root = Path(base).expanduser() if base else Path.home() / ".edge-agent" / "state" / "telegram-native-sessions" / f"{role}.json"
+    reject_symlink_components(root)
     if chat_id is None:
         return root.resolve()
     safe_chat = re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id))
-    return root.with_name(f"{root.stem}.chat-{safe_chat}{root.suffix or '.json'}").resolve()
+    candidate = root.with_name(f"{root.stem}.chat-{safe_chat}{root.suffix or '.json'}")
+    reject_symlink_components(candidate)
+    return candidate.resolve()
 
 
 def native_session_resume_allowed(metadata: Mapping[str, Any], *, chat_id: str | int, provider: str, workspace: str, workspace_identity: str | None = None) -> bool:

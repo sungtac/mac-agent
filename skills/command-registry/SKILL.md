@@ -74,7 +74,7 @@ python3 skills/command-registry/command_registry.py update_fail "<failed_command
 ## examples
 
 ```bash
-python3 skills/command-registry/command_registry.py check "python3 scripts/skill_quality_audit.py --json"
+python3 skills/command-registry/command_registry.py check "python3 -m py_compile skills/command-registry/command_registry.py"
 ```
 
 ```bash
@@ -89,5 +89,5 @@ python3 skills/command-registry/command_registry.py update_fail \
 Run this after creating or changing this skill:
 
 ```bash
-python3 scripts/skill_quality_audit.py --skill skills/command-registry/SKILL.md --run-tests --json
+PYTHONPATH=. python3 skills/command-registry/tests/test_command_registry.py
 ```

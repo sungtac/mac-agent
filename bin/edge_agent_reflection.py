@@ -10,13 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from edge_agent_secure_paths import ensure_private_directory, read_text, reject_symlink_components
+
 
 ROOT = Path(os.environ.get("EDGE_AGENT_EVIDENCE_DIR", str(Path.home() / ".edge-agent"))).expanduser()
 REFLECTION_DIR = ROOT / "reflections"
 
 
 def _atomic_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    ensure_private_directory(path.parent)
     fd, temp_name = tempfile.mkstemp(prefix=".evidence-", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -52,8 +54,8 @@ def update_worktree_metadata(worktree: Path, *, task_id: str, role: str, status:
     """Update lifecycle state without replacing creation ownership evidence."""
     path = worktree / ".edge-agent-task.json"
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        payload = json.loads(read_text(path))
+    except (OSError, UnicodeError, RuntimeError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"worktree metadata is unreadable: {path}") from exc
     if (
         payload.get("schema") != "edge_agent_worktree.v1"

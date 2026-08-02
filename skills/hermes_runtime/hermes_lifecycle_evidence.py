@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import sys
+import tempfile
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,8 +22,8 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from skills.hermes_runtime.hermes_lifecycle_common import high_priority_records, priority_of
-from skills.hermes_runtime.hermes_lifecycle_gate import DEFAULT_LOG, lifecycle_stage, live_evidence, mitigation_evidence, retirement_evidence
+from skills.hermes_runtime.hermes_lifecycle_common import contains_sensitive, high_priority_records, priority_of, redact_text
+from skills.hermes_runtime.hermes_lifecycle_gate import DEFAULT_LOG, lifecycle_stage, live_evidence, mitigation_evidence, recurrence_free_window, retirement_evidence
 
 
 @dataclass
@@ -60,7 +62,10 @@ def load_lines(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
     for line in lines:
         if not line.strip():
             continue
-        records.append(json.loads(line))
+        value = json.loads(line)
+        if not isinstance(value, dict):
+            raise ValueError(f"Hermes record at {path} is not an object")
+        records.append(value)
     return lines, records
 
 
@@ -74,9 +79,11 @@ def candidate_for(index: int, record: dict[str, Any], *, priority: int | None = 
     missing_retired = list(missing_live)
     if not retirement_evidence(record):
         missing_retired.append("retirement evidence/retiredAt")
+    if not recurrence_free_window(record):
+        missing_retired.append("recurrence-free window")
     return Candidate(
         index=index,
-        title=str(record.get("title") or "untitled"),
+        title=redact_text(str(record.get("title") or "untitled")),
         stage=stage,
         priority=int(priority if priority is not None else priority_of(record)),
         can_live_verify=stage == "mitigated" and not missing_live,
@@ -111,8 +118,10 @@ def apply_evidence(
     target_stage: str,
     live_evidence_text: str,
     retirement_evidence_text: str = "",
+    recurrence_free_window_text: str = "",
     contains: bool = False,
     dry_run: bool = False,
+    approved: bool = False,
 ) -> EvidenceResult:
     p = Path(path)
     errors: list[str] = []
@@ -122,6 +131,12 @@ def apply_evidence(
         errors.append("live evidence is required")
     if target_stage == "retired" and not retirement_evidence_text.strip():
         errors.append("retirement evidence is required for retired")
+    if target_stage == "retired" and not recurrence_free_window_text.strip():
+        errors.append("recurrence-free window is required for retired")
+    if contains_sensitive((live_evidence_text, retirement_evidence_text, recurrence_free_window_text)):
+        errors.append("evidence contains sensitive values")
+    if not dry_run and not approved:
+        errors.append("explicit approval is required for ledger mutation")
     lines, records = load_lines(p)
     hits = match_records(records, title, contains)
     if not hits:
@@ -148,6 +163,7 @@ def apply_evidence(
         record["liveVerifiedAt"] = record.get("liveVerifiedAt") or now
         if target_stage == "retired":
             record["retirementEvidence"] = retirement_evidence_text.strip()
+            record["recurrenceFreeWindow"] = recurrence_free_window_text.strip()
             record["retiredAt"] = record.get("retiredAt") or now
         record["lifecycleUpdatedAt"] = now
         updated += 1
@@ -162,7 +178,18 @@ def apply_evidence(
             shutil.copy2(p, backup_path)
             backup = str(backup_path)
         content = "\n".join(json.dumps(record, ensure_ascii=False, sort_keys=True) for record in records) + "\n"
-        p.write_text(content, encoding="utf-8")
+        fd, temporary = tempfile.mkstemp(prefix=f".{p.name}.", suffix=".tmp", dir=str(p.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            if p.exists():
+                os.chmod(temporary, p.stat().st_mode & 0o777)
+            os.replace(temporary, p)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
     return EvidenceResult(True, "apply", len(hits), updated, str(p), backup=backup)
 
 
@@ -179,7 +206,9 @@ def main(argv: list[str] | None = None) -> int:
     p_apply.add_argument("--target-stage", choices=["live_verified", "retired"], required=True)
     p_apply.add_argument("--live-evidence", required=True)
     p_apply.add_argument("--retirement-evidence", default="")
+    p_apply.add_argument("--recurrence-free-window", default="", help="explicit recurrence-free observation window required for retired")
     p_apply.add_argument("--dry-run", action="store_true")
+    p_apply.add_argument("--confirm-approval", action="store_true", help="confirm explicit user approval for ledger mutation")
     p_apply.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -192,8 +221,10 @@ def main(argv: list[str] | None = None) -> int:
             target_stage=args.target_stage,
             live_evidence_text=args.live_evidence,
             retirement_evidence_text=args.retirement_evidence,
+            recurrence_free_window_text=args.recurrence_free_window,
             contains=args.contains,
             dry_run=args.dry_run,
+            approved=args.confirm_approval,
         )
     payload = asdict(result)
     if getattr(args, "json", False):

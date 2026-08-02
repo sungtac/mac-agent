@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
+import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -131,10 +133,25 @@ def build_payload(plan: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Generate read-only Hermes evidence tickets")
     parser.add_argument("--input", default="", help="Use an existing active_resolution.json instead of running the planner")
-    parser.add_argument("--output-dir", default=str(ROOT / "state" / "hermes-evidence-tickets"))
+    default_output = Path(os.environ.get("EDGE_AGENT_STATE_ROOT", "~/.edge-agent/state")).expanduser() / "hermes-evidence-tickets"
+    parser.add_argument("--output-dir", default=str(default_output))
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
 
@@ -142,8 +159,8 @@ def main(argv: list[str] | None = None) -> int:
     payload = build_payload(plan)
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "latest.json").write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (out_dir / "latest.md").write_text(render_markdown(payload), encoding="utf-8")
+    _atomic_write_text(out_dir / "latest.json", json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    _atomic_write_text(out_dir / "latest.md", render_markdown(payload))
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

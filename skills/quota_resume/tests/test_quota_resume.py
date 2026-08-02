@@ -22,6 +22,9 @@ def main() -> int:
         assert "sk-test" not in raw
         queue = quota_resume.add_resume_queue_item(base, {"task_id": "T1", "resume_after": "2000-01-01T00:00:00"})
         assert queue["status"] == "success"
+        duplicate = quota_resume.record_quota_event(base, {"event_id": event["event_id"], "message": "different"})
+        assert duplicate["event"]["event_id"] == event["event_id"]
+        assert len(json.loads((base / "state" / "quota_events.json").read_text(encoding="utf-8"))["events"]) == 1
         items = quota_resume.ready_queue_items(base)
         assert items and items[0]["auto_execute"] is False and items[0]["requires_user_review"] is True
         json.loads(raw)

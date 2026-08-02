@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
+from edge_agent_secure_paths import ensure_private_directory, read_text, reject_symlink_components
+
 
 SCHEMA = "edge_agent_parallel_worktree.v1"
 # `succeeded` and `merge_ready` still own a live worktree and therefore remain
@@ -113,9 +115,9 @@ class WorktreeManager:
 
     def __init__(self, *, state_root: str | Path | None = None, worktree_root: str | Path | None = None):
         root = Path(state_root or Path.home() / ".edge-agent" / "parallel").expanduser()
-        self.state_root = root.resolve()
+        self.state_root = ensure_private_directory(root)
         self.manifest_root = self.state_root / "manifests"
-        self.worktree_root = Path(worktree_root or Path.home() / ".edge-agent-worktrees" / "parallel").expanduser().resolve()
+        self.worktree_root = ensure_private_directory(Path(worktree_root or Path.home() / ".edge-agent-worktrees" / "parallel").expanduser())
 
     def _manifest_path(self, task_id: str) -> Path:
         return self.manifest_root / f"{task_id}.json"
@@ -126,7 +128,7 @@ class WorktreeManager:
 
     @staticmethod
     def _write_json(path: Path, payload: dict) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        ensure_private_directory(path.parent)
         fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as stream:
@@ -149,6 +151,8 @@ class WorktreeManager:
         resolved_base = _git(repo, "rev-parse", spec.base_commit)
         target = self._worktree_path(spec)
         manifest_path = self._manifest_path(spec.task_id)
+        reject_symlink_components(target)
+        reject_symlink_components(manifest_path)
         if target.exists() or manifest_path.exists():
             raise FileExistsError(f"parallel task already exists: {spec.task_id}")
 
@@ -191,7 +195,7 @@ class WorktreeManager:
 
     def read(self, task_id: str) -> WorktreeManifest:
         path = self._manifest_path(task_id)
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(read_text(path))
         if payload.get("schema") != SCHEMA:
             raise ValueError("unsupported parallel worktree manifest schema")
         return WorktreeManifest(**payload)

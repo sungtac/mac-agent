@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -43,8 +44,29 @@ def load_catalog(path: str | Path = DEFAULT_CATALOG) -> dict[str, Any]:
             raise ValueError(f"manifest escapes skills root: {skill_id}")
         if not manifest_path.is_file():
             raise ValueError(f"manifest is missing for {skill_id}: {manifest}")
+        manifest_text = manifest_path.read_text(encoding="utf-8")
+        name_match = re.search(r"^name:\s*(\S+)\s*$", manifest_text, re.MULTILINE)
+        if not name_match:
+            raise ValueError(f"manifest has no frontmatter name for {skill_id}")
+        normalize_id = lambda value: value.replace("-", "_")
+        if normalize_id(name_match.group(1)) != normalize_id(skill_id):
+            raise ValueError(f"catalog id does not match manifest name for {skill_id}")
         if manifest in seen_manifests:
             raise ValueError(f"duplicate skill manifest: {manifest}")
+        tests = entry.get("tests", [])
+        if not isinstance(tests, list) or any(
+            not isinstance(test_path, str) or not test_path or Path(test_path).is_absolute() for test_path in tests
+        ):
+            raise ValueError(f"invalid tests paths for {skill_id}")
+        for test_path in tests:
+            repo_candidate = (ROOT / test_path).resolve()
+            skills_candidate = (SKILLS_ROOT / test_path).resolve()
+            repo_safe = ROOT.resolve() in repo_candidate.parents or repo_candidate == ROOT.resolve()
+            skills_safe = SKILLS_ROOT.resolve() in skills_candidate.parents or skills_candidate == SKILLS_ROOT.resolve()
+            if not (repo_safe and repo_candidate.exists()) and not (skills_safe and skills_candidate.exists()):
+                if not repo_safe and not skills_safe:
+                    raise ValueError(f"test path escapes repository root: {skill_id}")
+                raise ValueError(f"test path is missing for {skill_id}: {test_path}")
         seen_ids.add(skill_id)
         seen_manifests.add(manifest)
     return payload
