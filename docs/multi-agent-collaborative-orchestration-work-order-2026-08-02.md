@@ -410,7 +410,7 @@ verdict: pass | changes_required
   fan-out을 막지 않도록 claim key를 `message_key:role=<role>`로 분리했다. 따라서
   동일 역할의 중복 update는 막고, 같은 사용자 발화에 대한 네 역할의 정상 참여는
   허용한다.
-- 검증 결과: mac-agent `475 tests`, engine-repo `44 tests` 모두 통과했고,
+- 검증 결과: mac-agent `476 tests`, engine-repo `44 tests` 모두 통과했고,
   compileall·git diff --check·LaunchAgent plist lint를 통과했다. 네 canonical
   서비스는 drain-aware 재기동 후 `state=running`이며, 그룹 intake 권한 로그는
   모두 정상이다.
@@ -431,7 +431,7 @@ verdict: pass | changes_required
 - claim/lease에는 `claim_provenance_events`와 signed session lease metadata를
   추가했다. fencing token, owner, root task, 상태 전이를 HMAC 이벤트로 기록하고
   조회 시 검증한다.
-- 전체 검증: mac-agent `475 tests`, engine-repo `44 tests` 모두 통과. 네 서비스
+- 전체 검증: mac-agent `476 tests`, engine-repo `44 tests` 모두 통과. 네 서비스
   재기동 후 canonical Codex가 실제 Telegram API canary를 전송했고, delivery
   `canonical-canary-20260802-r2`가 `succeeded`, Telegram `message_id=285`로
   확인됐다.
@@ -442,7 +442,7 @@ verdict: pass | changes_required
 - Antigravity 공식 독립 reviewer 판정: `pass`
 - blocking issues: `none`
 - missing requirements: `none`
-- reviewer가 mac-agent `475/475`, engine-repo `44/44`, post-restart canary
+- reviewer가 mac-agent `476/476`, engine-repo `44/44`, post-restart canary
   `message_id=285`, ingress, signed messages, shared egress, approval/cancel/
   restart control-plane, signed claim/lease provenance, canonical LaunchAgent,
   RetryAfter backoff를 확인했다.

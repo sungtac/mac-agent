@@ -109,7 +109,7 @@
   bounded dynamic backoff를 추가했다.
 - claim/lease HMAC provenance journal 및 signed session metadata를 구현했고,
   fencing lifecycle 검증 테스트를 추가했다.
-- mac-agent `475`, engine-repo `44` 전체 테스트 통과 및 서비스 재기동 후,
+- mac-agent `476`, engine-repo `44` 전체 테스트 통과 및 서비스 재기동 후,
   canonical live canary `message_id=285`, delivery `succeeded`를 확인했다.
 
 최신 Claude 독립 검토가 아직 없으므로 이 문서의 기존 `changes_required`는
@@ -129,7 +129,7 @@ Claude 재검토를 받기 전까지 historical verdict를 임의로 덮어쓰�
 - 확인 기준: ingress fan-out/직접/부분 지정, signed agent messages, shared
   egress queue, approval/cancel/restart control-plane, signed claim/lease
   provenance, canonical Codex LaunchAgent, canonical/direct RetryAfter backoff.
-- 근거: mac-agent 475/475, engine-repo 44/44, 네 canonical 서비스 running,
+- 근거: mac-agent 476/476, engine-repo 44/44, 네 canonical 서비스 running,
   post-restart canonical canary `message_id=285` 기록 확인.
 - 비차단 위험: dirty worktree의 checkpoint/commit 부재와 장시간 퇴역 관찰은
   이번 구현 게이트 밖의 운영 후속 항목이다.

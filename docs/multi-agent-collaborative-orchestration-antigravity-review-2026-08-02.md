@@ -104,7 +104,7 @@ CLI가 필요한 `command` 권한을 실행 환경에서 자동 거부하여 결
 - 이전 429 지적을 반영해 canonical engine과 direct Claude·Antigravity·Roda에
   Telegram `RetryAfter` 기반 bounded dynamic backoff를 연결했다.
 - claim/lease fencing lifecycle HMAC provenance 및 검증 테스트를 추가했다.
-- mac-agent `475 tests`, engine-repo `44 tests` 전체 통과 후 네 서비스 재기동을
+- mac-agent `476 tests`, engine-repo `44 tests` 전체 통과 후 네 서비스 재기동을
   완료했다. canonical Telegram canary `canonical-canary-20260802-r2`는
   `succeeded`, message id `285`로 확인됐다.
 
@@ -116,7 +116,7 @@ CLI가 필요한 `command` 권한을 실행 환경에서 자동 거부하여 결
 - 판정: `pass`
 - blocking_issues: `none`
 - missing_requirements: `none`
-- 근거: mac-agent `475/475`, engine-repo `44/44` 통과, post-restart canonical
+- 근거: mac-agent `476/476`, engine-repo `44/44` 통과, post-restart canonical
   canary `canonical-canary-20260802-r2` / Telegram `message_id=285`, ingress·signed
   message·shared egress·control-plane·signed claim/lease provenance·canonical
   LaunchAgent·RetryAfter backoff 확인.
