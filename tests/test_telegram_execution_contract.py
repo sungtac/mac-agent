@@ -168,6 +168,16 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"--permission-mode", "acceptEdits"', source)
         self.assertIn('"--sandbox", "--mode", "accept-edits"', source)
 
+    def test_claude_session_limit_is_probed_with_a_fresh_nonpersistent_session(self):
+        self.assertTrue(BOT._is_claude_session_local_failure("", "You've hit your session limit · resets 7pm"))
+        self.assertFalse(BOT._is_claude_session_local_failure("", "account authentication failed"))
+        original = ["claude", "-p", "--resume", "old-session", "--output-format", "text", "--", "prompt"]
+        retry = BOT._fresh_claude_retry_args(original, "fresh-session")
+        self.assertIn("--no-session-persistence", retry)
+        self.assertIn("--session-id", retry)
+        self.assertNotIn("--resume", retry)
+        self.assertIn("fresh-session", retry)
+
     async def test_existing_worktree_requires_matching_owner_metadata(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

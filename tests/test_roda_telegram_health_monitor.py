@@ -37,6 +37,8 @@ class RodaHealthMonitorTests(unittest.TestCase):
 
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
+        self.assertEqual(health.classify_line("[claude] You've hit your session limit · resets 7pm"), "session_limited")
+        self.assertEqual(health.classify_line("[claude] session limit reached"), "session_limited")
         self.assertEqual(health.classify_line("[codex] you have reached your usage limit"), "usage_limited")
         self.assertEqual(health.classify_line("usage cap"), "usage_limited")
         self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: limit exceeded"), "usage_limited")
@@ -99,6 +101,13 @@ class RodaHealthMonitorTests(unittest.TestCase):
         event = health._usage_event("codex", "usage_limited", "quota exceeded", now=100)
         self.assertEqual(event["source"], "stderr")
         self.assertEqual(event["authority"], "local_log")
+
+    def test_claude_session_limit_is_not_reported_as_account_usage_exhaustion(self):
+        event = health._usage_event("claude", "session_limited", "You've hit your session limit · resets 7pm", now=100)
+        self.assertIn("세션 상태 확인", event["message"])
+        self.assertIn("계정 전체 사용량 제한으로 판정하지 않음", event["message"])
+        self.assertNotIn("사용량 제한 감지", event["message"])
+        self.assertEqual(event["auto_repair"], "blocked")
 
     def test_usage_event_extracts_exact_retry_after_without_guessing_window(self):
         event = health._usage_event(

@@ -55,7 +55,11 @@ class CompletionHarnessTests(unittest.TestCase):
             evidence_path.write_text(json.dumps({"passed": True, "roles": ["claude", "codex", "antigravity"], "rounds": 3}), encoding="utf-8")
             passed, _ = module.canary_evidence_ok(evidence_path)
             self.assertFalse(passed)
-            evidence_path.write_text(json.dumps({"passed": True, "roles": ["claude", "codex", "antigravity", "roda"], "rounds": 3}), encoding="utf-8")
+            probes = {
+                role: {"status": "verified_available", "method": "fresh_session_probe", "observed_at": "2026-08-02T10:00:00Z"}
+                for role in ("claude", "codex", "antigravity", "roda")
+            }
+            evidence_path.write_text(json.dumps({"passed": True, "roles": ["claude", "codex", "antigravity", "roda"], "rounds": 3, "provider_probes": probes}), encoding="utf-8")
             passed, _ = module.canary_evidence_ok(evidence_path)
             self.assertTrue(passed)
             with patch.dict(os.environ, {"EDGE_AGENT_IMPROVEMENT_ROOT": str(Path(directory) / "improvements")}):

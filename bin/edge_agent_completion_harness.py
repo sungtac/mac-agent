@@ -336,8 +336,40 @@ def canary_evidence_ok(path: Path, *, minimum_rounds: int = 3) -> tuple[bool, li
         round_count = int(rounds)
     except (TypeError, ValueError):
         round_count = -1
-    passed = bool(isinstance(payload, dict) and payload.get("passed") is True and isinstance(roles, list) and len(set(roles)) >= 4 and round_count >= minimum_rounds)
-    return passed, [f"canary_passed={bool(payload.get('passed')) if isinstance(payload, dict) else False}", f"rounds={rounds}", f"roles={len(set(roles)) if isinstance(roles, list) else 0}"]
+    required_roles = {"claude", "codex", "antigravity", "roda"}
+    role_count = len(set(roles)) if isinstance(roles, list) else 0
+    probes = payload.get("provider_probes") if isinstance(payload, dict) else None
+    probe_errors: list[str] = []
+    if not isinstance(probes, dict):
+        probe_errors.append("provider_probes_missing")
+    else:
+        for role in sorted(required_roles):
+            probe = probes.get(role)
+            if not isinstance(probe, dict):
+                probe_errors.append(f"provider_probe_missing={role}")
+                continue
+            if probe.get("status") not in {"available", "verified_available"}:
+                probe_errors.append(f"provider_probe_not_available={role}")
+            if not str(probe.get("method", "")).strip():
+                probe_errors.append(f"provider_probe_method_missing={role}")
+            if not str(probe.get("observed_at", "")).strip():
+                probe_errors.append(f"provider_probe_time_missing={role}")
+    passed = bool(
+        isinstance(payload, dict)
+        and payload.get("passed") is True
+        and isinstance(roles, list)
+        and required_roles.issubset(set(roles))
+        and round_count >= minimum_rounds
+        and not probe_errors
+    )
+    evidence = [
+        f"canary_passed={bool(payload.get('passed')) if isinstance(payload, dict) else False}",
+        f"rounds={rounds}",
+        f"roles={role_count}",
+        f"provider_probes={4 - len([error for error in probe_errors if error.startswith(('provider_probe_missing=', 'provider_probe_not_available='))])}/4",
+    ]
+    evidence.extend(probe_errors)
+    return passed, evidence
 
 
 def register_failure(store: CompletionStore, goal_id: str, domain: str, *, blocker: str, next_action: str, evidence: list[str]) -> dict[str, Any]:

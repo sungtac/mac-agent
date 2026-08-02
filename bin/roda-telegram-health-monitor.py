@@ -102,6 +102,14 @@ USAGE_LIMIT_RE = re.compile(
     r"쿼터\s*(?:초과|소진)",
     re.I,
 )
+# Claude's "session limit" is scoped to the resumable native CLI session. It
+# is not proof that the account-wide subscription allowance is exhausted.
+# Keep it as a separate signal so Roda cannot turn one stderr line into a
+# false account-usage report.
+SESSION_LOCAL_LIMIT_RE = re.compile(
+    r"hit\s+your\s+session\s+limit|session\s+limit(?:\s+(?:reached|exceeded|exhausted))?",
+    re.I,
+)
 EXPLICIT_USAGE_LIMIT_RE = re.compile(
     r"hit your (?:session|usage) limit|(?:usage|session) limit\s*(?:reached|exceeded|exhausted)|usage cap|"
     r"you have reached your (?:session|usage) limit|quota\s*(?:exceeded|reached|exhausted)|"
@@ -138,6 +146,7 @@ EXPLICIT_RATE_LIMIT_RE = re.compile(
 )
 NON_REPAIRABLE_CODES = frozenset({
     "usage_limited",
+    "session_limited",
     "rate_limited",
     "capacity_limited",
     "service_overloaded",
@@ -145,7 +154,7 @@ NON_REPAIRABLE_CODES = frozenset({
     "auth_error",
     "main_dirty",
 })
-RESOURCE_RECOVERY_CODES = frozenset({"usage_limited", "rate_limited", "capacity_limited", "service_overloaded"})
+RESOURCE_RECOVERY_CODES = frozenset({"usage_limited", "session_limited", "rate_limited", "capacity_limited", "service_overloaded"})
 UNKNOWN_SIGNAL_RE = re.compile(
     r"provider|quota|usage\s+(?:cap|limit)|resource[_ -]?exhausted|rate[_ -]?limit|"
     r"429|capacity|overload|unavailable|retry[- _]?after",
@@ -417,6 +426,8 @@ def classify_line(line: str, *, role: str | None = None) -> str | None:
         return "capacity_limited"
     if rate_candidate and (EXPLICIT_RATE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
         return "rate_limited"
+    if SESSION_LOCAL_LIMIT_RE.search(line):
+        return "session_limited"
     if usage_candidate and (EXPLICIT_USAGE_LIMIT_RE.search(line) or FAILURE_CONTEXT_RE.search(provider_prefix)):
         return "usage_limited"
     if re.search(r"resource[_ -]?exhausted", line, re.I):
@@ -607,11 +618,16 @@ def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -
         recovery = "회복 시각: provider 정보 없음"
     title = {
         "usage_limited": "사용량 제한",
+        "session_limited": "native CLI 세션 제한 가능성(계정 전체 사용량 미확인)",
         "rate_limited": "요청 빈도 제한",
         "capacity_limited": "provider 용량 제한",
         "service_overloaded": "provider 과부하",
     }.get(code, "provider 제한")
-    header = "[Roda 사용량 제한 감지]" if code in {"usage_limited", "rate_limited"} else "[Roda provider 상태 감지]"
+    header = "[Roda 세션 상태 확인]" if code == "session_limited" else (
+        "[Roda 사용량 제한 감지]" if code in {"usage_limited", "rate_limited"} else "[Roda provider 상태 감지]"
+    )
+    if code == "session_limited":
+        recovery = "계정 전체 사용량 제한으로 판정하지 않음; fresh-session probe가 필요합니다."
     request_hash = _request_id_hash(line)
     if not request_hash and details.get("request_id"):
         request_hash = hashlib.sha256(details["request_id"].encode()).hexdigest()[:12]
@@ -1363,6 +1379,7 @@ def _process_cycle(state: dict) -> None:
                 blocked_reason = {
                     "main_dirty": "main 저장소 추적 변경 — 사람 확인 필요",
                     "usage_limited": "사용량 제한 이벤트 — 자동복구 차단",
+                    "session_limited": "native CLI 세션 제한 가능성 — 계정 전체 사용량으로 단정하지 않고 fresh-session 확인 대기",
                     "rate_limited": "요청 빈도 제한 이벤트 — 자동복구 차단",
                     "capacity_limited": "provider 용량 제한 이벤트 — 자동복구 차단",
                     "service_overloaded": "provider 과부하 이벤트 — 자동복구 차단",

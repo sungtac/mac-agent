@@ -1179,6 +1179,47 @@ class WorkspaceLockBusy(Exception):
     pass
 
 
+_CLAUDE_SESSION_LOCAL_FAILURE_RE = re.compile(
+    r"hit\s+your\s+session\s+limit|session\s+limit(?:\s+(?:reached|exceeded|exhausted))?",
+    re.I,
+)
+
+
+def _is_claude_session_local_failure(stdout: str, stderr: str) -> bool:
+    """Recognize only Claude's session-local limit signal.
+
+    A single CLI stderr line is not evidence that the account-wide quota is
+    exhausted.  This predicate is intentionally narrower than the health
+    monitor's provider-limit classifier so the runner can try an isolated
+    fresh session before surfacing an operational failure.
+    """
+    return bool(_CLAUDE_SESSION_LOCAL_FAILURE_RE.search(f"{stdout}\n{stderr}"))
+
+
+def _fresh_claude_retry_args(provider_args: list[str], session_id: str) -> list[str]:
+    """Replace a resumable Claude session with a one-shot fresh session."""
+    retry_args = list(provider_args)
+    for marker in ("--resume", "--session-id"):
+        try:
+            marker_index = retry_args.index(marker)
+        except ValueError:
+            continue
+        retry_args[marker_index] = "--session-id"
+        if marker_index + 1 >= len(retry_args):
+            raise ValueError("Claude session flag has no session id")
+        retry_args[marker_index + 1] = session_id
+        break
+    else:
+        raise ValueError("Claude command has no session flag")
+    if "--no-session-persistence" not in retry_args:
+        try:
+            print_index = retry_args.index("-p")
+        except ValueError as exc:
+            raise ValueError("Claude command has no print flag") from exc
+        retry_args.insert(print_index + 1, "--no-session-persistence")
+    return retry_args
+
+
 def _workspace_lock_path(resolved_path: str) -> Path:
     canonical_path = str(canonical_repository_root(resolved_path))
     digest = hashlib.sha256(canonical_path.encode()).hexdigest()[:32]
@@ -1287,52 +1328,73 @@ async def _run_cli(
 
     # The wrapper applies the protected Team OS path policy to the provider
     # CLI and every child tool it starts, while preserving the original argv.
-    args = [str(PROVIDER_SANDBOX), *args]
+    provider_args = args
+    args = [str(PROVIDER_SANDBOX), *provider_args]
 
     try:
         async with acquire_workspace_lock(str(provider_workspace), on_wait=on_wait):
-            proc = await asyncio.create_subprocess_exec(
-                *args,
-                cwd=str(provider_workspace),
-                env=ENV,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                start_new_session=True,
-            )
-            # Captured immediately after spawn, not re-derived inside the
-            # timeout handler — see _terminate_process_group's docstring.
-            try:
-                pgid = os.getpgid(proc.pid)
-            except ProcessLookupError:
-                pgid = proc.pid
-            try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
-            except asyncio.TimeoutError:
-                await _terminate_process_group(proc, pgid)
-                raise RuntimeError(f"{role} 실행 시간이 제한 시간({timeout_seconds}초)을 초과했습니다.")
-            except BaseException:
-                # Covers asyncio.CancelledError (task cancellation — e.g. app
-                # shutdown mid-request; CancelledError is a BaseException,
-                # not Exception, so a plain `except Exception` would miss
-                # it) and anything else that isn't a plain timeout. Without
-                # this, only TimeoutError ever ran cleanup and every other
-                # exit path left the provider subprocess running as an
-                # orphan. Re-raises unchanged so cancellation semantics
-                # aren't altered — this only adds the cleanup side effect.
-                if proc.returncode is None:
+            async def execute(command_args: list[str]) -> tuple[int, bytes, bytes]:
+                proc = await asyncio.create_subprocess_exec(
+                    *command_args,
+                    cwd=str(provider_workspace),
+                    env=ENV,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    start_new_session=True,
+                )
+                # Captured immediately after spawn, not re-derived inside the
+                # timeout handler — see _terminate_process_group's docstring.
+                try:
+                    pgid = os.getpgid(proc.pid)
+                except ProcessLookupError:
+                    pgid = proc.pid
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+                except asyncio.TimeoutError:
                     await _terminate_process_group(proc, pgid)
-                raise
+                    raise RuntimeError(f"{role} 실행 시간이 제한 시간({timeout_seconds}초)을 초과했습니다.")
+                except BaseException:
+                    # Covers asyncio.CancelledError (task cancellation — e.g.
+                    # app shutdown mid-request; CancelledError is a
+                    # BaseException) and ensures every non-timeout exit path
+                    # cleans up the provider process group.
+                    if proc.returncode is None:
+                        await _terminate_process_group(proc, pgid)
+                    raise
+                return proc.returncode or 0, stdout or b"", stderr or b""
+
+            returncode, stdout, stderr = await execute(args)
+            output = stdout.decode(errors="replace").strip()
+            error = stderr.decode(errors="replace").strip()
+            native_session_persist = True
+            if role == "claude" and returncode != 0 and _is_claude_session_local_failure(output, error):
+                # A resumable native session can be exhausted independently
+                # of the account. Probe a fresh, non-persistent session once
+                # before reporting provider failure. This is deliberately
+                # inside the workspace lock so the retry cannot race another
+                # role's work in the same repository.
+                fresh_session_id = str(uuid.uuid4())
+                retry_provider_args = _fresh_claude_retry_args(provider_args, fresh_session_id)
+                log("claude native session failure detected; fresh-session probe starting")
+                returncode, stdout, stderr = await execute([str(PROVIDER_SANDBOX), *retry_provider_args])
+                output = stdout.decode(errors="replace").strip()
+                error = stderr.decode(errors="replace").strip()
+                native_session_id = fresh_session_id
+                native_session_is_new = True
+                native_session_persist = False
+                if returncode == 0:
+                    log("claude fresh-session probe=success; account-wide usage limit not established")
+                else:
+                    log("claude fresh-session probe=failed; account-wide usage limit remains unverified")
     except WorkspaceLockBusy:
         raise RuntimeError(
             f"다른 역할 봇이 워크스페이스를 {WORKSPACE_LOCK_WAIT_SECONDS}초 넘게 사용 중이라 실행하지 못했습니다. 잠시 후 다시 말 걸어 주세요."
         )
 
-    output = (stdout or b"").decode(errors="replace").strip()
-    error = (stderr or b"").decode(errors="replace").strip()
-    if proc.returncode != 0:
+    if returncode != 0:
         snippet = _bounded_cli_diagnostic(output, error)
-        log(f"{role} exit={proc.returncode}: {snippet}")
+        log(f"{role} exit={returncode}: {snippet}")
         raise RuntimeError(f"{role} 실행에 실패했습니다. 로그를 확인해 주세요.")
 
     # Codex --json emits JSONL events.  Prefer the final assistant message,
@@ -1362,12 +1424,12 @@ async def _run_cli(
         log(f"{role} empty response: {detail[-1600:]}")
         raise RuntimeError(f"{role}가 빈 응답을 반환했습니다: {detail[-500:]}")
     if role == "claude" and native_session_id:
-        if native_session_is_new:
+        if native_session_is_new and native_session_persist:
             try:
                 _persist_native_session_id(role, native_session_id, chat_id=chat_id, workspace=provider_workspace)
             except OSError as exc:
                 log(f"Claude 네이티브 세션 ID 저장 실패(응답은 유지): {type(exc).__name__}")
-        if ACTIVE_LOGICAL_SESSION_ID:
+        if ACTIVE_LOGICAL_SESSION_ID and native_session_persist:
             try:
                 bind_native_session(ACTIVE_LOGICAL_SESSION_ID, provider=role, native_session_id=native_session_id)
             except (FileNotFoundError, OSError, ValueError) as exc:
