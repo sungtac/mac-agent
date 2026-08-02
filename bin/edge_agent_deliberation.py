@@ -192,6 +192,7 @@ class DeliberationStore:
                     key_id=self._message_key_id(),
                     signing_key=signing_key,
                     evidence_refs=tuple(evidence_refs),
+                    round=current_round,
                 )
                 verify_message(envelope, signing_key, expected_key_id=self._message_key_id())
                 result["agent_message"] = envelope.to_dict()

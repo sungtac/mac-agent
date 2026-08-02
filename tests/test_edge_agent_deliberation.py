@@ -61,6 +61,26 @@ class DeliberationStoreTests(unittest.TestCase):
                 store.record(session_id, "gemma", status="completed", summary="legacy alias")
                 self.assertEqual(store.snapshot(session_id)["results"]["roda"]["summary"], "legacy alias")
 
+    def test_two_round_peer_follow_up_is_durable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 101)
+                store.start(session_id, "4개 역할이 논의")
+                for role in ("claude", "codex", "antigravity", "roda"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 1차")
+                self.assertEqual(len(store._bus.transcript(session_id)), 4)
+                self.assertEqual(store.wait(session_id, timeout_seconds=0)["status"], "barrier_ready")
+                for role in ("claude", "codex", "antigravity", "roda"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 2차", round_number=2)
+                transcript = store._bus.transcript(session_id)
+                self.assertEqual(len(transcript), 8)
+                self.assertTrue(any(message.round == 2 for message in transcript))
+                self.assertIn("round=2", store.render(session_id))
+
 
 if __name__ == "__main__":
     unittest.main()
