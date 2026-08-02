@@ -173,7 +173,22 @@ class ControlPlaneStore:
             payload = self._read(path)
             tasks = payload["tasks"]
             if task_id not in tasks and len(tasks) >= MAX_TASKS:
-                raise ControlPlaneError("control plane task concurrency cap reached")
+                terminal = [
+                    (existing_id, item)
+                    for existing_id, item in tasks.items()
+                    if item.get("status") in TERMINAL_TASK_STATES
+                ]
+                terminal.sort(
+                    key=lambda pair: (
+                        float(pair[1].get("finished_epoch") or pair[1].get("started_epoch") or 0),
+                        pair[0],
+                    )
+                )
+                while len(tasks) >= MAX_TASKS and terminal:
+                    existing_id, _ = terminal.pop(0)
+                    tasks.pop(existing_id, None)
+                if len(tasks) >= MAX_TASKS:
+                    raise ControlPlaneError("control plane task concurrency cap reached")
             tasks[task_id] = {"status": "running", "roles": list(roles), "started_epoch": time.time()}
             if payload.get("status") == "cancelled":
                 payload["status"] = "running"

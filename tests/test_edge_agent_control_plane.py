@@ -55,6 +55,25 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(len(recovered), 1)
         self.assertEqual(recovered[0]["status"], "waiting_approval")
 
+    def test_new_task_reclaims_old_terminal_history_but_preserves_active_tasks(self):
+        for index in range(8):
+            task_id = f"old-{index}"
+            self.store.start_task("chat", task_id)
+            self.store.mark_task("chat", task_id, "completed", summary="done")
+
+        self.store.start_task("chat", "new-task", roles=("codex",))
+        payload = self.store.snapshot("chat")
+        self.assertIn("new-task", payload["tasks"])
+        self.assertEqual(payload["tasks"]["new-task"]["status"], "running")
+        self.assertLessEqual(len(payload["tasks"]), 8)
+
+    def test_task_cap_still_blocks_when_all_slots_are_active(self):
+        for index in range(8):
+            self.store.start_task("chat", f"active-{index}")
+
+        with self.assertRaisesRegex(ControlPlaneError, "concurrency cap"):
+            self.store.start_task("chat", "overflow")
+
 
 if __name__ == "__main__":
     unittest.main()

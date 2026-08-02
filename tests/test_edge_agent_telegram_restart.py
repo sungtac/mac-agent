@@ -48,6 +48,23 @@ class TelegramRestartTests(unittest.TestCase):
                 ("request completed", "request failed"),
             ))
 
+    def test_known_unhandled_failure_drains_as_failed_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "stderr.log"
+            log.write_text(
+                "connected as @sukja_hwpx_helper_bot\n"
+                "request started chat=-100\n"
+                "No error handlers are registered, logging exception.\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(MODULE.request_is_active(
+                log,
+                "connected as @",
+                "request started",
+                ("request completed", "request failed"),
+                ("No error handlers are registered",),
+            ))
+
     def test_restart_refuses_to_kill_active_request(self):
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "stderr.log"
@@ -65,10 +82,12 @@ class TelegramRestartTests(unittest.TestCase):
             root = Path(td)
             log = root / "stderr.log"
             marker = root / "maintenance.json"
+            plist = root / "x.plist"
+            plist.write_text("plist", encoding="utf-8")
             log.write_text("Starting direct Telegram antigravity bot\n", encoding="utf-8")
             original_targets = MODULE.TARGETS
             original_marker = MODULE.MAINTENANCE_FILE
-            MODULE.TARGETS = {"x": {"label": "com.example.x", "log": log}}
+            MODULE.TARGETS = {"x": {"label": "com.example.x", "plist": plist, "log": log}}
             MODULE.MAINTENANCE_FILE = marker
             calls = []
 
@@ -79,7 +98,7 @@ class TelegramRestartTests(unittest.TestCase):
 
             def runner(argv, **kwargs):
                 calls.append(argv)
-                if "kickstart" in argv:
+                if "bootstrap" in argv:
                     with log.open("a", encoding="utf-8") as handle:
                         handle.write("Starting direct Telegram antigravity bot\n")
                 return Result()
@@ -87,7 +106,8 @@ class TelegramRestartTests(unittest.TestCase):
             try:
                 with patch.object(MODULE, "service_running", return_value=True):
                     MODULE.restart("x", drain_seconds=0, runner=runner, sleep=lambda _: None)
-                self.assertIn("kickstart", calls[0])
+                self.assertIn("bootout", calls[0])
+                self.assertIn("bootstrap", calls[1])
                 self.assertFalse(marker.exists())
             finally:
                 MODULE.TARGETS = original_targets

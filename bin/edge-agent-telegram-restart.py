@@ -33,23 +33,28 @@ MARKER_SECONDS = int(os.environ.get("EDGE_AGENT_TELEGRAM_MARKER_SECONDS", "180")
 TARGETS = {
     "claude": {
         "label": "com.macagent.telegram-claude",
+        "plist": HOME / "Library/LaunchAgents/com.macagent.telegram-claude.plist",
         "log": HOME / ".claude/hooks-state/telegram-claude/stderr.log",
     },
     "codex": {
         "label": "com.multiagent.engine",
+        "plist": HOME / "Library/LaunchAgents/com.multiagent.engine.plist",
         "log": HOME / ".edge-agent/state/multiagent-engine/stderr.log",
         "startup_marker": "Starting canonical Telegram engine",
     },
     "antigravity": {
         "label": "com.macagent.telegram-antigravity",
+        "plist": HOME / "Library/LaunchAgents/com.macagent.telegram-antigravity.plist",
         "log": HOME / ".claude/hooks-state/telegram-antigravity/stderr.log",
     },
     "roda": {
         "label": "com.macagent.telegram-roda-gemma",
+        "plist": HOME / "Library/LaunchAgents/com.macagent.telegram-roda-gemma.plist",
         "log": HOME / ".claude/hooks-state/telegram-roda-gemma/stderr.log",
         "startup_marker": "connected as @",
         "request_start_marker": "request started",
         "request_done_markers": ("request completed", "request failed"),
+        "request_failure_markers": ("No error handlers are registered", "EDGE_AGENT_MESSAGE_KEY_FILE is required"),
     },
 }
 
@@ -66,6 +71,7 @@ def request_is_active(
     startup_marker: str = "Starting direct Telegram",
     request_start_marker: str = "처리 시작",
     request_done_markers: tuple[str, ...] = ("처리 완료", "처리 실패"),
+    request_failure_markers: tuple[str, ...] = (),
 ) -> bool:
     """Return true only for a request started after the latest bot startup."""
 
@@ -77,7 +83,7 @@ def request_is_active(
             latest_boot = index
         if request_start_marker in line:
             latest_start = index
-        if any(marker in line for marker in request_done_markers):
+        if any(marker in line for marker in request_done_markers) or any(marker in line for marker in request_failure_markers):
             latest_done = index
     # An old unmatched start before a later bot startup is stale and must not
     # block every future maintenance operation forever.
@@ -166,7 +172,7 @@ def clear_maintenance(role: str) -> None:
                 pass
 
 
-def restart(role: str, *, reason: str = "operator requested restart", drain_seconds: int = DEFAULT_DRAIN_SECONDS, runner=subprocess.run, sleep=time.sleep) -> None:
+def restart(role: str, *, reason: str = "operator requested restart", drain_seconds: int = DEFAULT_DRAIN_SECONDS, force_active: bool = False, runner=subprocess.run, sleep=time.sleep) -> None:
     target = TARGETS[role]
     deadline = time.monotonic() + max(0, drain_seconds)
     while request_is_active(
@@ -174,8 +180,11 @@ def restart(role: str, *, reason: str = "operator requested restart", drain_seco
         target.get("startup_marker", "Starting direct Telegram"),
         target.get("request_start_marker", "처리 시작"),
         target.get("request_done_markers", ("처리 완료", "처리 실패")),
+        target.get("request_failure_markers", ()),
     ):
         if time.monotonic() >= deadline:
+            if force_active:
+                break
             raise TimeoutError(f"{role} active request did not drain before restart")
         sleep(1)
 
@@ -183,15 +192,33 @@ def restart(role: str, *, reason: str = "operator requested restart", drain_seco
     marker_expires = time.time() + max(MARKER_SECONDS, STARTUP_SECONDS + 30)
     set_maintenance(role, reason=reason, expires_at=marker_expires)
     try:
-        result = runner(
-            ["/bin/launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{target['label']}"],
+        domain = f"gui/{os.getuid()}"
+        bootout = runner(
+            ["/bin/launchctl", "bootout", f"{domain}/{target['label']}"],
             capture_output=True,
             text=True,
             check=False,
         )
-        if result.returncode != 0:
-            detail = (result.stderr or result.stdout or "launchctl kickstart failed").strip()
+        if bootout.returncode != 0 and "No such process" not in (bootout.stderr or bootout.stdout):
+            detail = (bootout.stderr or bootout.stdout or "launchctl bootout failed").strip()
             raise RuntimeError(detail[-500:])
+        plist = target.get("plist")
+        if not plist or not Path(plist).is_file():
+            raise RuntimeError(f"{role} LaunchAgent plist is unavailable")
+        result = None
+        for attempt in range(5):
+            result = runner(
+                ["/bin/launchctl", "bootstrap", domain, str(plist)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                break
+            detail = (result.stderr or result.stdout or "launchctl bootstrap failed").strip()
+            if "Input/output error" not in detail or attempt == 4:
+                raise RuntimeError(detail[-500:])
+            sleep(1)
         startup_deadline = time.monotonic() + max(1, STARTUP_SECONDS)
         while time.monotonic() < startup_deadline:
             lines = _read_log(target["log"])
@@ -214,6 +241,7 @@ def stop(role: str, *, reason: str = "operator requested stop", drain_seconds: i
         target.get("startup_marker", "Starting direct Telegram"),
         target.get("request_start_marker", "처리 시작"),
         target.get("request_done_markers", ("처리 완료", "처리 실패")),
+        target.get("request_failure_markers", ()),
     ):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{role} active request did not drain before stop")
@@ -245,13 +273,14 @@ def main() -> int:
     parser.add_argument("role", choices=sorted(TARGETS))
     parser.add_argument("--reason", default="operator requested restart")
     parser.add_argument("--drain-seconds", type=int, default=DEFAULT_DRAIN_SECONDS)
+    parser.add_argument("--force-active", action="store_true", help="explicitly restart after a verified unrecoverable active request")
     parser.add_argument("--stop", action="store_true", help="drain and stop instead of restart")
     args = parser.parse_args()
     if args.stop:
         stop(args.role, reason=args.reason, drain_seconds=args.drain_seconds)
         print(f"stopped {args.role}")
     else:
-        restart(args.role, reason=args.reason, drain_seconds=args.drain_seconds)
+        restart(args.role, reason=args.reason, drain_seconds=args.drain_seconds, force_active=args.force_active)
         print(f"restarted {args.role}")
     return 0
 
