@@ -71,36 +71,22 @@ HAS_PLAN_MODE="$(jq -r '
 # verify-task-v2 in its one-line skill catalog, and any doc path or prose
 # mentioning the name matches too). A real-world audit of every session log
 # for this project found this pattern matching constantly on boilerplate
-# while a real `Workflow({scriptPath: "workflows/verify-task-v2.js", ...})`
-# tool_use call — the actual invocation, per docs/verify-task-v2-design.md — never
-# appeared even once. That means this MANDATORY tier's "no escape valve"
-# guarantee was silently defeated almost every session: the exemption fired
-# on the boilerplate mention alone, so MANDATORY_HITS below was never
-# reached. Parsed with jq (already a hard dependency here) so it walks the
-# real message.content[].{type,name,input} structure instead of guessing at
-# raw-JSON key ordering/whitespace.
+# while the real host orchestrator invocation was absent. That means this
+# MANDATORY tier's "no escape valve" guarantee was silently defeated almost
+# every session: the exemption fired on the boilerplate mention alone, so
+# MANDATORY_HITS below was never reached. Parsed with jq (already a hard
+# dependency here) so it walks the real message.content[].{type,name,input}
+# structure instead of guessing at raw-JSON key ordering/whitespace.
 # 2026-07-30 fix (Codex 코드리뷰로 발견): `grep -c 'verify-task'`는 여전히
-# 부분 문자열 매칭이라, scriptPath 어딘가에 "verify-task"가 들어있기만 하면
-# 실제로 존재하지도 않는 가짜 경로(예: /tmp/fake-verify-task-v2.js)나 무관한
-# 스크립트도 통과시켰다 — 성공 여부는 물론 "진짜 그 파일인지"조차 확인
-# 안 함. basename이 정확히 verify-task-v2(.js) 또는 그
-# Workflow 재개용 사본(예: verify-task-v2-wf_<runid>.js — Workflow 툴이
-# resumeFromRunId로 재개할 때 실제로 이런 이름의 사본을 만든다, 이번 세션에서
-# 직접 확인함)일 때만 인정하도록 좁힘. 여전히 "성공했는지"는 안 보는
-# 기계적 프록시다(파일 헤더 주석 참고) — 그 이상의 결과 검증은 이 훅의
-# 설계 범위 밖.
+# 부분 문자열 매칭이라 존재하지도 않는 가짜 경로나 무관한 스크립트도
+# 통과시켰다. 이제는 정식 호스트 오케스트레이터의 절대 경로만 인정한다.
+# 여전히 "성공했는지"는 안 보는 기계적 프록시다(파일 헤더 주석 참고) —
+# 그 이상의 결과 검증은 이 훅의 설계 범위 밖.
 #
-# 2026-07-30 추가 수정(자체 end-to-end 재현으로 발견, Codex 리뷰엔 없었음):
-# 위 수정을 실제로 이 세션 자신의 트랜스크립트에 돌려봤더니, 이 세션에서
-# 실행한 진짜 verify-task 호출이 여전히 안 잡혀서 훅이 오탐 차단했다 —
-# `Workflow({name: "verify-task-v2", args:{...}})`처럼 `scriptPath`가 아니라
-# 등록된 `name`으로 부르는 방식은
-# 호출법으로 등록된 두 번째 형태)은 `.input.scriptPath`만 보는 이 jq
-# 쿼리에 아예 안 잡혔다. `.input.name`도 함께 확인하도록 확장.
 HAS_VERIFY_TASK="$(jq -r '
   select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
-  select(.name == "Workflow") | ((.input.scriptPath // ""), (.input.name // ""))
-' "$TRANSCRIPT_PATH" 2>/dev/null | grep -cE '/verify-task-v2(-wf_[A-Za-z0-9_-]+)?\.js$|^verify-task-v2$')"
+  select(.name == "Bash") | (.input.command // "")
+' "$TRANSCRIPT_PATH" 2>/dev/null | grep -cE '(^|[[:space:]])python3[[:space:]]+/Users/edge_ai/mac-agent/bin/verify-task-orchestrator\.py([[:space:]]|$)')"
 
 [ "${HAS_VERIFY_TASK:-0}" -gt 0 ] && exit 0
 
@@ -113,7 +99,7 @@ if [ "${#MANDATORY_HITS[@]}" -gt 0 ]; then
   HITS_STR="$(IFS=', '; echo "${MANDATORY_HITS[*]}")"
   jq -n --arg hits "$HITS_STR" '{
     decision: "block",
-    reason: ("이 세션은 무조건 독립검증 대상 카테고리(" + $hits + ")에 해당하는데 verify-task 실행 흔적이 없습니다. 이 카테고리는 \"검증 필요 없었다\"는 설명으로 넘어갈 수 없습니다 — Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona}})로 verify-task-v2를 실제로 돌리세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다)."),
+    reason: ("이 세션은 무조건 독립검증 대상 카테고리(" + $hits + ")에 해당하는데 호스트 검증 오케스트레이터 실행 흔적이 없습니다. 이 카테고리는 \"검증 필요 없었다\"는 설명으로 넘어갈 수 없습니다 — python3 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py --task-file <작업파일> --cwd <cwd> --session-id <session_id> 를 실제로 실행하세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다)."),
     systemMessage: "무조건 독립검증 카테고리 감지 — verify-task 실행 필수, 생략 불가."
   }'
   exit 0
@@ -123,7 +109,7 @@ if [ "${RISKY_BASH_COUNT:-0}" -ge 1 ]; then
   touch "$NAG_MARKER"
   jq -n '{
     decision: "block",
-    reason: "이 세션에서 설치/커밋 등 위험 신호가 있는 Bash 명령이 감지됐는데, verify-task로 독립 검증한 흔적이 안 보입니다. 이번 작업이 검증 대상(중요/복잡한 작업)이라면 Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona}})로 verify-task-v2를 돌리세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다). 검증이 필요 없는 가벼운 작업이었다면, 그 이유를 사용자에게 한 줄로 알려주고 종료하세요.",
+    reason: "이 세션에서 설치/커밋 등 위험 신호가 있는 Bash 명령이 감지됐는데, verify-task로 독립 검증한 흔적이 안 보입니다. 이번 작업이 검증 대상(중요/복잡한 작업)이라면 python3 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py --task-file <작업파일> --cwd <cwd> --session-id <session_id> 로 호스트 검증을 돌리세요(작은 변경이면 light 트랙이 자동으로 저렴하게 처리합니다). 검증이 필요 없는 가벼운 작업이었다면, 그 이유를 사용자에게 한 줄로 알려주고 종료하세요.",
     systemMessage: "verify-task 미실행 감지 — 검증하거나, 왜 생략하는지 사용자에게 알려주세요."
   }'
 fi

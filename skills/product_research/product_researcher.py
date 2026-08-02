@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
 
-USER_AGENT = "Mozilla/5.0 (product-researcher; OpenClaw)"
+USER_AGENT = "Mozilla/5.0 (product-researcher; Edge-Agent)"
 ACCESSORY_TERMS = ("호환", "날개", "부품", "리모컨", "커버", "어댑터", "케이블", "충전기", "전용", "보호회로", "12.6v")
 
 CONFIDENCE_ORDER = {

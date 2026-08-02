@@ -83,7 +83,7 @@ def collect() -> dict:
                 claude / "discord-bot" / "pending",
                 "Discord bot + retry workflows",
                 "pending_job_directory",
-                "bin/discord-bot.py; workflows/verify-task-v2.js",
+                "bin/discord-bot.py; bin/verify-task-orchestrator.py",
                 "deleting entries can break reply-triggered retries",
             ),
             _entry(
@@ -97,7 +97,7 @@ def collect() -> dict:
                 claude / "verify-task-v2-history.jsonl",
                 "verify-task-v2 workflow",
                 "history_ledger",
-                "workflows/verify-task-v2.js",
+                "bin/verify-task-orchestrator.py",
             ),
             _entry(
                 HOME / ".claude-watchdog",

@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass, asdict
 from pathlib import Path
 import json
+import os
 
 STATUS_ORDER = ("proposed", "implemented", "validated", "mitigated", "live_verified", "retired", "blocked", "rejected")
 VALID_STATUSES = set(STATUS_ORDER)
@@ -85,6 +86,10 @@ def build_backlog(path: str | Path) -> dict:
 if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Summarize Hermes feedback backlog")
-    parser.add_argument("path", nargs="?", default="state/hermes-feedback.jsonl")
+    parser.add_argument(
+        "path",
+        nargs="?",
+        default=os.environ.get("EDGE_AGENT_HERMES_LOG", "~/.edge-agent/state/hermes-feedback.jsonl"),
+    )
     args = parser.parse_args()
     print(json.dumps(build_backlog(args.path), ensure_ascii=False, indent=2))

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from edge_agent_capability_preflight import render_prompt
+from edge_agent_skill_catalog import catalog_skill_ids
 
 
 SKILLS_ROOT = Path(__file__).resolve().parents[1] / "skills"
@@ -22,6 +23,15 @@ SKILL_TRIGGERS = {
     "code-review": ("코드리뷰", "코드 리뷰", "코드 점검", "코드점검", "코드 품질", "코드품질"),
 }
 
+# These bounded policy signals are not portable skills in skills/catalog.json.
+# They are nevertheless resolved here so every adapter uses one trigger owner.
+POLICY_SKILL_TRIGGERS = {
+    "context_budget": ("context", "compact", "clear", "handoff", "컨텍스트", "요약"),
+    "minimality_review": ("minimal", "over-engineer", "ponytail", "간결", "불필요한 코드"),
+    "quota_routing": ("quota", "rate limit", "429", "사용량", "토큰 한도"),
+    "verification": ("test", "verify", "검증", "테스트", "diff"),
+}
+
 
 @dataclass(frozen=True)
 class CapabilityResolution:
@@ -31,14 +41,21 @@ class CapabilityResolution:
 
 
 def discover_skill_ids() -> tuple[str, ...]:
-    if not SKILLS_ROOT.is_dir():
-        return ()
-    return tuple(sorted(path.parent.name for path in SKILLS_ROOT.glob("*/SKILL.md") if path.is_file()))
+    return catalog_skill_ids()
 
 
 def select_skill_ids(prompt: str) -> tuple[str, ...]:
     lowered = (prompt or "").casefold()
     return tuple(skill for skill, triggers in SKILL_TRIGGERS.items() if any(trigger.casefold() in lowered for trigger in triggers))
+
+
+def select_policy_skill_ids(prompt: str) -> tuple[str, ...]:
+    lowered = (prompt or "").casefold()
+    return tuple(
+        skill
+        for skill, triggers in POLICY_SKILL_TRIGGERS.items()
+        if any(trigger.casefold() in lowered for trigger in triggers)
+    )
 
 
 def resolve(prompt: str, *, max_chars: int = 6000, include_core: bool = True) -> CapabilityResolution:

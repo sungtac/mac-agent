@@ -40,6 +40,7 @@ _URL_PATTERN = re.compile(r"https?://[^\s<>\"]+", re.IGNORECASE)
 _FOLLOW_UP = ("팩트체크", "팩트 체크", "분석", "요약", "확인", "검토해줘", "검토 해줘")
 _DEICTIC = ("이거", "그거", "저거", "이 영상", "그 영상", "이 내용", "그 내용", "이 링크", "방금")
 _GREETING = ("안녕", "안녕하세요", "하이", "hello", "hi", "반가워")
+_DIRECT_STATUS_QUERY = ("현재 상태", "서비스 상태", "실행 상태", "상태 확인", "정상인지", "헬스체크", "health check")
 
 
 def _now() -> str:
@@ -173,6 +174,11 @@ def looks_like_anaphoric_reference(text: str, recent_anchors: Iterable[EntityAnc
     """Recognize short follow-ups only when there is an anchor to follow."""
     normalized = " ".join(str(text or "").split()).lower()
     if not normalized or any(normalized.startswith(greeting) for greeting in _GREETING):
+        return False
+    # A direct status question is self-contained. It must not be interpreted
+    # as a follow-up to the previous URL/topic anchor merely because it uses
+    # the ordinary Korean word "확인".
+    if any(phrase in normalized for phrase in _DIRECT_STATUS_QUERY):
         return False
     if not any(anchor for anchor in recent_anchors):
         return False

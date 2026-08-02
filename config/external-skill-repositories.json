@@ -1,0 +1,15 @@
+{
+  "schema": "edge_agent_external_skill_repositories.v1",
+  "repositories": {
+    "hwpx-skill": {
+      "path": "$HOME/document-writing-project/hwpx-skill",
+      "manifest": "SKILL.md",
+      "status": "external_dependency"
+    },
+    "pptx-skill": {
+      "path": "$HOME/document-writing-project/pptx-skill",
+      "manifest": "SKILL.md",
+      "status": "external_dependency"
+    }
+  }
+}

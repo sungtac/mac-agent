@@ -17,6 +17,36 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyTaskOrchestratorTests(unittest.TestCase):
+    def test_antigravity_prompt_contains_bounded_evidence_and_forbids_tools(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            source = repo / "example.ts"
+            source.write_text("export const value = 1;\n", encoding="utf-8")
+            runner = MODULE.HostOrchestrator("example.ts 수정", repo, repo / ".verify", 1, False)
+            prompt = runner.headless_evidence_prompt(
+                "조사 결과를 JSON으로 반환하라.",
+                {"relevant_files": ["example.ts"], "rules_text": "- 테스트를 실행하지 마라."},
+            )
+            self.assertIn("HEADLESS EVIDENCE CONTRACT", prompt)
+            self.assertIn("Bash, command, git, Read, Grep", prompt)
+            self.assertIn("export const value = 1;", prompt)
+            self.assertIn("APPLICABLE RULE TEXT", prompt)
+
+    def test_antigravity_review_omits_duplicate_file_contents(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "example.ts").write_text("export const value = 1;\n", encoding="utf-8")
+            runner = MODULE.HostOrchestrator("example.ts 수정", repo, repo / ".verify", 1, False)
+            prompt = runner.headless_evidence_prompt(
+                "diff를 검토하라.",
+                {"relevant_files": ["example.ts"]},
+                include_files=False,
+            )
+            self.assertNotIn("export const value = 1;", prompt)
+            self.assertIn("OMITTED BY HOST POLICY", prompt)
+
     def test_nested_provider_result_unwraps_json_without_api_usage(self):
         result, usage = MODULE.nested_provider_result({
             "usage": {"input_tokens": 12, "output_tokens": 4},
@@ -24,6 +54,13 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
         })
         self.assertEqual(result, {"verdict": "pass"})
         self.assertEqual(usage["input_tokens"], 12)
+
+    def test_last_json_keeps_provider_envelope_instead_of_nested_array(self):
+        value = MODULE.last_json(
+            'provider banner {"focus":"research","evidence":[{"source":"example.py"}],"testImplications":["make test"]}'
+        )
+        self.assertEqual(value["focus"], "research")
+        self.assertEqual(value["testImplications"], ["make test"])
 
     def test_dry_run_uses_host_harness_and_subscription_cli_paths(self):
         with tempfile.TemporaryDirectory() as directory:

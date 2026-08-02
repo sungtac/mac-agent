@@ -43,6 +43,17 @@ def _size(path: Path) -> int:
     return total
 
 
+def _is_clean_worktree(path: Path) -> bool:
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", str(path), "status", "--porcelain"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # A failed status probe is ambiguous and must remain protected.
+    return result.returncode == 0 and result.stdout == ""
+
+
 def inventory(*, now: float | None = None) -> dict:
     current = now if now is not None else time.time()
     registered = _registered_worktrees()
@@ -55,21 +66,29 @@ def inventory(*, now: float | None = None) -> dict:
             age_days = max(0.0, (current - stat.st_mtime) / 86400)
             size_bytes = _size(path)
             active = path.resolve() in registered
-            eligible = age_days >= RETENTION_DAYS and not active
-            items.append({"path": str(path), "age_days": round(age_days, 2), "size_bytes": size_bytes, "active_worktree": active, "eligible": eligible})
+            clean = _is_clean_worktree(path) if not active else False
+            eligible = age_days >= RETENTION_DAYS and not active and clean
+            items.append({"path": str(path), "age_days": round(age_days, 2), "size_bytes": size_bytes, "active_worktree": active, "clean": clean, "eligible": eligible})
     total_bytes = sum(item["size_bytes"] for item in items)
     return {"repair_root": str(REPAIR_ROOT), "retention_days": RETENTION_DAYS, "max_bytes": MAX_BYTES, "total_bytes": total_bytes, "over_budget": total_bytes > MAX_BYTES, "items": items}
 
 
 def prune(report: dict) -> list[str]:
     removed: list[str] = []
+    registered = _registered_worktrees()
     for item in report["items"]:
         if not item["eligible"]:
             continue
-        path = Path(item["path"])
+        path = Path(item["path"]).resolve()
         if path.parent != REPAIR_ROOT or not path.is_dir():
             continue
-        result = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "remove", "--force", str(path)], capture_output=True, text=True, check=False)
+        # Recheck the report at mutation time; inventory may be stale and a
+        # repair worktree may have become active or dirty since then.
+        if path in registered or not _is_clean_worktree(path):
+            continue
+        # Never force-remove a repair worktree.  Eligibility already requires
+        # a clean status, and Git itself remains the final safety check.
+        result = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "remove", str(path)], capture_output=True, text=True, check=False)
         if result.returncode == 0:
             removed.append(str(path))
     return removed

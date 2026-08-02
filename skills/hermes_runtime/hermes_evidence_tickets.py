@@ -116,10 +116,10 @@ def render_markdown(payload: dict[str, Any]) -> str:
 def build_payload(plan: dict[str, Any]) -> dict[str, Any]:
     tickets = tickets_from_plan(plan)
     return {
-        "schema": "openclaw.hermes_evidence_tickets.v1",
+        "schema": "edge_agent.hermes_evidence_tickets.v1",
         "ok": not plan.get("error"),
         "generated_at": utc_now(),
-        "source": "scripts/hermes_active_resolution_plan.py --json",
+        "source": "skills/hermes_runtime/hermes_active_resolution_plan.py --json",
         "source_ok": plan.get("ok"),
         "ticket_count": len(tickets),
         "tickets": [asdict(ticket) for ticket in tickets],

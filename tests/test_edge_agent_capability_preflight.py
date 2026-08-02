@@ -31,6 +31,8 @@ class CapabilityPreflightTests(unittest.TestCase):
             rendered = MODULE.render_prompt("/tmp")
         self.assertNotIn("must-not-appear", rendered)
         self.assertIn("unknown means verify further", rendered)
+        self.assertIn("Discovery evidence", rendered)
+        self.assertIn("searched_scopes", rendered)
 
     def test_json_is_machine_readable(self):
         payload = json.loads(MODULE.json.dumps([MODULE.asdict(item) for item in MODULE.collect(None)]))

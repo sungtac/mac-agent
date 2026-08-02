@@ -1,6 +1,6 @@
 # verify-task v2 — Claude 최소 세션 기반 다중 검증 게이트 (구현됨, 2026-08-01)
 
-**상태: 구현됨 (`workflows/verify-task-v2.js`).** 이 문서는 코드가 아니라 결정 기록이다. 2026-07-25~26에 걸쳐 사용자·Claude·Codex·Antigravity·Plan 에이전트가 여러 라운드로 검토하며 나온 최초 설계이고(아래 0~5단계 절, 이후 폐기됨), 결정마다 "왜"를 남긴 이유는 — 한 번 순서 오류(안티그래비티가 경량 트랙에도 다시 끼어드는 실수)가 실제로 났었고, 글로 확정 안 해두면 다음에 또 어긋나기 때문이다. 2026-08-01에 전체 트랙이 조사·병렬 계획·코드 리뷰 스킬 흐름으로 재설계됨 — 문서 하단 최신 개정 섹션이 현재 유효한 설계다. 구현/수정 시 이 문서를 먼저 읽고, 여기 없는 임의 변경은 하지 말 것.
+**상태: 구현됨 (`bin/verify-task-orchestrator.py`).** 구형 JS Workflow 어댑터는 제거되었다. 이 문서는 코드가 아니라 결정 기록이다. 2026-07-25~26에 걸쳐 사용자·Claude·Codex·Antigravity·Plan 에이전트가 여러 라운드로 검토하며 나온 최초 설계이고(아래 0~5단계 절, 이후 폐기됨), 결정마다 "왜"를 남긴 이유는 — 한 번 순서 오류(안티그래비티가 경량 트랙에도 다시 끼어드는 실수)가 실제로 났었고, 글로 확정 안 해두면 다음에 또 어긋나기 때문이다. 2026-08-01에 전체 트랙이 조사·병렬 계획·코드 리뷰 스킬 흐름으로 재설계됨 — 문서 하단 최신 개정 섹션이 현재 유효한 설계다. 구현/수정 시 이 문서를 먼저 읽고, 여기 없는 임의 변경은 하지 말 것.
 
 ## 목적
 
@@ -151,6 +151,15 @@ Codex·Antigravity·Plan 3자 만장일치 결론. Claude Code의 `UserPromptSub
 `.verify/runs/<task-id>/`에 기록한다. 에이전트 간에는 이 디렉터리의 구조화 산출물과
 필요한 최소 diff만 전달한다.
 
+### 부재 주장 게이트
+
+하네스는 현재 셸이나 단일 경로를 확인한 뒤 전역 부재로 확대하는 오류를 차단한다.
+`bin/edge_agent_capability_preflight.py`는 실행파일·환경변수 이름·보안 저장소·LaunchAgents·
+설정 디렉터리를 읽기 전용으로 조사하고, 비밀값은 읽지 않은 채 `discovery_evidence`를 만든다.
+`bin/edge_agent_absence_guard.py`는 토큰·키·자격증명·설정·파일·서비스·실행파일·기능의
+부재 주장이 `discovery_evidence` 또는 `searched_scopes`를 포함하지 않으면 provider 결과를
+실패 처리한다. 허용되는 표현은 전역 “없음”이 아니라 “검색한 범위에서 찾지 못함”이다.
+
 경량 트랙은 `Claude 구현 → 하네스 diff·테스트 → Codex 차단 리뷰`만 수행한다.
 파일 3개 초과, 민감·보호 경로, 신규 의존성, 마이그레이션·배포·파괴적 데이터 변경,
 공개 API 파괴 변경, 전체 검증 명시가 있으면 하네스가 전체 트랙으로 격상한다.
@@ -164,6 +173,35 @@ Claude는 기본적으로 계획·조사·구현을 맡지 않으며, 계획 비
 제한한다. 전체 로그는 `logs/`에 보존하고 리뷰어에는 실패 요약만 전달한다. 실행별
 `task.json`, `repository-state.json`, `investigation.json`, `current.diff`,
 `test-summary.json`, `metrics.jsonl`을 남겨 후속 재시도와 토큰 분석에 사용한다.
+
+Antigravity의 `agy -p` 조사·리뷰는 headless 권한 프롬프트를 표시할 수 없으므로
+저장소 탐색을 요청하지 않는다. 호스트 하네스가 조사 단계에는 허용된 관련 파일 내용
+(파일당 12,000자, 전체 24,000자)과 규칙(6,000자)을 미리 수집하고, 리뷰 단계에는
+중복 파일 내용을 보내지 않고 현재 diff와 테스트 요약만 전달한다. Antigravity 프롬프트에는
+도구·명령·테스트 실행 금지 계약을 명시한다. 권한 우회 플래그는 사용하지 않으며, 증거가
+부족하거나 provider가 JSON을 반환하지 않으면 `dispatchFailed`로 기록하고 승인하지 않는다.
+커밋 SHA 기반 `code-review-request-worker`도 동일하게 호스트가 stat·diff·변경 파일 내용을
+미리 묶어 Antigravity에 전달하며, diff는 40,000자, 파일 증거는 전체 24,000자로 제한한다.
+리뷰 sandbox는 Antigravity CLI가 실제로 사용하는 기본 로그·crash 경로를 제거하지 않고
+동적 로그 경로와 함께 허용한다. 이 경로를 제거하면 인증 초기화가 실패해 headless 리뷰가
+빈 응답으로 끝날 수 있다.
+작업 명세가 테스트 보강을 요구하지만 테스트 경로를 직접 지정하지 않은 경우에는 하네스가
+작업 대상 파일명과 basename이 일치하는 기존 테스트 파일만 허용 목록에 추가한다. 또한
+provider 응답에서 중첩 배열·객체를 최종 결과로 오인하지 않도록 오케스트레이터 JSON 추출기는
+완전한 top-level JSON 값 단위로 후보를 수집한다.
+
+하네스 테스트 명령은 `package.json`/`Makefile`의 `test`, `lint`, `typecheck`를 모두
+실행하고, 명시된 실행기가 없으면 pytest 설정과 실제 설치 여부를 확인한 뒤 Python
+`unittest` 및 Node `--test`를 탐지한다. 각 명령의 결과와 통합 로그를 `test-summary.json`
+에 기록하며, 정상 테스트 이름의 `failed` 문자열은 실패로 오인하지 않는다. 결정론적 하네스와
+provider CLI는 `bin/verify-task-orchestrator.py`가 호스트 subprocess로 직접 실행한다. 따라서
+Claude 세션은 작업을 전달하는 부모 세션과 필요한 역할의 단발 CLI 호출로 제한되고, 별도
+Claude Workflow `agent()` 세션은 기본 경로에 사용하지 않는다.
+
+이 경로에는 별도 provider API 키가 필요하지 않다. `claude`, `codex`, `agy`가 각각 로그인된
+구독형 CLI인지 하네스가 사전 확인하고, 실제 인증·사용량 정책은 각 CLI 계정에 맡긴다.
+브리지와 provider dispatch가 실제 provider 토큰 사용량을 알 수 없는 경우 해당 값은 `0`이
+아니라 `null`로 기록하고, 입력 패키지 바이트와 추정 토큰만 별도로 남긴다.
 
 ### 폐기된 직전 개정 흐름
 

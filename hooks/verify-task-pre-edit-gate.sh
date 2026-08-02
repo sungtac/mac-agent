@@ -13,6 +13,15 @@ SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
 AGENT_ID="$(printf '%s' "$INPUT" | jq -r '.agent_id // empty' 2>/dev/null)"
 
+# Claude may report a temporary-directory path through a symlink (for example
+# /tmp vs /private/tmp on macOS), while the host orchestrator records the
+# canonical path from Path.resolve(). Compare the same representation on both
+# sides so a valid run is not rejected for an equivalent path spelling.
+if [ -n "$CWD" ]; then
+  CWD_CANONICAL="$(cd -- "$CWD" 2>/dev/null && pwd -P || true)"
+  [ -n "$CWD_CANONICAL" ] && CWD="$CWD_CANONICAL"
+fi
+
 # Claude Code runs session hooks inside subagents as well.  Without this
 # bypass, verify-task-v2's own temporary Write operations deadlock the gate.
 [ -n "$AGENT_ID" ] && exit 0
@@ -38,6 +47,6 @@ jq -n ' {
   hookSpecificOutput: {
     hookEventName: "PreToolUse",
     permissionDecision: "deny",
-    permissionDecisionReason: "메인 세션의 Edit/Write를 차단했습니다. 먼저 Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona, sessionId}})를 호출하고, 조사·계획 검토·구현·code-review가 성공한 뒤 다시 시도하세요."
+    permissionDecisionReason: "메인 세션의 Edit/Write를 차단했습니다. 먼저 Bash로 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py --task-file <작업파일> --cwd <cwd> --session-id <session_id> 를 실행하고, 호스트 하네스와 독립 리뷰가 성공한 뒤 다시 시도하세요."
   }
 }'

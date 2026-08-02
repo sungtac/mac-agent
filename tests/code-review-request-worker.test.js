@@ -7,6 +7,8 @@ const { execFileSync } = require('node:child_process')
 const { recordReviewRequest, findReviewRequest, SCHEMA_VERSION: REQUEST_SCHEMA } = require('../workflows/lib/code-review-request-queue.js')
 const { findLatestReview } = require('../workflows/lib/code-review-store.js')
 const { runWorkerOnce } = require('../bin/code-review-request-worker.js')
+const { buildReviewEvidence, createPrompt } = require('../bin/code-review-request-worker.js')
+const workerSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'code-review-request-worker.js'), 'utf8')
 
 let root
 let repo
@@ -62,6 +64,22 @@ test('dry-run verifies the exact clean SHA without invoking providers', async ()
   assert.equal(findReviewRequest(request.review_id, queueRoot).state, 'pending')
 })
 
+test('Antigravity review receives pre-gathered evidence and a no-tools contract', () => {
+  const evidence = buildReviewEvidence(repo, headSha)
+  const prompt = createPrompt(queueRequest(), repo, 'agy', evidence)
+  assert.match(prompt, /HEADLESS EVIDENCE CONTRACT/)
+  assert.match(prompt, /Bash, command, git, Read, Grep/)
+  assert.match(prompt, /module\.exports = 1/)
+  assert.match(prompt, new RegExp(headSha))
+})
+
+test('Codex review keeps repository inspection instructions', () => {
+  const prompt = createPrompt(queueRequest(), repo, 'codex')
+  assert.match(prompt, /git -C .* rev-parse HEAD/)
+  assert.match(prompt, /git show --stat --oneline/)
+  assert.doesNotMatch(prompt, /HEADLESS EVIDENCE CONTRACT/)
+})
+
 test('execute runs Codex and Antigravity, persists the report, and completes the queue item', async () => {
   const request = queueRequest()
   recordReviewRequest(request, queueRoot)
@@ -108,4 +126,9 @@ test('a blocking finding produces changes required without AI approval', async (
   })
   assert.equal(result.status, 'CHANGES_REQUIRED')
   assert.equal(findLatestReview(request.review_id, stateRoot).approval, undefined)
+})
+
+test('isolated worktree cleanup never force-removes an unverified worktree', () => {
+  assert.doesNotMatch(workerSource, /worktree', 'remove', '--force'/)
+  assert.match(workerSource, /status', '--porcelain', '--untracked-files=all'/)
 })

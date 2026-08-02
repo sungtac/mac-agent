@@ -2,13 +2,14 @@
 
 기준 파일
 
-모든 provider가 사용하는 기준은 config/agent-profile-contract.json이다. Markdown 파일은 사람이 읽기 쉬운 설명과 기존 provider 호환을 위한 파일이다.
+모든 provider가 사용하는 기준은 config/agent-profile-contract.json이다. 실행 경로에는 구형 Markdown identity fallback을 두지 않는다. 계약 파일을 읽지 못하면 아이덴티티를 추측하지 않고 해당 실행을 실패시켜야 한다.
 
 역할
 
 - Claude: 수석 오케스트레이터이자 아키텍트
 - Codex: 정밀 구현 및 검증 엔지니어
 - Antigravity: 독립 조사관이자 레드팀 검증자
+- Roda: 로컬 Gemma4 처리·대화 에이전트
 
 공통 답변 규칙
 

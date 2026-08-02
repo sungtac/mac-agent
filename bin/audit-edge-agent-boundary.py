@@ -30,6 +30,7 @@ PROTECTED_SERVICE_LABELS = {
     "com.macagent.telegram-claude",
     "com.macagent.telegram-codex",
     "com.macagent.telegram-antigravity",
+    "com.multiagent.engine",
 }
 
 
@@ -203,9 +204,9 @@ def audit_boundary(
 
     if process_lines is None:
         process_lines = _run(["ps", "-axo", "pid=,ppid=,command="]).splitlines()
-    scripts = {"telegram-agent-bot.py", "roda-gemma-bot.py", "discord-bot.py", "codex-bot.py"}
+    scripts = {"telegram-agent-bot.py", "roda-gemma-bot.py", "adapter.py"}
     report.processes = _process_records(process_lines, scripts)
-    expected_scripts = {"telegram-agent-bot.py", "roda-gemma-bot.py", "discord-bot.py", "codex-bot.py"}
+    expected_scripts = {"telegram-agent-bot.py", "roda-gemma-bot.py", "adapter.py"}
     observed_scripts = {item["script"] for item in report.processes}
     for script in sorted(expected_scripts - observed_scripts):
         report.findings.append(Finding("warning", "process_not_observed", "expected provider script was not observed in process snapshot", script))

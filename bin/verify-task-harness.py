@@ -9,7 +9,9 @@ It intentionally does not use an LLM.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -19,6 +21,15 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+
+ABSENCE_GUARD_PATH = Path(__file__).with_name("edge_agent_absence_guard.py")
+ABSENCE_GUARD_SPEC = importlib.util.spec_from_file_location("edge_agent_absence_guard", ABSENCE_GUARD_PATH)
+if ABSENCE_GUARD_SPEC is None or ABSENCE_GUARD_SPEC.loader is None:
+    raise RuntimeError(f"absence guard unavailable: {ABSENCE_GUARD_PATH}")
+ABSENCE_GUARD = importlib.util.module_from_spec(ABSENCE_GUARD_SPEC)
+sys.modules[ABSENCE_GUARD_SPEC.name] = ABSENCE_GUARD
+ABSENCE_GUARD_SPEC.loader.exec_module(ABSENCE_GUARD)
 
 
 SCHEMA = "edge_agent.verify_task_handoff.v1"
@@ -32,6 +43,7 @@ SENSITIVE = (
     re.compile(r"(^|/)(auth|authentication|authorization|security|permissions?)(/|\.|$)", re.I),
     re.compile(r"(^|/)(config|configuration|deploy|deployment|infra|infrastructure|migrations?)(/|\.|$)", re.I),
     re.compile(r"(^|/)(Dockerfile|docker-compose(?:\.|$)|Makefile|.*\.lock$)", re.I),
+    re.compile(r"(^|/)(README(?:\.[^/]+)?|docs)(/|$)", re.I),
 )
 PROTECTED = (
     re.compile(r"(^|/)\.git(/|$)"),
@@ -98,6 +110,40 @@ def task_paths(task: str) -> list[str]:
     return found
 
 
+def related_test_files(cwd: Path, relevant: list[str]) -> list[str]:
+    """Add only existing tests whose basename matches a task file.
+
+    A task can require test changes without naming the test path.  The old
+    package exposed only changed files and explicit task paths, so an agent
+    could be forbidden from updating the existing matching test.  Keep the
+    handoff bounded by selecting basename matches rather than every test in
+    the repository.
+    """
+    stems = {Path(path).stem for path in relevant}
+    candidates: list[Path] = []
+    candidates.extend(cwd.glob("test_*.py"))
+    candidates.extend(cwd.glob("*.test.*"))
+    tests_dir = cwd / "tests"
+    if tests_dir.is_dir():
+        candidates.extend(tests_dir.rglob("test_*.py"))
+        candidates.extend(tests_dir.rglob("*.test.*"))
+    matches: list[str] = []
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        name = candidate.name
+        if name.startswith("test_"):
+            candidate_stem = name[5:].split(".", 1)[0]
+        else:
+            candidate_stem = name.split(".test.", 1)[0]
+        if candidate_stem not in stems:
+            continue
+        relative = safe_rel(str(candidate.relative_to(cwd)))
+        if relative not in matches:
+            matches.append(relative)
+    return sorted(matches)
+
+
 def is_sensitive(path: str) -> bool:
     normalized = safe_rel(path)
     return any(pattern.search(normalized) for pattern in SENSITIVE)
@@ -136,24 +182,57 @@ def discover_rules(cwd: Path, files: list[str]) -> tuple[list[str], str]:
 def test_commands(cwd: Path) -> list[str]:
     commands: list[str] = []
     package = cwd / "package.json"
+    package_scripts: dict[str, str] = {}
     if package.is_file():
         try:
             scripts = json.loads(package.read_text(encoding="utf-8")).get("scripts", {})
+            package_scripts = scripts if isinstance(scripts, dict) else {}
             for name in ("test", "lint", "typecheck"):
-                if name in scripts:
+                if name in package_scripts:
                     commands.append(f"npm run {name}")
         except (OSError, json.JSONDecodeError):
             pass
-    if (cwd / "pytest.ini").exists() or (cwd / "tests").is_dir():
-        commands.append("python3 -m pytest")
+    make_targets: set[str] = set()
     if (cwd / "Makefile").is_file():
         try:
-            targets = re.findall(r"^([A-Za-z0-9_.-]+):", (cwd / "Makefile").read_text(encoding="utf-8", errors="replace"), re.M)
+            make_targets = set(re.findall(r"^([A-Za-z0-9_.-]+):", (cwd / "Makefile").read_text(encoding="utf-8", errors="replace"), re.M))
             for target in ("test", "lint", "typecheck"):
-                if target in targets:
+                if target in make_targets:
                     commands.append(f"make {target}")
         except OSError:
             pass
+
+    tests_dir = cwd / "tests"
+    has_js_tests = tests_dir.is_dir() and any(tests_dir.rglob("*.test.js"))
+    has_python_tests = tests_dir.is_dir() and any(tests_dir.rglob("test_*.py"))
+    has_declared_test = "test" in package_scripts or "test" in make_targets
+
+    # Only use pytest when the repository declares pytest configuration and the
+    # interpreter can import it. A bare tests/ directory is not evidence that
+    # pytest is installed; this repository uses unittest and node --test.
+    pytest_configured = (cwd / "pytest.ini").is_file()
+    for config_name in ("pyproject.toml", "setup.cfg"):
+        config_path = cwd / config_name
+        if config_path.is_file():
+            try:
+                config_text = config_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                config_text = ""
+            pytest_configured = pytest_configured or "[tool.pytest" in config_text or "[tool:pytest]" in config_text
+    pytest_available = importlib.util.find_spec("pytest") is not None
+
+    if not has_declared_test:
+        if pytest_configured and pytest_available:
+            commands.append("python3 -m pytest")
+        elif has_python_tests:
+            commands.append("python3 -m unittest discover -s tests -p 'test_*.py'")
+        elif pytest_configured:
+            # Preserve an explicit pytest requirement so the missing runner is
+            # reported as a deterministic test failure rather than silently
+            # skipping the project's tests.
+            commands.append("python3 -m pytest")
+        if has_js_tests:
+            commands.append("node --test tests/*.test.js")
     return list(dict.fromkeys(commands))
 
 
@@ -184,10 +263,66 @@ def append_metric(run_dir: Path, record: dict[str, Any]) -> None:
     path = run_dir / "metrics.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        # Full-track research and review calls are intentionally parallel.
+        # Lock the append itself so concurrent provider bridges cannot
+        # interleave JSONL records or truncate one another's writes.
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+            handle.flush()
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
-def init_run(cwd: Path, task: str, run_dir: Path, explicit_full: bool) -> dict[str, Any]:
+def append_agent_bridge_metric(run_dir: Path) -> None:
+    agent = os.environ.get("VERIFY_AGENT")
+    if not agent:
+        return
+
+    def optional_int(name: str) -> int | None:
+        value = os.environ.get(name)
+        try:
+            return int(value) if value else None
+        except ValueError:
+            return None
+
+    package_bytes = optional_int("VERIFY_PACKAGE_BYTES")
+    append_metric(run_dir, {
+        "task_id": os.environ.get("VERIFY_TASK_ID", run_dir.name),
+        "track": os.environ.get("VERIFY_TRACK"),
+        "agent": agent,
+        "role": os.environ.get("VERIFY_ROLE", "harness-bridge"),
+        "round": optional_int("VERIFY_ROUND"),
+        "model": os.environ.get("VERIFY_MODEL"),
+        "effort": os.environ.get("VERIFY_EFFORT"),
+        # The Workflow API does not expose provider usage to the script. Keep
+        # unknown values null instead of falsely reporting zero usage.
+        "input_tokens": optional_int("VERIFY_INPUT_TOKENS"),
+        "output_tokens": optional_int("VERIFY_OUTPUT_TOKENS"),
+        "cache_read_tokens": optional_int("VERIFY_CACHE_READ_TOKENS"),
+        "cache_creation_tokens": optional_int("VERIFY_CACHE_CREATION_TOKENS"),
+        "package_bytes": package_bytes or 0,
+        "package_tokens": max(1, package_bytes // 4) if package_bytes else None,
+        "prefix_fingerprint": os.environ.get("VERIFY_PREFIX_FINGERPRINT"),
+    })
+
+
+def summarize_failure_lines(output: str) -> list[str]:
+    failures: list[str] = []
+    for line in output.splitlines():
+        stripped = line.strip()
+        if re.search(r"^(?:✖|not ok\b|FAIL(?:ED|URE)?\b|ERROR\b|Error:|npm ERR!|E\s+|F\s+)", stripped) or re.search(r"(?:No module named|command not found)", stripped, re.I):
+            failures.append(stripped)
+    return failures[:10]
+
+
+def init_run(
+    cwd: Path,
+    task: str,
+    run_dir: Path,
+    explicit_full: bool,
+    preflight_result: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "logs").mkdir(exist_ok=True)
     state = head_state(cwd)
@@ -195,8 +330,9 @@ def init_run(cwd: Path, task: str, run_dir: Path, explicit_full: bool) -> dict[s
     rules, rule_text = discover_rules(cwd, files)
     commands = test_commands(cwd)
     policy = classify(task, files, explicit_full)
-    preflight_result = preflight(cwd)
+    preflight_result = preflight_result if preflight_result is not None else preflight(cwd)
     relevant = [path for path in files if (cwd / path).is_file()]
+    relevant = list(dict.fromkeys(relevant + related_test_files(cwd, relevant)))
     task_id = hashlib.sha256(f"{cwd}\0{task}".encode()).hexdigest()[:16]
     task_record = {"schema": SCHEMA, "task_id": task_id, "task": task, "cwd": str(cwd), "run_dir": str(run_dir)}
     repository = {**state, "status": "clean" if not state["files_changed"] else "dirty"}
@@ -321,29 +457,52 @@ def preflight(cwd: Path) -> dict[str, Any]:
     else:
         code, _, err = run([agy, "models"], cwd, 20)
         checks.append({"name": "antigravity", "ok": code == 0, "reason": "models check failed" if code else "available"})
-    return {"schema": SCHEMA, "ok": all(item["ok"] for item in checks), "issues": "; ".join(f"{item['name']}: {item['reason']}" for item in checks if not item["ok"]), "checks": checks}
+    discovery = ABSENCE_GUARD.discover_local_sources(subject="provider/configuration/capability")
+    return {
+        "schema": SCHEMA,
+        "ok": all(item["ok"] for item in checks),
+        "issues": "; ".join(f"{item['name']}: {item['reason']}" for item in checks if not item["ok"]),
+        "checks": checks,
+        "discovery_evidence": discovery.as_dict(candidate_limit=80),
+    }
 
 
 def run_tests(cwd: Path, run_dir: Path) -> dict[str, Any]:
     commands = test_commands(cwd)
     if not commands:
-        result = {"schema": SCHEMA, "status": "not_run", "commands": [], "failures": [], "full_log_path": str(run_dir / "logs/tests.log")}
+        result = {"schema": SCHEMA, "status": "not_run", "commands": [], "results": [], "failures": [], "full_log_path": str(run_dir / "logs/tests.log")}
         write_json(run_dir / "test-summary.json", result)
         append_metric(run_dir, {"task_id": run_dir.name, "track": None, "agent": "harness", "role": "test_runner", "round": 0, "model": None, "effort": None, "input_tokens": 0, "output_tokens": 0, "package_bytes": 0, "package_tokens": 0})
         return result
-    command = commands[0]
     log_path = run_dir / "logs" / "tests.log"
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        proc = subprocess.run(command, cwd=cwd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
-        output = proc.stdout or ""
-        log_path.write_text(output, encoding="utf-8", errors="replace")
-        failures = [line.strip() for line in output.splitlines() if re.search(r"(?:FAIL|ERROR|Error:|failed|FAILED)", line, re.I)][:10]
-        status = "passed" if proc.returncode == 0 else "failed"
-        result = {"schema": SCHEMA, "status": status, "command": command, "exit_code": proc.returncode, "failures": failures, "full_log_path": str(log_path)}
-    except subprocess.TimeoutExpired as exc:
-        log_path.write_text((exc.stdout or "") if isinstance(exc.stdout, str) else "", encoding="utf-8")
-        result = {"schema": SCHEMA, "status": "error", "command": command, "failures": ["test command timed out"], "full_log_path": str(log_path)}
+    results: list[dict[str, Any]] = []
+    all_failures: list[str] = []
+    log_chunks: list[str] = []
+    for index, command in enumerate(commands, start=1):
+        try:
+            proc = subprocess.run(command, cwd=cwd, shell=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=300)
+            output = proc.stdout or ""
+            failures = summarize_failure_lines(output)
+            command_status = "passed" if proc.returncode == 0 else "failed"
+            result = {"command": command, "status": command_status, "exit_code": proc.returncode, "failures": failures}
+        except subprocess.TimeoutExpired as exc:
+            output = (exc.stdout or "") if isinstance(exc.stdout, str) else ""
+            result = {"command": command, "status": "error", "failures": ["test command timed out"]}
+        results.append(result)
+        all_failures.extend(f"{command}: {failure}" for failure in result.get("failures", []))
+        log_chunks.append(f"=== command {index}: {command} ===\n{output}")
+
+    log_path.write_text("\n\n".join(log_chunks), encoding="utf-8", errors="replace")
+    status = "passed" if all(item["status"] == "passed" for item in results) else "failed"
+    result = {
+        "schema": SCHEMA,
+        "status": status,
+        "commands": commands,
+        "results": results,
+        "failures": all_failures[:10],
+        "full_log_path": str(log_path),
+    }
     write_json(run_dir / "test-summary.json", result)
     append_metric(run_dir, {"task_id": run_dir.name, "track": None, "agent": "harness", "role": "test_runner", "round": 0, "model": None, "effort": None, "input_tokens": 0, "output_tokens": 0, "package_bytes": 0, "package_tokens": 0})
     return result
@@ -357,7 +516,7 @@ def snapshot_and_tests(cwd: Path, task: str, run_dir: Path, explicit_full: bool)
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["preflight", "init", "snapshot", "snapshot-tests", "tests"])
+    parser.add_argument("command", choices=["preflight", "init", "snapshot", "snapshot-tests", "tests", "record-agent-metric"])
     parser.add_argument("--cwd", required=True)
     parser.add_argument("--task", default="")
     parser.add_argument("--run-dir", required=True)
@@ -376,8 +535,13 @@ def main() -> int:
         output = snapshot_and_tests(cwd, args.task, run_dir, args.full)
     elif args.command == "snapshot":
         output = snapshot(cwd, args.task, run_dir, args.full)
+    elif args.command == "record-agent-metric":
+        append_agent_bridge_metric(run_dir)
+        output = {"schema": SCHEMA, "ok": True, "run_dir": str(run_dir)}
     else:
         output = run_tests(cwd, run_dir)
+    if args.command != "record-agent-metric":
+        append_agent_bridge_metric(run_dir)
     print(json.dumps(output, ensure_ascii=False, separators=(",", ":")))
     return 0
 

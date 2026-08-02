@@ -3,6 +3,9 @@
 ; this profile from the launchd-managed provider bridge.
 (version 1)
 (allow default)
+(deny file-write* (subpath "/Users/edge_ai/.edge-agent/protected-canary"))
+(deny file-write* (subpath "/Users/edge_ai/.openclaw"))
+(deny file-write* (subpath "/Users/edge_ai/.edge-agent/retired-openclaw-workspace"))
 (deny file-write* (subpath "/Users/edge_ai/.openclaw/workspace/team_os"))
 (deny file-write* (subpath "/Users/edge_ai/.openclaw/workspace/state"))
 (deny file-write* (subpath "/Users/edge_ai/.openclaw/workspace/sukja_telegram"))

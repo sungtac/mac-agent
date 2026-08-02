@@ -41,7 +41,7 @@ lock_file = ~/.claude/discord-bot/repo-locks/<sha256(lock_key)>.lock
 |---|---|---|
 | `nano-gate-events.jsonl` | `taskId + stepId` 멱등 이벤트 | append lock 또는 단일 writer, 중복·충돌 판정 |
 | `verify-task-v2-history.jsonl` | 검증 실행 결과 | 원자 append, 손상 줄 감지, 실패 시 성공으로 처리 금지 |
-| Discord pending JSON | 재시도 작업 1건 | 임시 파일 작성 후 atomic rename, id 기반 중복 방지 |
+| Retired Discord pending JSON | 퇴역 전 재시도 작업 1건 | 보존만 수행; 새 writer·자동 재시도는 없음 |
 
 원장 기록 실패는 해당 작업을 성공으로 확정하지 않는다. 특히 nano 이벤트
 기록이 실패하면 다음 nano step으로 진행하지 않는다.

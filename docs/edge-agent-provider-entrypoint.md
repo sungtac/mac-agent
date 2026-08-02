@@ -15,4 +15,6 @@ provider 실행은 엣지 provider sandbox를 거치며, Codex는 지정한 work
 
 실행 전에는 `bin/edge_agent_capability_preflight.py`의 read-only 관측도 프롬프트에
 주입된다. 관측은 실행 가능성의 근거일 뿐 권한 승인이 아니며, 관측 실패는
-`unknown`으로 처리된다.
+`unknown`으로 처리된다. 또한 환경변수 하나나 단일 경로만 보고 토큰·키·설정·파일·서비스·
+실행파일·기능이 없다고 결론 내릴 수 없다. `bin/edge_agent_absence_guard.py`가 공통
+소스 탐색 증거(`discovery_evidence`/`searched_scopes`) 없는 부재 주장을 차단한다.

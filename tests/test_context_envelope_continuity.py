@@ -19,6 +19,10 @@ from unittest.mock import AsyncMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
+_TOKEN_ROOT = tempfile.TemporaryDirectory()
+_TOKEN_FILE = Path(_TOKEN_ROOT.name) / "claude.token"
+_TOKEN_FILE.write_text("123456:unit-test-token", encoding="utf-8")
+_TOKEN_FILE.chmod(0o600)
 
 from edge_agent_context_envelope import (  # noqa: E402
     ContextEnvelopeStore,
@@ -34,7 +38,12 @@ def load_module(name: str, filename: str):
     spec = importlib.util.spec_from_file_location(name, BIN / filename)
     module = importlib.util.module_from_spec(spec)
     assert spec and spec.loader
-    spec.loader.exec_module(module)
+    with patch.dict(os.environ, {
+        "TELEGRAM_AGENT_ROLE": "claude",
+        "TELEGRAM_AGENT_CHAT_ID": "-1003952617795",
+        "TELEGRAM_AGENT_TOKEN_FILE": str(_TOKEN_FILE),
+    }):
+        spec.loader.exec_module(module)
     return module
 
 
@@ -50,9 +59,15 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
     def setUp(self):
         self.tempdir = tempfile.TemporaryDirectory()
         self.store = ContextEnvelopeStore(self.tempdir.name)
+        self._previous_state_dir = os.environ.get("EDGE_AGENT_STATE_DIR")
+        os.environ["EDGE_AGENT_STATE_DIR"] = str(Path(self.tempdir.name) / "task-state")
         self.bot = load_module("telegram_agent_bot_native_session_test", "telegram-agent-bot.py")
 
     def tearDown(self):
+        if self._previous_state_dir is None:
+            os.environ.pop("EDGE_AGENT_STATE_DIR", None)
+        else:
+            os.environ["EDGE_AGENT_STATE_DIR"] = self._previous_state_dir
         self.tempdir.cleanup()
 
     def test_video_anchor_resolves_short_fact_check_follow_up(self):

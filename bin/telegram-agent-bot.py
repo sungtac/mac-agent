@@ -53,6 +53,7 @@ from edge_agent_context_envelope import (
 )
 from edge_agent_skill_connector import build_skill_context
 from edge_agent_state import write_task_state
+from edge_agent_coordination import wait_for_peer_results
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
 from agent_profile import render_agent_profile
@@ -87,7 +88,7 @@ ROLE = os.environ.get("TELEGRAM_AGENT_ROLE", "").strip().lower()
 TOKEN_FILE = Path(
     os.environ.get(
         "TELEGRAM_AGENT_TOKEN_FILE",
-        str(HOME / ".config" / "agent-telegram" / f"{ROLE}.token"),
+        str(HOME / ".edge-agent" / "secrets" / "telegram" / f"{ROLE}.token"),
     )
 ).expanduser()
 # GROUP_TITLE is no longer used for access control (see addressed_text) —
@@ -222,9 +223,9 @@ def _has_address(text: str, words: tuple[str, ...]) -> bool:
         return True
     for raw_token in tokens:
         token = _strip_wake_punct(raw_token)
-        for particle in ("야", "아", "씨", "님"):
-            if token.endswith(particle) and token != particle and token[:-len(particle)] in words:
-                return True
+        stripped = _strip_wake_particle(token)
+        if stripped != token and stripped in words:
+            return True
     return False
 
 
@@ -237,6 +238,8 @@ def _is_external_agent_addressed(text: str) -> bool:
 
 def _message_route(text: str, mentioned_roles: set[str] | None = None) -> str:
     """Return the routing class before any provider/worktree is started."""
+    if _is_coordination_request(text, mentioned_roles):
+        return "coordination"
     if _is_external_agent_addressed(text):
         return "external"
     if mentioned_roles:
@@ -244,6 +247,35 @@ def _message_route(text: str, mentioned_roles: set[str] | None = None) -> str:
     if _is_group_address(text):
         return "broadcast"
     return "default"
+
+
+def _is_coordination_request(text: str, mentioned_roles: set[str] | None = None) -> bool:
+    """Keep the coordinator active for an explicit multi-agent address.
+
+    Merely mentioning another agent while asking Roda a question remains a
+    Roda-only request. A conjunction such as ``안티랑 로다`` is the explicit
+    signal that the human wants peer coordination.
+    """
+    roles = mentioned_roles if mentioned_roles is not None else _wake_roles(text)
+    if not roles or not _is_external_agent_addressed(text):
+        return False
+    registered = "클로드|코덱스|콕스|안티|안티그래비티"
+    if re.search(rf"(?:{registered})\s*(?:랑|과|와)\s*로다", text):
+        return True
+    if re.search(rf"로다\s*(?:랑|과|와)\s*(?:{registered})", text):
+        return True
+    has_roda_mention = any(
+        re.search(rf"@{re.escape(username)}(?![a-zA-Z0-9_])", text, re.IGNORECASE)
+        for username in EXTERNAL_AGENT_USERNAMES
+    )
+    has_registered_mention = any(
+        re.search(rf"@{re.escape(username)}(?![a-zA-Z0-9_])", text, re.IGNORECASE)
+        for username in ROLE_USERNAMES.values()
+    )
+    # A Korean wake word for one provider plus a real @Roda mention is also
+    # an explicit multi-agent address. The provider name need not itself be
+    # an @mention (for example: "안티랑 @sukja_hwpx_helper_bot ...").
+    return has_roda_mention and (has_registered_mention or bool(roles))
 
 
 def _needs_task_worktree(text: str) -> bool:
@@ -672,7 +704,10 @@ def _harden_log_permissions() -> None:
 # particles (가/는/를/을/은/이/에게/한테) — round-5 independent review found
 # "코덱스가 이 파일을 봐줘" / "안티는 어떻게 생각해?" weren't recognized as
 # addressing that bot because only vocative forms were stripped.
-_WAKE_PARTICLE_SUFFIXES = ("에게", "한테", "야", "아", "씨", "님", "가", "는", "를", "을", "은", "이")
+_WAKE_PARTICLE_SUFFIXES = (
+    "에게", "한테", "야", "아", "씨", "님", "랑", "과", "와", "도", "만",
+    "가", "는", "를", "을", "은", "이",
+)
 
 
 def _strip_wake_punct(token: str) -> str:
@@ -825,8 +860,10 @@ def _is_stale(message) -> bool:
 #      decision. TELEGRAM_AGENT_CHAT_ID (added this session) is the intended
 #      boundary — trust is "whoever is in this specific group," not
 #      "whoever sent this specific message."
-# Ordinary unaddressed messages now go to Claude only; explicit group words
-# such as "각자" are the supported fan-out mechanism.
+# Ordinary unaddressed messages now go to every provider bot. Explicit role
+# names still narrow the route, while group words such as "각자" remain a
+# documented fan-out form. Roda participates when Telegram privacy mode allows
+# it to receive unmentioned group messages.
 def addressed_text(update: Update) -> str | None:
     message = update.effective_message
     chat = update.effective_chat
@@ -864,14 +901,8 @@ def addressed_text(update: Update) -> str | None:
         # let the provider bots answer or create workspaces for its request.
         return None
 
-    if mentioned_roles and ROLE not in mentioned_roles:
+    if mentioned_roles and ROLE not in mentioned_roles and route != "coordination":
         # Explicitly addressed to (a) different role bot(s) — stay silent.
-        return None
-
-    if not mentioned_roles and route == "default" and ROLE != "claude":
-        # Claude is the representative for ordinary conversation. This
-        # avoids three provider processes competing for one message while
-        # preserving explicit fan-out through words such as "각자".
         return None
 
     if route == "broadcast" and _needs_task_worktree(text) and ROLE != "codex":
@@ -1432,6 +1463,61 @@ _conflict_times: "deque[float]" = deque(maxlen=200)
 # over hours don't trigger this.
 CONFLICT_BURST_THRESHOLD = int(os.environ.get("TELEGRAM_AGENT_CONFLICT_BURST_THRESHOLD", "15"))
 CONFLICT_BURST_WINDOW_SECONDS = int(os.environ.get("TELEGRAM_AGENT_CONFLICT_BURST_WINDOW_SECONDS", "120"))
+CONFLICT_RESTART_COOLDOWN_SECONDS = min(
+    3600,
+    max(0, int(os.environ.get("TELEGRAM_AGENT_CONFLICT_RESTART_COOLDOWN_SECONDS", "60"))),
+)
+_CONFLICT_COOLDOWN_FILE = Path(
+    os.environ.get(
+        "TELEGRAM_AGENT_CONFLICT_COOLDOWN_FILE",
+        str(
+            HOME
+            / ".claude"
+            / "hooks-state"
+            / "telegram-bridge-locks"
+            / f"conflict-cooldown-{hashlib.sha256(TOKEN.encode()).hexdigest()[:32]}.json"
+        ),
+    )
+).expanduser()
+
+
+def _write_conflict_cooldown() -> None:
+    """Persist a short restart delay so launchd cannot hot-loop on Conflict."""
+    if CONFLICT_RESTART_COOLDOWN_SECONDS <= 0:
+        return
+    try:
+        _CONFLICT_COOLDOWN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema": "edge_agent.telegram_conflict_cooldown.v1",
+            "cooldown_until": time.time() + CONFLICT_RESTART_COOLDOWN_SECONDS,
+            "pid": os.getpid(),
+        }
+        temporary = _CONFLICT_COOLDOWN_FILE.with_name(f".{_CONFLICT_COOLDOWN_FILE.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, _CONFLICT_COOLDOWN_FILE)
+    except OSError as exc:
+        log(f"Conflict cooldown 기록 실패: {type(exc).__name__}")
+
+
+def _wait_for_conflict_cooldown() -> None:
+    try:
+        payload = json.loads(_CONFLICT_COOLDOWN_FILE.read_text(encoding="utf-8"))
+        remaining = float(payload.get("cooldown_until", 0)) - time.time()
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return
+    if remaining <= 0:
+        return
+    delay = min(remaining, float(CONFLICT_RESTART_COOLDOWN_SECONDS))
+    log(f"최근 Conflict burst 감지 — {delay:.1f}초 후 polling을 재개합니다.")
+    time.sleep(delay)
+
+
+def _clear_conflict_cooldown() -> None:
+    try:
+        _CONFLICT_COOLDOWN_FILE.unlink(missing_ok=True)
+    except OSError as exc:
+        log(f"Conflict cooldown 정리 실패: {type(exc).__name__}")
 
 
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1456,6 +1542,7 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
             # 2026-07-31). A short sleep here plus launchd's own
             # ThrottleInterval (set in the plist) are two independent
             # brakes on the same failure mode.
+            _write_conflict_cooldown()
             await asyncio.sleep(10)
             context.application.stop_running()
         return
@@ -1558,11 +1645,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(f"❌ 공통 세션 초기화 오류: {exc}")
             return
 
+        coordination_request = ROLE == "claude" and _message_route(text, _wake_roles(text)) == "coordination"
         progress = None
-        try:
-            progress = await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]} 처리 중...")
-        except TelegramError as exc:
-            log(f"progress 메시지 전송 실패(계속 진행): {exc}")
+        # The coordinator's progress message is itself an unwanted answer in
+        # an explicit peer request. Wait for the bounded result packet and
+        # send only the final integrated response. Worker progress remains
+        # visible so the user can see which peer is executing.
+        if not coordination_request:
+            try:
+                progress = await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]} 처리 중...")
+            except TelegramError as exc:
+                log(f"progress 메시지 전송 실패(계속 진행): {exc}")
 
         async def _notify_waiting() -> None:
             if progress is None:
@@ -1653,7 +1746,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             elif ROLE == "claude" and _looks_like_coding_task(text):
                 reply = await claude_delegates_to_codex(text, message, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, chat_id=message.chat_id)
             else:
-                reply = await run_provider(text, on_wait=_notify_waiting, context_prompt=preparation.prompt_block if preparation else None, provider_text=text, chat_id=message.chat_id)
+                provider_text = text
+                if coordination_request:
+                    if progress is not None:
+                        await _notify_waiting()
+                    peer_report = await wait_for_peer_results(chat_id=message.chat_id, request=text)
+                    provider_text = f"{text}\n\n{peer_report}"
+                reply = await run_provider(
+                    text,
+                    on_wait=_notify_waiting,
+                    context_prompt=preparation.prompt_block if preparation else None,
+                    provider_text=provider_text,
+                    chat_id=message.chat_id,
+                )
         except Exception as exc:
             log(f"처리 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
             _record_telegram_efficiency(
@@ -1848,6 +1953,7 @@ async def _post_init(application: Application) -> None:
         application.stop_running()
         os._exit(1)
     log(f"봇 사용자명 확인됨: @{actual}")
+    _clear_conflict_cooldown()
 
 
 _SINGLETON_LOCK_DIR = Path.home() / ".claude" / "hooks-state" / "telegram-bridge-locks"
@@ -1881,6 +1987,7 @@ def main() -> None:
     _harden_log_permissions()
     log(f"Starting direct Telegram {ROLE} bot; workspace={(CODEX_WORKSPACE if ROLE == 'codex' else WORKSPACE)}; cli={CLI}")
     _acquire_singleton_lock()
+    _wait_for_conflict_cooldown()
     # Python 3.14 removed asyncio.get_event_loop()'s implicit loop creation,
     # which Application.run_polling() still relies on internally — without
     # this, every launchd instance crashes immediately with "There is no

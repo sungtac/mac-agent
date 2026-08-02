@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Google Calendar OAuth helper for OpenClaw/Sukja.
+"""Google Calendar OAuth helper for Edge Agent.
 
 No third-party Python dependencies. Stores OAuth client and token under
-~/.openclaw/secrets by default. Supports read/write calendar scopes after the
+~/.edge-agent/secrets/calendar by default. Supports read/write calendar scopes after the
 user explicitly authorizes them in Google OAuth.
 
 Setup:
-  1) Put OAuth Desktop client JSON at ~/.openclaw/secrets/google_calendar_client.json
+  1) Put OAuth Desktop client JSON at ~/.edge-agent/secrets/calendar/google_calendar_client.json
   2) python3 scripts/google_calendar.py auth-url
   3) Open URL, approve, copy code
   4) python3 scripts/google_calendar.py exchange --code '...'
@@ -29,11 +29,23 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
-SECRETS_DIR = Path(
-    os.environ.get("EDGE_AGENT_CALENDAR_SECRETS_DIR", "~/.edge-agent/secrets")
+EDGE_AGENT_SECRETS_ROOT = Path(
+    os.environ.get("EDGE_AGENT_SECRETS_ROOT", "~/.edge-agent/secrets")
 ).expanduser().resolve()
-CLIENT_FILE = Path(os.environ.get("GOOGLE_CALENDAR_CLIENT_FILE", SECRETS_DIR / "google_calendar_client.json"))
-TOKEN_FILE = Path(os.environ.get("GOOGLE_CALENDAR_TOKEN_FILE", SECRETS_DIR / "google_calendar_token.json"))
+
+
+def _configured_secret_path(value: str | os.PathLike[str] | None, default: Path) -> Path:
+    path = Path(value or default).expanduser().resolve()
+    if ".openclaw" in path.parts:
+        raise SystemExit("Legacy OpenClaw credential paths are not supported; migrate the file to Edge Agent secrets first")
+    return path
+
+
+SECRETS_DIR = Path(
+    os.environ.get("EDGE_AGENT_CALENDAR_SECRETS_DIR", str(EDGE_AGENT_SECRETS_ROOT / "calendar"))
+).expanduser().resolve()
+CLIENT_FILE = _configured_secret_path(os.environ.get("GOOGLE_CALENDAR_CLIENT_FILE"), SECRETS_DIR / "google_calendar_client.json")
+TOKEN_FILE = _configured_secret_path(os.environ.get("GOOGLE_CALENDAR_TOKEN_FILE"), SECRETS_DIR / "google_calendar_token.json")
 SCOPES = ["https://www.googleapis.com/auth/calendar"]
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
@@ -425,7 +437,7 @@ def cmd_add(args: argparse.Namespace) -> None:
         payload["description"] = description
     payload["start"] = start_obj
     payload["end"] = end_obj
-    payload["extendedProperties"] = {"private": {"createdBy": "openclaw-google-calendar.py", "parsedAllDay": str(parsed_all_day).lower()}}
+    payload["extendedProperties"] = {"private": {"createdBy": "edge-agent-google-calendar.py", "parsedAllDay": str(parsed_all_day).lower()}}
     result = api_post(f"/calendars/{urllib.parse.quote(args.calendar_id, safe='')}/events", payload)
     print(json.dumps({"ok": True, "event": {"id": result.get("id"), "summary": result.get("summary"), "htmlLink": result.get("htmlLink")}}, ensure_ascii=False, indent=2))
 

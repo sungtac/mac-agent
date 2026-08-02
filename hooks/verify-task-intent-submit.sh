@@ -36,6 +36,6 @@ verify_task_state_write "$SESSION_ID" "$STATE_JSON" || exit 0
 jq -n ' {
   hookSpecificOutput: {
     hookEventName: "UserPromptSubmit",
-    additionalContext: "코드 변경 의도가 감지되었습니다. 메인 세션에서 Edit/Write를 수행하기 전에 반드시 Workflow({scriptPath:\"~/.claude/workflows/verify-task-v2.js\", args:{task, cwd, persona, sessionId}})를 실제 호출하세요. Workflow의 조사·병렬 계획 검토·Codex 구현·code-review가 성공한 뒤에만 직접 편집할 수 있습니다."
+    additionalContext: "코드 변경 의도가 감지되었습니다. 메인 세션에서 Edit/Write를 수행하기 전에 Bash로 원문 작업을 파일에 저장하고 python3 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py --task-file <작업파일> --cwd <cwd> --session-id <session_id> 를 실제 호출하세요. 호스트 하네스가 결정론적 점검을 수행하고 구독형 Claude·Codex·Antigravity CLI를 필요한 역할에만 호출합니다. finalVerdict가 통과한 뒤에만 직접 편집할 수 있습니다."
   }
 }'

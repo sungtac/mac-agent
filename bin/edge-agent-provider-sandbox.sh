@@ -21,31 +21,66 @@ fi
 # Codex has its own workspace-write seatbelt. Nesting it inside macOS
 # sandbox-exec prevents Codex's sandbox helper from starting (observed as
 # sandbox_apply exit 71 / Operation not permitted). For Codex only, use its
-# internal sandbox and refuse the legacy shared workspace, which contains
-# Team OS protected roots. This preserves the boundary while allowing safe
-# isolated repositories/worktrees to run.
+# internal sandbox and refuse the retired OpenClaw paths. This preserves the
+# boundary while allowing safe isolated repositories/worktrees to run.
 COMMAND_NAME="$(basename -- "$1")"
 if [ "$COMMAND_NAME" = "codex" ]; then
   CODEX_CWD="${PWD}"
-  for ((i = 1; i < $#; i++)); do
+  for ((i = 1; i <= $#; i++)); do
     arg="${!i}"
     next_index=$((i + 1))
-    if [ "$arg" = "-C" ] || [ "$arg" = "--cd" ]; then
-      CODEX_CWD="${!next_index:-}"
-      break
-    fi
+    case "$arg" in
+      --) break ;;
+      -C|--cd)
+        if [ "$next_index" -gt "$#" ]; then
+          echo "edge-agent-provider-sandbox: $arg requires a directory" >&2
+          exit 64
+        fi
+        CODEX_CWD="${!next_index}"
+        ;;
+      -C?*) CODEX_CWD="${arg#-C}" ;;
+      --cd=*) CODEX_CWD="${arg#--cd=}" ;;
+    esac
   done
-  CODEX_CWD="$(cd -- "$CODEX_CWD" 2>/dev/null && pwd -P || printf '%s' "$CODEX_CWD")"
-  LEGACY_WORKSPACE="/Users/edge_ai/.openclaw/workspace"
-  case "$CODEX_CWD" in
-    "$LEGACY_WORKSPACE"|"$LEGACY_WORKSPACE"/*)
-      echo "edge-agent-provider-sandbox: Codex refuses legacy shared workspace; use an isolated edge workspace/worktree: $CODEX_CWD" >&2
-      exit 77
-      ;;
-    *)
-      exec "$@"
-      ;;
-  esac
+  if ! CODEX_CWD="$(python3 - "$CODEX_CWD" <<'PY'
+import os
+import sys
+
+try:
+    print(os.path.realpath(os.path.abspath(sys.argv[1])))
+except (IndexError, OSError, UnicodeError):
+    raise SystemExit(2)
+PY
+)"; then
+    echo "edge-agent-provider-sandbox: unable to canonicalize Codex working directory" >&2
+    exit 64
+  fi
+  if python3 - "$CODEX_CWD" "$HOME/.openclaw" "$HOME/.edge-agent/retired-openclaw-workspace" <<'PY'
+import os
+import sys
+
+try:
+    target = os.path.realpath(os.path.abspath(sys.argv[1])).casefold()
+    roots = [os.path.realpath(os.path.abspath(item)).casefold() for item in sys.argv[2:]]
+except (IndexError, OSError, UnicodeError):
+    raise SystemExit(2)
+
+for root in roots:
+    if target == root or target.startswith(root + os.sep):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+  then
+    echo "edge-agent-provider-sandbox: Codex refuses retired OpenClaw paths; use an isolated edge workspace/worktree: $CODEX_CWD" >&2
+    exit 77
+  else
+    CODEX_PATH_CHECK_RC=$?
+    if [ "$CODEX_PATH_CHECK_RC" -ne 1 ]; then
+      echo "edge-agent-provider-sandbox: unable to validate Codex working directory" >&2
+      exit 64
+    fi
+    exec "$@"
+  fi
 fi
 
 exec /usr/bin/sandbox-exec -f "$PROFILE" -- "$@"

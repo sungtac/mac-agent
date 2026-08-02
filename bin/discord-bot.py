@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Discord bot — Phase 1 (on-demand automation triggers) + Phase 2 v1
 (reply-triggered retry for weekly-report.sh) + Phase 2.5 (reply-triggered
-retry for work-log-stop-check.sh AND verify-task-v2.js's needs_clarification/
+retry for work-log-stop-check.sh AND the host verifier's needs_clarification/
 needsUserDecision escalations — see handle_pending_reply,
 handle_verify_task_v2_retry, handle_verify_task_v2_decision_retry) + Phase 3
 (free-form chat relay to `claude -p`, own session continuity via `--resume`
@@ -43,6 +43,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -52,22 +53,25 @@ from discord_bot_common import SUBPROCESS_ENV, is_codex_wake_word, usage_gate_ch
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "config.json"
 MAC_AGENT = Path.home() / "mac-agent"
-# Telegram's existing OpenClaw service is the canonical local workspace.  The
-# Discord adapter must enter the same workspace so both channels see the same
-# files, Team OS state, approval artifacts, and OpenClaw configuration boundary.
-OPENCLAW_WORKSPACE = Path(
-    os.environ.get("OPENCLAW_WORKSPACE", str(Path.home() / ".openclaw" / "workspace"))
+# Discord and Telegram provider calls use the same active Edge Agent worktree.
+# The former OpenClaw workspace is retired and must not be recreated as a
+# runtime dependency.
+EDGE_AGENT_WORKSPACE = Path(
+    os.environ.get(
+        "EDGE_AGENT_WORKSPACE",
+        str(Path.home() / ".edge-agent-worktrees" / "telegram-bootstrap"),
+    )
 ).expanduser().resolve()
-OPENCLAW_HOME = Path(
-    os.environ.get("OPENCLAW_HOME", str(OPENCLAW_WORKSPACE.parent))
+EDGE_AGENT_HOME = Path(
+    os.environ.get("EDGE_AGENT_HOME", str(Path.home() / ".edge-agent"))
 ).expanduser().resolve()
 WEEKLY_REPORT_SH = MAC_AGENT / "cron" / "weekly-report.sh"
 WORK_LOG_STOP_CHECK_SH = MAC_AGENT / "hooks" / "work-log-stop-check.sh"
-VERIFY_TASK_V2_JS = MAC_AGENT / "workflows" / "verify-task-v2.js"
+VERIFY_TASK_ORCHESTRATOR_PY = MAC_AGENT / "bin" / "verify-task-orchestrator.py"
 CLAUDE_BIN = Path.home() / ".local" / "bin" / "claude"
 PROVIDER_SANDBOX = MAC_AGENT / "bin" / "edge-agent-provider-sandbox.sh"
 ANTIGRAVITY_BIN = Path.home() / ".local" / "bin" / "agy"
-VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # full-track verify-task-v2 round-trips codex/antigravity several times
+VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS = 30 * 60  # host orchestrator may round-trip Codex/Antigravity several times
 STATE_DIR = Path.home() / ".claude" / "hooks-state"
 WORK_LOG_DISPATCHED_MARKER_DIR = STATE_DIR / "work-log"
 
@@ -289,39 +293,53 @@ async def handle_work_log_retry(message: discord.Message, params: dict):
         await message.channel.send(f"❌ work-log 재시도 실행 중 예외: {e}")
 
 
-async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
-    """Re-run verify-task-v2.js's full pipeline from scratch with the user's
-    Discord reply appended as the answer to a needs_clarification question.
+async def run_host_verify_task(task: str, cwd: str, max_rounds: int, session_id: str | None = None):
+    """Run the subscription-backed verification pipeline directly on host.
 
-    verify-task-v2.js has no internal resume/checkpoint mechanism at all (see
-    docs/verify-task-v2-design.md and the workflow's own needs_clarification
-    comment) — the only documented recovery path is "answer the question,
-    append it to the original task string, and re-invoke the whole workflow
-    from the top." There is also no bash-script entry point the way
-    weekly-report.sh/work-log-stop-check.sh have — verify-task-v2.js can only
-    be invoked through Claude Code's own `Workflow` tool, which nothing in
-    this file had ever called before (weekly-report.sh/work-log-stop-check.sh
-    are bash scripts spawned directly; !코덱스 calls `codex exec` directly).
-    So this spawns a headless `claude -p` and instructs it, in natural
-    language, to call `Workflow({scriptPath: ..., args: {...}})` itself —
-    confirmed working via a live probe workflow before this was built
-    (2026-07-28): a trivial `probe.js` invoked this way returned its result
-    correctly through headless `claude -p`.
-
-    Unlike handle_work_log_retry, this DOES await the full run to completion
-    (stdout=PIPE + communicate(), not DEVNULL + wait()) — verify-task-v2.js
-    runs synchronously to completion inside the `claude -p` process itself,
-    it does not background+disown the way work-log-stop-check.sh does, so
-    there is no inherited-pipe-stays-open hazard here (see the docstring on
-    handle_work_log_retry for that bug and why it doesn't apply to this
-    function).
-
-    If this retry run itself hits needs_clarification again, that is not
-    handled specially here — the re-invoked verify-task-v2.js's own
-    notifyDiscordEscalation() fires again independently and writes a fresh
-    pending-job, so a reply chain (answer -> still unclear -> answer again)
-    works naturally without any extra code in this function.
+    Discord must not spend an extra Claude session merely to ask Claude to
+    invoke a Workflow that then asks other agents to run local commands.
     """
+    task_file = None
+    try:
+        with tempfile.NamedTemporaryFile("w", prefix="verify-task-", suffix=".txt", delete=False, encoding="utf-8") as handle:
+            handle.write(task)
+            task_file = Path(handle.name)
+        argv = [
+            sys.executable,
+            str(VERIFY_TASK_ORCHESTRATOR_PY),
+            "--task-file", str(task_file),
+            "--cwd", cwd,
+            "--max-rounds", str(max(1, int(max_rounds))),
+        ]
+        if session_id:
+            argv.extend(["--session-id", session_id])
+        with try_acquire_repo_lock(str(Path(cwd).resolve())):
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                env={**SUBPROCESS_ENV, "PYTHONUNBUFFERED": "1"},
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                start_new_session=True,
+            )
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
+            except asyncio.TimeoutError:
+                await _kill_process_group_graceful(proc)
+                return 124, "host orchestrator timeout"
+            tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
+            return proc.returncode, tail
+    except RepoLockBusy:
+        raise
+    finally:
+        if task_file:
+            try:
+                task_file.unlink()
+            except FileNotFoundError:
+                pass
+
+
+async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
+    """Retry the host orchestrator after appending the user's clarification."""
     task = params.get("task")
     cwd = params.get("cwd")
     if not task or not cwd:
@@ -344,80 +362,16 @@ async def handle_verify_task_v2_retry(message: discord.Message, params: dict):
         return
 
     new_task = f"{task}\n\n[사용자 답변]\n{answer}"
-    workflow_args = {
-        "task": new_task,
-        "cwd": cwd,
-        "persona": params.get("persona", "일반 사용자"),
-        "maxRounds": params.get("maxRounds", 2),
-        "historyFile": params.get("historyFile"),
-        "harnessFile": params.get("harnessFile"),
-    }
-    workflow_args = {k: v for k, v in workflow_args.items() if v is not None}
-
-    await message.channel.send("답장 확인 — verify-task-v2를 답변 반영해서 처음부터 재실행합니다. 전체 트랙이면 코덱스/안티그래비티를 여러 번 오가서 몇 분 걸릴 수 있어요, 끝나면 알려드릴게요.")
-
-    prompt = (
-        "Workflow 툴을 사용해서 다음을 실행해줘: "
-        f"scriptPath는 {json.dumps(str(VERIFY_TASK_V2_JS))}, "
-        f"args는 {json.dumps(workflow_args, ensure_ascii=False)}. "
-        "실행이 끝나면 반환된 finalVerdict를 요약해서 한국어로 짧게 알려줘 "
-        "(통과 여부, needsUserDecision/needs_clarification로 또 끝났으면 그것도 명시)."
-    )
-
-    # CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0: a real bug caught by live testing
-    # (2026-07-28), not something documented anywhere beforehand. A Workflow
-    # call with real agent() calls (unlike the trivial no-agent probe.js used
-    # to validate feasibility) runs as an async background task inside
-    # `claude -p`'s own runtime, and by default `claude -p` gives up waiting
-    # for it after ~600s, prints a "still running in background, I'll notify
-    # you" message, and exits with code 0 — but a one-shot `-p` process has
-    # nowhere to deliver that later notification, so the workflow run is
-    # effectively orphaned and never actually reported (confirmed: verify-task-v2's
-    # own historyFile only had the FIRST run's entry, never the retry's, after
-    # this happened in a live test). Setting the ceiling to 0 disables that
-    # internal give-up-and-detach behavior so `communicate()` genuinely blocks
-    # until the workflow finishes — confirmed via a live agent()-calling probe
-    # workflow (not the trivial one) returning correctly with this var set.
-    verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
-
-    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): codex-bot.py의
-    # CODEX_DISPATCH_LOCKS는 그 프로세스 안에서만 유효해서, discord-bot.py의
-    # 이 재시도가 codex-bot.py의 !코덱스와 거의 동시에 같은 저장소를 건드리는
-    # 경우를 못 막았다. 크로스프로세스 파일 락으로 한 번 더 확인.
+    max_rounds = params.get("maxRounds", 2)
+    await message.channel.send("답장 확인 — 호스트 검증 오케스트레이터를 답변 반영해서 처음부터 재실행합니다. 전체 트랙이면 몇 분 걸릴 수 있어요.")
     try:
-        with try_acquire_repo_lock(str(Path(cwd).resolve())):
-            proc = await asyncio.create_subprocess_exec(
-                str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
-                env=verify_task_v2_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                # start_new_session + _kill_process_group, not plain proc.kill()
-                # (2026-07-29 fix, matches handle_free_chat's already-fixed
-                # pattern below in this same file): this headless claude -p call
-                # runs verify-task-v2.js, which itself spawns codex/antigravity
-                # subprocess children — a bare kill() only kills this wrapper
-                # and orphans those children running full-tool-access work
-                # undetected in the background.
-                start_new_session=True,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                # graceful kill (2026-07-30 fix, same rationale as
-                # handle_weekly_report above): this claude -p run itself spawns
-                # codex/antigravity subprocess children doing real file writes.
-                await _kill_process_group_graceful(proc)
-                await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
-                return
-            tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
-            if proc.returncode == 0:
-                await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
-            else:
-                await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+        code, tail = await run_host_verify_task(new_task, cwd, max_rounds, params.get("sessionId"))
+        label = "✅ 호스트 검증 재시도 완료" if code == 0 else "❌ 호스트 검증 재시도 실패"
+        await message.channel.send(f"{label} (exit={code}).\n```\n{tail}\n```"[:1900])
     except RepoLockBusy:
         await message.channel.send("이 저장소에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 잠시 후 이 메시지에 다시 답장해주세요.")
     except Exception as e:
-        await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
+        await message.channel.send(f"❌ 호스트 검증 재시도 실행 중 예외: {e}")
 
 
 RETRY_INTENT_KEYWORDS = ("재시도", "retry", "다시")
@@ -471,10 +425,7 @@ def _has_retry_intent(reply_text: str) -> bool:
 
 
 async def handle_verify_task_v2_decision_retry(message: discord.Message, params: dict):
-    """Reply-triggered retry for verify-task-v2.js's needsUserDecision
-    (max-rounds exhausted with a real accept/retry/manual-intervention
-    three-way choice) — as opposed to handle_verify_task_v2_retry, which is
-    for needs_clarification (info-gathering re-questions).
+    """Reply-triggered retry for a host-orchestrator max-rounds decision.
 
     A free-text Discord reply can't cleanly carry a three-way choice, so this
     only acts on one signal: does the reply contain a retry-intent keyword
@@ -508,70 +459,15 @@ async def handle_verify_task_v2_decision_retry(message: discord.Message, params:
         return
 
     bumped_max_rounds = params.get("maxRounds", 2) + 2
-    workflow_args = {
-        "task": task,
-        "cwd": cwd,
-        "persona": params.get("persona", "일반 사용자"),
-        "maxRounds": bumped_max_rounds,
-        "historyFile": params.get("historyFile"),
-        "harnessFile": params.get("harnessFile"),
-    }
-    workflow_args = {k: v for k, v in workflow_args.items() if v is not None}
-
-    await message.channel.send(f"답장 확인 — verify-task-v2를 maxRounds={bumped_max_rounds}로 늘려 같은 작업을 처음부터 재실행합니다. 전체 트랙이면 코덱스/안티그래비티를 여러 번 오가서 몇 분 걸릴 수 있어요, 끝나면 알려드릴게요.")
-
-    prompt = (
-        "Workflow 툴을 사용해서 다음을 실행해줘: "
-        f"scriptPath는 {json.dumps(str(VERIFY_TASK_V2_JS))}, "
-        f"args는 {json.dumps(workflow_args, ensure_ascii=False)}. "
-        "실행이 끝나면 반환된 finalVerdict를 요약해서 한국어로 짧게 알려줘 "
-        "(통과 여부, needsUserDecision/needs_clarification로 또 끝났으면 그것도 명시)."
-    )
-
-    # Same rationale as handle_verify_task_v2_retry: this awaits the full run
-    # to completion (stdout=PIPE + communicate(), CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS=0)
-    # rather than backgrounding — see that function's docstring for why a
-    # short give-up-and-detach default silently turns into a false success.
-    verify_task_v2_env = {**SUBPROCESS_ENV, "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"}
-
-    # 2026-07-30 fix (사용자 확정, Codex 코드리뷰로 발견): codex-bot.py의
-    # CODEX_DISPATCH_LOCKS는 그 프로세스 안에서만 유효해서, discord-bot.py의
-    # 이 재시도가 codex-bot.py의 !코덱스와 거의 동시에 같은 저장소를 건드리는
-    # 경우를 못 막았다. 크로스프로세스 파일 락으로 한 번 더 확인.
+    await message.channel.send(f"답장 확인 — 호스트 검증 오케스트레이터를 maxRounds={bumped_max_rounds}로 늘려 같은 작업을 재실행합니다. 전체 트랙이면 몇 분 걸릴 수 있어요.")
     try:
-        with try_acquire_repo_lock(str(Path(cwd).resolve())):
-            proc = await asyncio.create_subprocess_exec(
-                str(PROVIDER_SANDBOX), str(CLAUDE_BIN), "-p", prompt, "--output-format", "text",
-                env=verify_task_v2_env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                # start_new_session + _kill_process_group, not plain proc.kill()
-                # (2026-07-29 fix, matches handle_free_chat's already-fixed
-                # pattern below in this same file): this headless claude -p call
-                # runs verify-task-v2.js, which itself spawns codex/antigravity
-                # subprocess children — a bare kill() only kills this wrapper
-                # and orphans those children running full-tool-access work
-                # undetected in the background.
-                start_new_session=True,
-            )
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                # graceful kill (2026-07-30 fix, same rationale as
-                # handle_weekly_report above): this claude -p run itself spawns
-                # codex/antigravity subprocess children doing real file writes.
-                await _kill_process_group_graceful(proc)
-                await message.channel.send(f"⚠️ verify-task-v2 재시도가 {VERIFY_TASK_V2_RETRY_TIMEOUT_SECONDS}초를 넘어서 강제 종료했습니다 — 직접 확인이 필요합니다.")
-                return
-            tail = "\n".join((stdout or b"").decode(errors="replace").splitlines()[-20:])
-            if proc.returncode == 0:
-                await message.channel.send(f"✅ verify-task-v2 재시도 완료.\n```\n{tail}\n```"[:1900])
-            else:
-                await message.channel.send(f"❌ verify-task-v2 재시도 실패 (exit={proc.returncode}).\n```\n{tail}\n```"[:1900])
+        code, tail = await run_host_verify_task(task, cwd, bumped_max_rounds, params.get("sessionId"))
+        label = "✅ 호스트 검증 재시도 완료" if code == 0 else "❌ 호스트 검증 재시도 실패"
+        await message.channel.send(f"{label} (exit={code}).\n```\n{tail}\n```"[:1900])
     except RepoLockBusy:
         await message.channel.send("이 저장소에 대한 다른 프로세스의 실행이 이미 진행 중입니다 — 잠시 후 이 메시지에 다시 답장해주세요.")
     except Exception as e:
-        await message.channel.send(f"❌ verify-task-v2 재시도 실행 중 예외: {e}")
+        await message.channel.send(f"❌ 호스트 검증 재시도 실행 중 예외: {e}")
 
 
 async def send_and_requeue(message: discord.Message, text: str, job_type: str, params: dict) -> None:
@@ -635,7 +531,7 @@ async def handle_pending_reply(message: discord.Message) -> bool:
     # original code unconditionally unlinked the file BEFORE dispatching,
     # regardless of whether job_type/params were actually usable. An
     # unrecognized type or a non-dict params (corrupted file, or a producer
-    # bug — verify-task-v2.js's own pending-job write is LLM-instruction-
+    # bug — the retired Workflow adapter's own pending-job write was LLM-instruction-
     # mediated, not code-verified, see notifyDiscordEscalation) would let a
     # handler's own `params.get(...)` throw AFTER the file was already gone,
     # losing the retry state permanently with no user-visible feedback. The
@@ -729,7 +625,7 @@ async def on_ready():
 
 FREE_CHAT_SESSION_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-session.json"
 FREE_CHAT_FALLBACK_CONTEXT_FILE = Path.home() / ".claude" / "discord-bot" / "free-chat-fallback-context.json"
-FREE_CHAT_CWD = OPENCLAW_WORKSPACE
+FREE_CHAT_CWD = EDGE_AGENT_WORKSPACE
 FREE_CHAT_TIMEOUT_SECONDS = 30 * 60  # same budget as !코덱스/verify-task-v2 — full tool access can run a real coding task
 # 2026-07-30, 사용자 명시적 요청: 맥이 계정 한도로 응답 자체가 실패하면
 # "기다리세요"로 끝내지 말고, 이 저장소 다른 곳(route-dispatch.sh Rule B —
@@ -976,10 +872,10 @@ async def handle_free_chat(message: discord.Message):
         env = {
             **SUBPROCESS_ENV,
             "CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0",
-            "OPENCLAW_HOME": str(OPENCLAW_HOME),
-            "OPENCLAW_WORKSPACE": str(OPENCLAW_WORKSPACE),
+            "EDGE_AGENT_HOME": str(EDGE_AGENT_HOME),
+            "EDGE_AGENT_WORKSPACE": str(EDGE_AGENT_WORKSPACE),
             "PYTHONPATH": os.pathsep.join(
-                part for part in (str(OPENCLAW_WORKSPACE), SUBPROCESS_ENV.get("PYTHONPATH", "")) if part
+                part for part in (str(EDGE_AGENT_WORKSPACE), SUBPROCESS_ENV.get("PYTHONPATH", "")) if part
             ),
         }
         # --append-system-prompt는 매 턴(resume 포함) 넣는다 — Claude

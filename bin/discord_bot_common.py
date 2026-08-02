@@ -355,14 +355,14 @@ CODEX_BOT_NAME = "콕스"
 # 권한(Bash 포함, 저장소 제한 없음, docs/discord-bot.md "Phase 3" 절 참고)을
 # 갖고 있어서, 터미널의 오케스트레이터처럼 직접 Bash로 코덱스를 부를 수 있는
 # 능력이 이미 있었다 — 페르소나가 그 능력을 쓰지 말고 사람한테 떠넘기라고
-# 지시하고 있었을 뿐. codex-execute-dispatch.sh(verify-task-v2.js가 실제
+# 지시하고 있었을 뿐. codex-execute-dispatch.sh(호스트 오케스트레이터가 실제
 # 코덱스 실행 단계에서 쓰는 것과 동일한, 쓰기 가능한 디스패처)를 직접 부를 수
 # 있다고 알려주고, 자기보고 불신 원칙(이 저장소 전체에 이미 깔린 규율 —
 # score-dispatch.sh/codex-bot.py의 before/after diff 검증과 동일)까지
 # 명시해서 판단·검증 방식도 맞춘다.
 # 2026-07-30, 사용자 후속 요청: "터미널의 너와 디스코드의 맥은 100% 동일해야해.
 # 콕스의 역할도 마찬가지고." — 위 버전은 코덱스 위임을 codex-execute-dispatch.sh
-# 직접호출로만 안내했는데, 이건 verify-task-v2.js Full track(스펙+블라인드
+# 직접호출로만 안내했는데, 이건 호스트 검증 Full track(스펙+블라인드
 # 비평+다단계 검증, 이 저장소에서 실제 코딩 위임의 "진짜" 엔진)을 우회하는
 # 얕은 버전이었다 — 완전한 동일성이 아니었음. 확인해보니 필요한 인프라는
 # 이미 다 있었다: ~/.claude/settings.json의 Stop 훅(verify-task-stop-check.sh
@@ -399,13 +399,11 @@ MAC_BOT_PERSONA = (
     '<지시문파일경로>`를 실행해 — `{"ok": true/false, "message": "..."}` JSON이 돌아와. 코덱스의 '
     "자기 보고를 그대로 믿지 말고, 실행 전/후 `git status`/`git diff`로 직접 대조 확인.\n"
     "3. **진짜 코딩 위임**(새 기능, 여러 파일에 걸친 변경, 로직이 있는 작업 등 — 인터랙티브 세션이었다면 "
-    "네가 verify-task-v2를 돌렸어야 할 만한 일): Workflow 툴을 직접 호출해 — "
-    '`Workflow({scriptPath: "/Users/edge_ai/mac-agent/workflows/verify-task-v2.js", args: {task: '
-    "\"<사용자 요청 그대로 + 필요한 맥락>\", cwd: \"<저장소 절대경로>\", persona: \"discord 사용자\"}})`. "
-    "이게 코덱스가 스스로 계획을 세우고, 클로드/안티그래비티가 그 계획을 블라인드 비평하고, 코덱스가 "
-    "반영해서 실행하고, 다시 듀얼 코드리뷰까지 거치는 정식 파이프라인이야(파일 개수·민감경로에 따라 "
-    "내부적으로 경량/전체 트랙을 스스로 판단하니 너는 그냥 불러주기만 하면 돼). 실행이 끝나면 반환된 "
-    "finalVerdict를 요약해서 사용자에게 한국어로 보고해.\n\n"
+    "네가 verify-task를 돌렸어야 할 만한 일): Claude Workflow를 거치지 말고 Bash로 호스트 오케스트레이터를 직접 실행해. "
+    "원문 작업을 임시 파일에 저장한 뒤 `python3 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py "
+    "--task-file <작업파일> --cwd <저장소절대경로> --session-id <세션ID>`를 호출하고, 반환된 `finalVerdict`와 "
+    "`.verify/runs/<task-id>/` 산출물을 기준으로 사용자에게 한국어로 보고해. 이 정식 파이프라인이 파일 수와 "
+    "민감도에 따라 경량/전체 트랙을 결정하고, 구독형 Claude·Codex·Antigravity CLI를 필요한 역할에만 직접 사용해.\n\n"
     f"같은 채널에 '{CODEX_BOT_NAME}'이라는 이름의 동료 봇도 별도로 있어(사용자가 직접 '콕스야'라고 "
     "부르면 그쪽이 응답함) — 하지만 너도 위 방법들로 직접 코덱스를 부를 수 있으니, 코딩 관련 요청이라고 "
     f"무조건 '{CODEX_BOT_NAME}한테 물어보세요'로 떠넘기지 말고, 위 세 단계 중 어디에 해당하는지 판단해서 "

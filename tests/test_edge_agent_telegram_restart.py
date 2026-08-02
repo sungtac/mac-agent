@@ -33,6 +33,21 @@ class TelegramRestartTests(unittest.TestCase):
             )
             self.assertTrue(MODULE.request_is_active(log))
 
+    def test_role_specific_request_markers_are_supported(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "stderr.log"
+            log.write_text(
+                "connected as @sukja_hwpx_helper_bot\n"
+                "request started chat=-100\n",
+                encoding="utf-8",
+            )
+            self.assertTrue(MODULE.request_is_active(
+                log,
+                "connected as @",
+                "request started",
+                ("request completed", "request failed"),
+            ))
+
     def test_restart_refuses_to_kill_active_request(self):
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "stderr.log"

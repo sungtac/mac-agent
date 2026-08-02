@@ -30,8 +30,9 @@ provider dispatch, usage gate, sandbox, canonical lock, nano event store를
    최종 권한인지 불명확하면 한쪽의 승인을 다른 쪽이 우회할 수 있다.
 3. **상태 중복:** TeamTask/ExecutionResult와 nano JSONL/work state를 양쪽에서
    갱신하면 상태가 서로 다른 완료를 주장할 수 있다.
-4. **workspace 충돌:** 두 시스템이 같은 `.openclaw/workspace`를 보지만 Team OS의
-   `team_os/`, `state/`, `sukja_telegram/`은 엣지 provider의 보호 대상이다.
+4. **workspace 충돌:** Team OS와 엣지 에이전트가 과거 `.openclaw/workspace`를
+   공유했지만, 해당 workspace는 퇴역했고 현재 엣지는 별도 Edge Agent worktree를
+   사용한다.
 5. **Roda 충돌:** Team OS의 Roda coordinator와 Gemma4 Telegram 봇은 이름만
    같고 책임이 다르므로 하나의 runtime role로 합치면 안 된다.
 

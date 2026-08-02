@@ -5,16 +5,14 @@
 // 여기서 무거워지면 verify-task v1이 겪었던 "매번 무조건 풀-웨이트"
 // 문제가 판정 단계로 옮겨붙을 뿐이다.
 //
-// 중요 — 이 파일은 지금 어디서도 import되지 않는다: Workflow 툴 스크립트
-// (workflows/verify-task-v2.js 등)는 파일시스템/require 접근이 없는
-// 샌드박스에서 실행되므로 외부 JS 모듈을 못 불러온다(verify-task-v2.js
-// 상단 주석에 이미 명시됨 — "의도적 중복이지, 재사용이 아니다"). 이 파일은
+// 중요 — 이 파일은 지금 어디서도 import되지 않는다. 호스트 오케스트레이터는
+// Python 하네스의 결정론적 판정을 사용한다. 이 파일은
 // 스펙을 고정하고 단위테스트로 검증하기 위한 기준 구현이고, 실제 나노게이트
 // 루프(구현계획 3단계)에 통합할 때는 이 함수 본문을 grep 가능한 형태로
 // 그대로 복사해 넣어야 한다(기존 decideTier()와 동일한 패턴). 이후 이 파일을
 // 고치면 인라인 사본도 반드시 같이 고칠 것 — 자동 동기화 없음.
 //
-// 민감 경로 패턴은 verify-task-v2.js의 SENSITIVE_PATH_PATTERNS와 동일하게
+// 민감 경로 패턴은 호스트 하네스의 민감 경로 규칙과 동일하게
 // 유지한다(의도적 복제, 두 곳 다 손대야 함).
 const SENSITIVE_PATH_PATTERNS = [
   /(^|\/)\.github\/workflows\//,
@@ -87,7 +85,7 @@ function detectDependencyBoundary(changedFiles, dependencyEdges = []) {
   return hasManifest && hasSource
 }
 
-// 누적 파일 수 임계값 3은 기존 verify-task-v2.js의 decideTier()(파일수≤3 →
+// 누적 파일 수 임계값 3은 기존 검증 게이트의 decideTier()(파일수≤3 →
 // light) 임계값을 그대로 재사용한 것 — docs/nano-gate-design.md 결정 2가
 // 요구한 "새 기준을 또 만들지 말고 이미 검증된 하나를 나노단위에도
 // 그대로 얹자"는 원칙에 따름. 잔여토큰 10%는 이전 아이디어 회의(Discord)에서

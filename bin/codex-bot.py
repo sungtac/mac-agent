@@ -36,6 +36,7 @@ from pathlib import Path
 
 import discord
 
+from edge_agent_external_skill_repositories import load_external_skill_repositories
 from discord_bot_common import MAC_AGENT, SUBPROCESS_ENV, is_codex_wake_word, is_group_address, usage_gate_check, _kill_process_group_graceful, try_acquire_repo_lock, RepoLockBusy, fetch_cross_bot_context, CODEX_BOT_PERSONA, MAC_BOT_PERSONA, MAC_BOT_NAME, CODEX_DELEGATE_TO_MAC_MARKER, QUOTA_LIMIT_PATTERN
 
 CONFIG_PATH = Path.home() / ".claude" / "discord-bot" / "codex-bot-config.json"
@@ -53,11 +54,11 @@ CLAUDE_DELEGATE_TIMEOUT_SECONDS = 30 * 60  # !코덱스/코덱스대화와 동�
 # absolute path for `codex exec -s workspace-write`, which really writes
 # files. Add a line here (after confirming with the user) to expose another
 # repo; do not accept a free-typed path from the message itself.
-CODEX_REPO_ALIASES = {
-    "mac-agent": MAC_AGENT,
-    "hwpx-skill": Path.home() / "document-writing-project" / "hwpx-skill",
-    "pptx-skill": Path.home() / "document-writing-project" / "pptx-skill",
-}
+try:
+    CODEX_REPO_ALIASES = {"mac-agent": MAC_AGENT, **load_external_skill_repositories()}
+except (OSError, UnicodeError, TypeError, ValueError) as exc:
+    print(f"FATAL: external skill repository configuration is invalid: {exc}", file=sys.stderr)
+    sys.exit(1)
 CODEX_DISPATCH_TIMEOUT_SECONDS = 30 * 60  # coding tasks can run longer than a report generation
 
 # Concurrency guard: two overlapping `!코덱스`/`!코덱스대화` runs against the

@@ -1,5 +1,5 @@
 {
-  "_comment": "Single source of truth for the repo set that per-repo automation (token-cost-report.sh's daily dashboard, and eventually discord-bot.py's !코덱스 CODEX_REPO_ALIASES once that file settles) tracks. Add a repo here only after confirming with the user.",
+  "_comment": "Single source of truth for the repo set that per-repo automation (token-cost-report.sh's daily dashboard) tracks. Discord aliases are retired and are not an active routing source. Add a repo here only after confirming with the user.",
   "mac-agent": "$HOME/mac-agent",
   "hwpx-skill": "$HOME/document-writing-project/hwpx-skill",
   "pptx-skill": "$HOME/document-writing-project/pptx-skill"

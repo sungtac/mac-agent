@@ -5,7 +5,7 @@ description: Safely review token quota, rate-limit, resume queue, context packet
 
 # quota_resume Skill
 
-Use this skill when OpenClaw/Sukja needs to review or prepare recovery from token quota, rate-limit, recharge, paused autoloop, resume queue, Hermes quota events, or fallback switching.
+Use this skill when Edge Agent needs to review or prepare recovery from token quota, rate-limit, recharge, paused autoloop, resume queue, Hermes quota events, or fallback switching.
 
 This skill is **preview-only by default**. It prepares reviewable state and JSON evidence. It must not automatically switch accounts, resume work, send external messages, read raw OAuth/token/cookie files, or claim live quota-exhaustion failover.
 

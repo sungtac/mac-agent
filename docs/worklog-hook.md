@@ -1,5 +1,8 @@
 # work-log-stop-check.sh (일정비서 — session-end archiving + calendar logging)
 
+상태 메모: 세션 보관·캘린더 기록은 활성 기능이다. Discord reply-triggered retry와
+Discord 알림은 2026-08-02 퇴역했으며, 기존 pending 상태만 역사 자료로 보존한다.
+
 `hooks/work-log-stop-check.sh` — a Claude Code `Stop` hook. Registered in `~/.claude/settings.json` under `hooks.Stop` (second entry, alongside `verify-task-stop-check.sh`). On every session end, if the session made at least one Edit/Write call (cheap mechanical gate), it backgrounds a headless `claude -p` sub-call that reads the session transcript and decides whether the session was public/work-output (document writing, etc.) as opposed to meta work (building/editing Claude Code hooks/skills/workflows — including this automation itself) or private use. Ambiguous cases are told to SKIP — under-logging beats spamming the calendar.
 
 - **If public work output:** the sub-agent copies the session's created/edited output files into `~/Library/CloudStorage/GoogleDrive-sungtac@gmail.com/내 드라이브/업무아카이브/YYYY-MM-DD/` (copy, not move — originals stay put) and creates one Google Calendar event per session on `sungtac@gmail.com` (30 min, today, description = short summary + file list). This is deliberately per-session, not one cumulative daily event.

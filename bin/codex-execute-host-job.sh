@@ -31,8 +31,8 @@ if ! /usr/bin/git -C "$CWD" rev-parse --is-inside-work-tree >/dev/null 2>&1; the
   write_failure 66 "작업 디렉토리가 git 저장소가 아님: $CWD"
 fi
 case "$CWD" in
-  /Users/edge_ai/.openclaw/workspace|/Users/edge_ai/.openclaw/workspace/*)
-    write_failure 77 "보호된 작업 디렉토리에서는 호스트 Codex를 실행하지 않음: $CWD"
+  "$HOME/.openclaw"|"$HOME/.openclaw/"*|"$HOME/.edge-agent/retired-openclaw-workspace"|"$HOME/.edge-agent/retired-openclaw-workspace/"*)
+    write_failure 77 "폐기된 OpenClaw 작업 디렉토리에서는 호스트 Codex를 실행하지 않음: $CWD"
     ;;
 esac
 

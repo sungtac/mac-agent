@@ -1,0 +1,3 @@
+# Active non-Discord runtime dependency.
+# Discord is retired and intentionally not part of this manifest.
+python-telegram-bot==21.6

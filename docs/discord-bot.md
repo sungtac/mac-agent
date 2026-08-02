@@ -1,21 +1,26 @@
-# discord-bot.py + discord-notify.sh (일정비서 — Discord 연동)
+# discord-bot.py + discord-notify.sh (퇴역 보존 문서)
 
-Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + `verify-task-v2.js`의 `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 답장 재시도 — 후자는 자유텍스트 3지선다를 그대로 해석하지 않고 재시도 의도 키워드(재시도/retry/다시)만 감지하는 방식으로 해결(사용자 확정, 2026-07-28). Phase 3(사용자 요청, 2026-07-29): 본인(free_chat_user_id) 전용 자유 채팅 — 접두어 없이 전부 릴레이, 전체 도구 허용, `--resume`로 세션 연속성 유지(`!새대화`로 초기화).
+상태: retired. 2026-08-02 `com.macagent.discord-bot`와 `com.macagent.codex-bot`을
+bootout하고 plist도 Disabled로 전환했다. 코드·설정·pending JSON은 즉시 삭제하지 않고
+quarantine/rollback을 위해 보존한다. 이 문서의 운영 절차와 Discord reply 재시도는
+더 이상 active 경로가 아니다.
+
+Phase 1 (사용자 요청, 2026-07-26): 온디맨드 트리거 + 일방향(Mac→Discord) 실패/에스컬레이션 알림. Phase 2 v1(사용자 요청, 2026-07-28): `weekly-report.sh` 실패 알림에 답장하면 재시도. Phase 2.5(사용자 요청, 2026-07-28): `work-log-stop-check.sh` 답장 재시도 + 호스트 검증 오케스트레이터의 `needs_clarification`/`needsUserDecision` 재시도. Phase 3(사용자 요청, 2026-07-29): 본인(free_chat_user_id) 전용 자유 채팅 — 접두어 없이 전부 릴레이, 전체 도구 허용, `--resume`로 세션 연속성 유지(`!새대화`로 초기화).
 
 ## 구성 (2026-07-30 갱신 — 봇 프로세스가 둘로 분리됨)
 
-## Telegram과 공용 환경 (2026-07-30 추가)
+## Telegram과 공용 환경 (2026-08-01 갱신)
 
-Telegram의 기존 OpenClaw 서비스가 사용하는
-`$OPENCLAW_WORKSPACE`를 세 채널의 기준 workspace로 삼는다. Discord 자유채팅도
-이제 기본적으로 `/Users/edge_ai/.openclaw/workspace`에서 실행하며, subprocess에
-`OPENCLAW_HOME`, `OPENCLAW_WORKSPACE`, `PYTHONPATH`를 전달한다.
+Telegram과 Discord의 provider 실행은 폐기된 OpenClaw workspace가 아니라
+`$EDGE_AGENT_WORKSPACE`를 기준으로 삼는다. 기본값은
+`/Users/edge_ai/.edge-agent-worktrees/telegram-bootstrap`이며, subprocess에는
+`EDGE_AGENT_HOME`, `EDGE_AGENT_WORKSPACE`, `PYTHONPATH`를 전달한다.
 
 따라서 터미널·Discord·Telegram은 다음 경계를 공유한다.
 
-- 동일한 workspace 파일과 Git 상태
-- 동일한 Team OS 상태·승인 산출물·로컬 하네스 결과
-- 동일한 OpenClaw home/workspace 환경변수
+- 동일한 Edge Agent 작업공간 파일과 Git 상태
+- 동일한 로컬 하네스 결과
+- 동일한 Edge Agent home/workspace 환경변수
 
 채널별 Discord/Telegram 사용자 세션 ID는 의도적으로 별도다. 이것은 대화 기록을
 무리하게 합치지 않으면서 동일한 실행 환경과 안전 경계를 공유하기 위한 것이다.
@@ -26,7 +31,7 @@ Telegram의 기존 OpenClaw 서비스가 사용하는
 "`!코덱스`" 절은 옛 위치를 그대로 서술한 채 남아있었다(2026-07-30 통합 감사로 발견·정정).
 현재 정확한 구조:
 
-- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`. `!주간보고서`/`!상태`/`!새대화`/`!중지`, work-log/verify-task-v2 답장 재시도, Phase 3 자유채팅을 담당.
+- `bin/discord-bot.py` — 상시 구동 프로세스(Discord Gateway WebSocket 연결). `~/Library/LaunchAgents/com.macagent.discord-bot.plist`로 launchd 상시 등록(`KeepAlive: true`, `RunAtLoad: true`) — 주간보고서처럼 주기 실행이 아니라 항상 떠 있어야 함. `~/.claude/discord-bot/venv`(격리된 venv, `discord.py 2.7.1`)로 실행. 코드를 고치면 재기동 필요: `launchctl kickstart -k gui/$(id -u)/com.macagent.discord-bot`. `!주간보고서`/`!상태`/`!새대화`/`!중지`, 호스트 검증 오케스트레이터 답장 재시도, Phase 3 자유채팅을 담당.
 - `bin/codex-bot.py` — **별도 프로세스, 별도 launchd 등록**(`com.macagent.codex-bot.plist`, 같은 `KeepAlive`/`RunAtLoad` 패턴, 재기동은 `launchctl kickstart -k gui/$(id -u)/com.macagent.codex-bot`), **별도 설정 파일**(`~/.claude/discord-bot/codex-bot-config.json` — `discord-bot.py`의 `config.json`과 의도적으로 분리, 자체 토큰). `!코덱스`(직접 디스패치), `!코덱스대화`(연속 대화, 세션 지속), `!코덱스대화초기화`(세션 리셋)를 담당 — 상세는 아래 "`!코덱스` 계열 명령" 절.
 - `bin/discord_bot_common.py` — 두 프로세스가 공유하는 헬퍼 모듈: 서브프로세스 env 빌더(`SUBPROCESS_ENV`), 사용량 게이트(`usage_gate_check`), provider 결과/폴백 체인/세션 맥락 계약(`ProviderResult`, `run_provider_attempt`, `run_provider_fallback_chain`, `*_provider_context`), 프로세스그룹 종료 헬퍼(`_kill_process_group`/`_kill_process_group_graceful`), 코덱스 wake-word 상수(`CODEX_CHAT_WAKE_WORDS`).
 - **두 프로세스가 같은 Discord 채널을 함께 본다**(`config.json`/`codex-bot-config.json`의 `channel_id`가 동일 — 의도된 설계, 둘 다 모든 메시지를 봐야 각자 자기 명령만 골라 응답할 수 있다). 그래서 라우팅 배제 로직이 정합적이어야 한다 — 한쪽이 처리할 메시지를 다른 쪽이 못 걸러내면 이중 응답이 난다(2026-07-30에 실제로 이 클래스 버그가 발견·수정됨, 아래 "2026-07-30 통합 감사" 절 참고).
@@ -58,7 +63,7 @@ Telegram의 기존 OpenClaw 서비스가 사용하는
 단계에 `search_events` 선확인 가드를 추가해 막았다. 나머지 둘은 이 시점엔 일방향으로
 남겨뒀다:
 
-- `verify-task-v2.js`의 `needsUserDecision`/`needsClarification`은 재개(resume) 메커니즘
+- 호스트 검증 오케스트레이터의 `needsUserDecision`/`needsClarification`은 재개(resume) 메커니즘
   자체가 없다 — 유일한 복구 경로가 "질문에 답 → 전체 워크플로우를 처음부터 재호출"이다.
   둘 다 아래 "## verify-task-v2 답장 재시도" 절에서 해결했다.
 - `work-log-stop-check.sh`는 `.dispatched` 마커 때문에 단순 재실행이 즉시 no-op되고, 스크립트
@@ -142,21 +147,16 @@ exit 3을 "⏳ 이미 실행 중"으로 별도 표시한다(실패로 오표시�
 
 ## verify-task-v2 답장 재시도 — needs_clarification + needsUserDecision (2026-07-28)
 
-`verify-task-v2.js`는 앞의 둘(weekly-report.sh, work-log-stop-check.sh)과 두 가지가
-근본적으로 다르다: (1) bash 스크립트가 아니라 Claude Code의 `Workflow` 툴로만 실행 가능한
-JS 워크플로우라 discord-bot.py가 그냥 서브프로세스로 못 띄운다. (2) 재개(resume) 메커니즘
-자체가 없어서 "부분 이어하기"가 아니라 항상 **전체를 처음부터 재실행**해야 한다.
+호스트 검증 오케스트레이터는 앞의 둘(weekly-report.sh, work-log-stop-check.sh)과 달리
+검증 단계가 여러 provider를 거치므로, 재시도는 항상 **전체를 처음부터 재실행**한다.
 
 `finalVerdict`가 멈추는 경우는 두 가지고, 이제 둘 다 구현돼 있다:
 
 ### needs_clarification (정보 부족 역질문)
 
-- `verify-task-v2.js`의 `notifyDiscordEscalation()`이 `discord-notify.sh`의 반환 메시지
-  id를 캡처해서(Workflow 스크립트는 JS 샌드박스라 파일시스템에 직접 못 씀 —
-  `appendHistory`/`appendHarnessRules`와 같은 방식으로 `agent()`를 통해 Bash/Write로 대신
-  시킴) `type: "verify-task-v2-retry"` pending-job을 기록한다. `params`에 원본 `task`(자르지
-  않은 전체), `cwd`, `persona`, `maxRounds`, `historyFile`, `harnessFile`, `questions`를
-  담는다 — 재실행에 필요한 상태 전부.
+- 호스트 오케스트레이터가 실패 결과를 남기면 `discord-notify.sh`와 pending-job 연결부가
+  `type: "verify-task-v2-retry"`를 기록한다. `params`에는 원본 `task`, `cwd`, `maxRounds`,
+  `sessionId`를 담아 재실행에 필요한 상태를 보존한다.
 - 답장이 오면 `handle_verify_task_v2_retry()`가 답장 텍스트를 `task` 끝에
   `"\n\n[사용자 답변]\n" + 답장`으로 붙여서 새 task를 만들고, 같은 maxRounds로 처음부터
   재실행한다.
@@ -183,12 +183,9 @@ JS 워크플로우라 discord-bot.py가 그냥 서브프로세스로 못 띄운�
 
 ### 공통 구현 메모
 
-- **discord-bot.py가 Claude Code의 `Workflow` 툴을 직접 호출한 최초 사례** — 이전엔 bash
-  스크립트 직접 실행(`weekly-report.sh`, `work-log-stop-check.sh`)이나 `codex exec` 직접
-  호출(`!코덱스`)뿐이었다. headless `claude -p`에 자연어로
-  `Workflow({scriptPath: ".../verify-task-v2.js", args: {...}})`를 호출하라고 지시하는
-  방식 — 실현 가능성은 사전에 트리비얼한 probe 워크플로우로 실측 확인 후 이 설계를 그대로
-  밀어붙였다.
+- **discord-bot.py는 Claude Code의 `Workflow`를 더 이상 호출하지 않는다** — 검증 재시도는
+  `python3 /Users/edge_ai/mac-agent/bin/verify-task-orchestrator.py`를 호스트에서 직접 실행해
+  불필요한 Claude 래퍼 세션을 만들지 않는다.
 - work-log-stop-check.sh의 재시도(`handle_work_log_retry`)와 달리 **끝까지 기다린다**
   (`stdout=PIPE`+`communicate()`) — verify-task-v2는 `& disown`으로 백그라운드에
   넘기는 구조가 아니라 `claude -p` 프로세스 자체가 끝까지 동기적으로 도는 구조라,
@@ -471,7 +468,7 @@ spawn 가드로 assert). PROCEED 경로는 `claude -p` 서브프로세스 자체
 
 - `cron/weekly-report.sh` — 3회 재시도 다 실패하면 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능).
 - `hooks/work-log-stop-check.sh` — 실패(타임아웃 포함) 시 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 성공 시에도(LOGGED일 때만) 알림.
-- `workflows/verify-task-v2.js` — `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 둘 다 `discord-notify.sh` 호출 + pending-job 기록(양방향, 답장으로 재시도 가능). 전자는 답장 전체를 답변으로 붙여 재실행, 후자는 답장에서 재시도 키워드(재시도/retry/다시)만 감지해 maxRounds를 늘려 재실행.
+- `bin/verify-task-orchestrator.py` — `needs_clarification`(정보 부족 역질문)과 `needsUserDecision`(최대 라운드 소진) 결과를 pending-job 재시도와 연결한다. 전자는 답장 전체를 작업에 붙여 재실행하고, 후자는 재시도 키워드가 있을 때 maxRounds를 늘려 재실행한다.
 
 ## 2026-07-30 통합 감사 — 두 봇 사이 톱니바퀴 불일치 발견·수정
 
@@ -501,10 +498,10 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
   절단이 앞이 아니라 뒤를 잘라야 할 내용을 대신 잘라버리는 경우가 있었음(예전에
   discord-bot.py에서 한 번 고친 것과 같은 버그 클래스가 codex-bot.py에서 재발) —
   `diff_stat` 자체를 소스에서 600자로 캡.
-- **중간**: `verify-task-v2.js`의 에스컬레이션 메시지가 `needs_clarification`일 때 실제
+- **중간**: 호스트 오케스트레이터의 에스컬레이션 메시지가 `needs_clarification`일 때 실제
   질문 대신 "AskUserQuestion을 직접 못 부름..." 고정 문구를 보여줬다(`reason || questions`
   순서에서 `reason`이 항상 이김) — Discord에 실제 질문이 노출되도록 수정.
-- **중간**: `verify-task-v2.js`의 pending-job 작성이 서브에이전트에 자연어로만 위임되고
+- **중간**: 과거 Workflow 어댑터의 pending-job 작성이 서브에이전트에 자연어로만 위임되고
   반환값을 전혀 확인 안 해서, 실패해도 완전히 조용했음 — schema를 줘서 성공/실패/사유를
   구조화된 값으로 받고, 실패 시 최소한 로그에 남기도록 수정(근본적으로 LLM 지시이행에
   의존한다는 한계 자체는 남음, `docs/verify-task-v2-design.md` 참고 대상 후보).
@@ -512,7 +509,7 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
   subprocess 스폰 지점 — 통일. 재시도-부정 정규식(`필요.{0,2}없`)이 "필요까지는 없"류의
   더 긴 조사구를 놓치던 사각지대를 `{0,6}`으로 확장. pending-job 디렉토리에 정리 메커니즘이
   전혀 없어(48시간 지난 항목은 "답장이 왔을 때"만 검사) 무응답 에스컬레이션이 영구
-  누적되던 것을, 봇 시작 시(`on_ready`) 1회 정리하는 스윕으로 보완. `verify-task-v2.js`의
+  누적되던 것을, 봇 시작 시(`on_ready`) 1회 정리하는 스윕으로 보완. 호스트 오케스트레이터의
   `gatherContext`가 `cwd` 존재 여부를 한 번도 확인 안 해서 정리된 스크래치패드를 가리키는
   낡은 pending-job에 답장하면 조용히 빈 컨텍스트로 계속 진행될 수 있던 잠재 결함도, 존재
   확인 후 즉시 실패하도록 수정.
@@ -544,8 +541,8 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
   각각 별도 예산으로 캡하도록 재수정(재현 테스트로 확인: untracked 60개에서도 요약줄 보존).
 **낮은 우선순위 항목 처리 (2026-07-30, 뒤이은 세션에서 순서대로 완료)**:
 - `verify-task-stop-check.sh`/`usage-routing-check.sh`의 fail-open 판정 — scriptPath
-  basename이 정확히 `verify-task(.js)`/`verify-task-v2(.js)`/재개용 사본
-  (`verify-task-wf_<runid>.js`)일 때만, Skill 이름은 정확히 일치할 때만 인정하도록 좁힘.
+  명령이 정식 `bin/verify-task-orchestrator.py`일 때만, Skill 이름은 정확히 일치할 때만
+  인정하도록 좁힘.
   **거기서 그치지 않고 자체 end-to-end 재현으로 추가 결함 발견**: `Workflow({name:
   "verify-task", ...})`처럼 `scriptPath` 대신 등록된 `name`으로 부르는 방식(docs가 명시한
   유효한 두 번째 호출법)은 아예 안 잡혔다 — `.input.name`도 함께 확인하도록 확장, 실제
@@ -553,7 +550,7 @@ launchd/config/문서 레벨)로 전체 Discord 연동을 감사. 실사용 가�
 - `weekly-report.sh`의 Calendar/사용량 감지 정규식 — OAuth 만료/토큰 문제/MCP 서버 불가,
   429/rate limit exceeded/overloaded/quota exceeded 등 흔한 변형 추가, 배터리 테스트로 신규
   포착·기존 회귀 없음·오탐 없음 확인.
-- `score-dispatch.sh`의 `CODEX_BIN`/`AGY_BIN` override가 `verify-task-v2.js`의 preflight엔
+- `score-dispatch.sh`의 `CODEX_BIN`/`AGY_BIN` override가 과거 Workflow 경로의 preflight엔
   적용 안 되던 것 — 같은 `${VAR:-기본값}` bash 파라미터 확장 관례를 preflight 프롬프트에도
   적용해 일관성 확보.
 - `CODEX_DISPATCH_LOCKS` 크로스프로세스 미보호(사용자 확정, blocking 등급) — 파일 기반
@@ -629,7 +626,7 @@ Discord 채널 안에 있으니, 사용자가 Claude와 나눈 대화를 Codex�
 나처럼 Bash로 직접 코덱스를 부를 능력이 이미 있었다. 페르소나가 그 능력을 쓰지 말고
 사람에게 떠넘기라고 지시하고 있었을 뿐.
 
-`MAC_BOT_PERSONA` 재작성: `codex-execute-dispatch.sh <저장소경로> <지시문파일>`(verify-task-v2.js
+`MAC_BOT_PERSONA` 재작성: `codex-execute-dispatch.sh <저장소경로> <지시문파일>`(호스트 검증
 Full track 3단계가 실제 코덱스 실행에 쓰는 것과 동일한 쓰기 가능 디스패처)를 직접 부를 수
 있다고 알려주고, 코덱스 자기 보고를 그대로 믿지 말고 `git status`/`git diff`로 실행 전/후
 직접 대조하라는 규율(이 저장소 전체에 이미 깔린 자기보고 불신 원칙 — score-dispatch.sh/
@@ -676,7 +673,7 @@ Bash로 직접 `claude -p`를 부름)은 실측으로 막혔다 — `codex exec 
 
 사용자 후속 요청: "터미널의 너와 디스코드의 맥은 100% 동일해야해. 콕스의 역할도 마찬가지고."
 위 `MAC_BOT_PERSONA`는 코덱스 위임을 `codex-execute-dispatch.sh` 직접호출로만 안내했는데 —
-이건 이 저장소에서 실제 "코딩 위임"의 정식 엔진인 `verify-task-v2.js` Full track(스펙 고정→
+이건 이 저장소에서 실제 "코딩 위임"의 정식 엔진인 호스트 Full track(스펙 고정→
 블라인드 비평→다단계 검증→하네스 규칙 누적, `verify-task-v2-design.md` 참고)을 완전히
 우회하는 얕은 버전이었다. 완전한 동일성이 아니었음.
 
@@ -701,7 +698,7 @@ verify-task-v2로"** 확정.
 1. **트리비얼**(오타, 한 줄 확인): 맥이 Read/Edit/Bash로 직접 처리.
 2. **소규모 위임**(파일 하나, 간단한 변경): 기존 `codex-execute-dispatch.sh` 직접호출 유지.
 3. **진짜 코딩 위임**(새 기능, 여러 파일, 로직 있는 작업): `Workflow({scriptPath:
-   "workflows/verify-task-v2.js", args: {task, cwd, persona}})`를 맥이 직접 호출 — 코덱스가
+   `python3 bin/verify-task-orchestrator.py --task-file <작업파일> --cwd <cwd>`를 맥이 직접 호출 — 코덱스가
    스스로 계획을 세우고, 클로드/안티그래비티가 블라인드 비평하고, 반영해서 실행하고, 다시
    듀얼 코드리뷰까지 거치는 정식 파이프라인이 그대로 돈다. 파일수/민감경로 기준 경량/전체
    자동 티어링은 verify-task-v2 스스로 하므로 맥은 그냥 불러주기만 하면 됨.
@@ -713,7 +710,7 @@ verify-task-v2로"** 확정.
 **검증(2026-07-30, 계정 빨간불이라 저비용 방식으로만)**: 전체 파이프라인을 실제로 돌리지
 않고, "실행하지 말고 방식만 한 단어로 답해" 프롬프트로 판단 로직만 확인 — 3개 요청("오타
 고쳐줘"/"README 섹션 추가"/"pending-job 정리 대시보드 새로 만들어줘, 파일 여러 개 걸쳐도
-됨")에 정확히 "직접 처리 / codex-execute-dispatch.sh / Workflow+verify-task-v2"로 분류됨.
+됨")에 정확히 "직접 처리 / codex-execute-dispatch.sh / host-orchestrator"로 분류됨.
 
 ### 계정 한도 = provider 개인 문제, 시스템 전체 장애 아님 — 자동 provider 폴백
 

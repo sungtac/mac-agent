@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Drain-aware restart helper for the direct Telegram agent LaunchAgents.
+"""Drain-aware restart helper for the Telegram agent LaunchAgents.
 
 The helper refuses to kill a provider while its latest request is active. It
 publishes a short-lived maintenance marker so the Roda health monitor does not
@@ -9,9 +9,12 @@ turn an intentional restart into an incident or start an unnecessary repair.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import fcntl
 import json
 import os
 import subprocess
+import tempfile
 import time
 from pathlib import Path
 
@@ -33,12 +36,20 @@ TARGETS = {
         "log": HOME / ".claude/hooks-state/telegram-claude/stderr.log",
     },
     "codex": {
-        "label": "com.macagent.telegram-codex",
-        "log": HOME / ".claude/hooks-state/telegram-codex/stderr.log",
+        "label": "com.multiagent.engine",
+        "log": HOME / ".edge-agent/state/multiagent-engine/stderr.log",
+        "startup_marker": "Starting canonical Telegram engine",
     },
     "antigravity": {
         "label": "com.macagent.telegram-antigravity",
         "log": HOME / ".claude/hooks-state/telegram-antigravity/stderr.log",
+    },
+    "roda": {
+        "label": "com.macagent.telegram-roda-gemma",
+        "log": HOME / ".claude/hooks-state/telegram-roda-gemma/stderr.log",
+        "startup_marker": "connected as @",
+        "request_start_marker": "request started",
+        "request_done_markers": ("request completed", "request failed"),
     },
 }
 
@@ -50,18 +61,23 @@ def _read_log(path: Path) -> list[str]:
         return []
 
 
-def request_is_active(path: Path) -> bool:
+def request_is_active(
+    path: Path,
+    startup_marker: str = "Starting direct Telegram",
+    request_start_marker: str = "처리 시작",
+    request_done_markers: tuple[str, ...] = ("처리 완료", "처리 실패"),
+) -> bool:
     """Return true only for a request started after the latest bot startup."""
 
     latest_start = -1
     latest_done = -1
     latest_boot = -1
     for index, line in enumerate(_read_log(path)):
-        if "Starting direct Telegram" in line:
+        if startup_marker in line:
             latest_boot = index
-        if "처리 시작" in line:
+        if request_start_marker in line:
             latest_start = index
-        if "처리 완료" in line or "처리 실패" in line:
+        if any(marker in line for marker in request_done_markers):
             latest_done = index
     # An old unmatched start before a later bot startup is stale and must not
     # block every future maintenance operation forever.
@@ -90,42 +106,75 @@ def _load_marker() -> dict[str, object]:
 
 def _write_marker(payload: dict[str, object]) -> None:
     MAINTENANCE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    temporary = MAINTENANCE_FILE.with_suffix(MAINTENANCE_FILE.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, MAINTENANCE_FILE)
-    os.chmod(MAINTENANCE_FILE, 0o600)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{MAINTENANCE_FILE.name}.", suffix=".tmp", dir=MAINTENANCE_FILE.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, MAINTENANCE_FILE)
+        os.chmod(MAINTENANCE_FILE, 0o600)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+@contextlib.contextmanager
+def _marker_lock():
+    """Serialize concurrent role updates to the shared maintenance marker."""
+    lock_path = MAINTENANCE_FILE.with_suffix(MAINTENANCE_FILE.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
 
 
 def set_maintenance(role: str, *, reason: str, expires_at: float) -> None:
-    payload = _load_marker()
-    roles = payload.setdefault("roles", {})
-    assert isinstance(roles, dict)
-    roles[role] = {"reason": reason[:240], "expires_at": expires_at}
-    _write_marker(payload)
+    with _marker_lock():
+        payload = _load_marker()
+        roles = payload.setdefault("roles", {})
+        assert isinstance(roles, dict)
+        roles[role] = {"reason": reason[:240], "expires_at": expires_at}
+        _write_marker(payload)
 
 
 def clear_maintenance(role: str) -> None:
-    if not MAINTENANCE_FILE.exists():
-        return
-    payload = _load_marker()
-    roles = payload.get("roles", {})
-    if not isinstance(roles, dict):
-        return
-    roles.pop(role, None)
-    if roles:
-        _write_marker(payload)
-    else:
-        try:
-            MAINTENANCE_FILE.unlink()
-        except FileNotFoundError:
-            pass
+    with _marker_lock():
+        if not MAINTENANCE_FILE.exists():
+            return
+        payload = _load_marker()
+        roles = payload.get("roles", {})
+        if not isinstance(roles, dict):
+            return
+        roles.pop(role, None)
+        if roles:
+            _write_marker(payload)
+        else:
+            try:
+                MAINTENANCE_FILE.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def restart(role: str, *, reason: str = "operator requested restart", drain_seconds: int = DEFAULT_DRAIN_SECONDS, runner=subprocess.run, sleep=time.sleep) -> None:
     target = TARGETS[role]
     deadline = time.monotonic() + max(0, drain_seconds)
-    while request_is_active(target["log"]):
+    while request_is_active(
+        target["log"],
+        target.get("startup_marker", "Starting direct Telegram"),
+        target.get("request_start_marker", "처리 시작"),
+        target.get("request_done_markers", ("처리 완료", "처리 실패")),
+    ):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{role} active request did not drain before restart")
         sleep(1)
@@ -146,7 +195,8 @@ def restart(role: str, *, reason: str = "operator requested restart", drain_seco
         startup_deadline = time.monotonic() + max(1, STARTUP_SECONDS)
         while time.monotonic() < startup_deadline:
             lines = _read_log(target["log"])
-            booted = any("Starting direct Telegram" in line for line in lines[before_lines:])
+            startup_marker = target.get("startup_marker", "Starting direct Telegram")
+            booted = any(startup_marker in line for line in lines[before_lines:])
             if booted and service_running(target["label"], runner=runner):
                 return
             sleep(1)
@@ -159,7 +209,12 @@ def stop(role: str, *, reason: str = "operator requested stop", drain_seconds: i
     """Drain active work and stop one Telegram LaunchAgent safely."""
     target = TARGETS[role]
     deadline = time.monotonic() + max(0, drain_seconds)
-    while request_is_active(target["log"]):
+    while request_is_active(
+        target["log"],
+        target.get("startup_marker", "Starting direct Telegram"),
+        target.get("request_start_marker", "처리 시작"),
+        target.get("request_done_markers", ("처리 완료", "처리 실패")),
+    ):
         if time.monotonic() >= deadline:
             raise TimeoutError(f"{role} active request did not drain before stop")
         sleep(1)

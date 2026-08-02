@@ -2,6 +2,10 @@
 
 작성일: 2026-07-30
 
+상태: historical. Discord 자유채팅과 Discord provider fallback은 2026-08-02
+퇴역했으며, 아래 구조는 보존용 과거 감사 기록이다. 현재 active 라우팅은 Telegram·
+터미널·검증 오케스트레이터 경로만 대상으로 한다.
+
 ## 목적
 
 Claude의 세션/사용량 한도로 Discord 자유채팅이 멈추지 않도록 Claude, Antigravity,
@@ -29,7 +33,7 @@ Discord 자유채팅
        └─ 실패/고갈로 판정되면 Codex
 
 코딩 검증 워크플로우
-  └─ verify-task-v2.js
+  └─ bin/verify-task-orchestrator.py
        ├─ Claude: 계획 비평/최종 리뷰
        ├─ Antigravity: 계획 비평/최종 리뷰
        └─ Codex: 조정/실행
@@ -51,7 +55,7 @@ Discord 자유채팅
 | `workflows/lib/usage-preflight-gate.sh` | Claude 5h/Codex 7d 사전 차단 | 임계값 10%, 게이트 고장 시 fail-open | Antigravity 수치 게이트 불가 |
 | `workflows/lib/route-dispatch.sh` | 단순작업 Antigravity→Codex | 짧은 quota 오류/빈 응답만 Antigravity 고갈로 판정 | 자유채팅과 실행/타임아웃 계약 불일치 |
 | `workflows/lib/usage-advisor.sh` | Claude/Codex 잔여량 비교 및 새 자유채팅 세션 라우팅 입력 | `coach` 기반 결정론적 추천, 조회 실패 시 fail-open | Antigravity 비교 불가 |
-| `workflows/verify-task-v2.js` | 코딩 전후 다자 검증 | Claude+Antigravity 비평/리뷰, Codex 실행 | 자유채팅 응답 폴백과 역할이 다름 |
+| `bin/verify-task-orchestrator.py` | 코딩 전후 다자 검증 | Claude+Antigravity 비평/리뷰, Codex 실행 | 자유채팅 응답 폴백과 역할이 다름 |
 | Stop 훅 | Claude 세션 규율/검증 강제 | verify-task-v2, 라우팅, 컨텍스트 크기 경고 | Discord 헤드리스 출력에는 일부 경고가 안 보임 |
 
 ## 실측 기준선

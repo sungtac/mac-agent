@@ -33,6 +33,9 @@ SCORE_DISPATCH = ROOT / "workflows" / "lib" / "score-dispatch.sh"
 CODEX_EXECUTE_DISPATCH = ROOT / "workflows" / "lib" / "codex-execute-dispatch.sh"
 PROFILE_SHA = "825e6f984205537e35701781a0216c9e197e6c6aa9a64214d77bcdc4e5df7793"
 HISTORY_SCHEMA = "edge_agent.verify_task_history.v1"
+HEADLESS_FILE_CHARS = 12000
+HEADLESS_TOTAL_FILE_CHARS = 24000
+HEADLESS_RULE_CHARS = 6000
 
 
 def load_harness():
@@ -75,14 +78,21 @@ def now_utc() -> str:
 def json_candidates(text: str) -> list[Any]:
     decoder = json.JSONDecoder()
     values: list[Any] = []
-    for index, character in enumerate(text):
+    index = 0
+    while index < len(text):
+        character = text[index]
         if character not in "[{":
+            index += 1
             continue
         try:
-            value, _ = decoder.raw_decode(text[index:])
+            value, consumed = decoder.raw_decode(text[index:])
         except json.JSONDecodeError:
+            index += 1
             continue
         values.append(value)
+        # Skip the complete top-level value. Otherwise nested objects and
+        # arrays become later candidates and can hide the provider envelope.
+        index += consumed
     return values
 
 
@@ -302,6 +312,10 @@ class HostOrchestrator:
         envelope = last_json(output)
         result, usage = nested_provider_result(envelope)
         self.record_metric("claude", role, prompt, usage)
+        try:
+            HARNESS.ABSENCE_GUARD.validate_provider_payload(result if result is not None else output)
+        except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
+            return {"ok": False, "error": "unsupported_absence_claim", "message": str(exc), "discovery_required": True}
         answer: dict[str, Any] = {"ok": code == 0, "raw": output[-4000:], "usage": usage}
         if expect_json:
             if isinstance(result, dict):
@@ -310,7 +324,16 @@ class HostOrchestrator:
                 answer.update({"ok": False, "error": "claude_json_result_missing"})
         return answer
 
-    def dispatch(self, tool: str, role: str, prompt: str, schema_kind: str) -> dict[str, Any]:
+    def dispatch(
+        self,
+        tool: str,
+        role: str,
+        prompt: str,
+        schema_kind: str,
+        context: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if tool == "agy":
+            prompt = self.headless_evidence_prompt(prompt, context, include_files=schema_kind == "research")
         prompt_path = self.write_prompt(role, prompt)
         binary = self.codex if tool == "codex" else self.agy
         if not binary:
@@ -326,6 +349,10 @@ class HostOrchestrator:
         self.record_metric(tool, role, prompt)
         if code != 0 or not isinstance(value, dict):
             return {"dispatchFailed": True, "dispatchFailureReason": f"{tool} dispatch failed: {output[-1000:]}"}
+        try:
+            HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
+        except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
+            return {"dispatchFailed": True, "dispatchFailureReason": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
         return value
 
     def execute_codex(self, role: str, prompt: str) -> dict[str, Any]:
@@ -340,6 +367,10 @@ class HostOrchestrator:
         value = last_json(output)
         if code != 0 or not isinstance(value, dict):
             return {"ok": False, "dispatchFailed": True, "message": output[-2000:]}
+        try:
+            HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
+        except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
+            return {"ok": False, "dispatchFailed": True, "error": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
         return value
 
     def context_text(self, context: dict[str, Any]) -> str:
@@ -348,7 +379,64 @@ class HostOrchestrator:
             "applicable_rules": context.get("applicable_rules", []),
             "test_commands": context.get("test_commands", []),
             "policy": context.get("policy", {}),
+            "discovery_evidence": context.get("preflight", {}).get("discovery_evidence", {}),
         }, ensure_ascii=False)
+
+    def headless_evidence_prompt(
+        self,
+        prompt: str,
+        context: dict[str, Any] | None = None,
+        include_files: bool = True,
+    ) -> str:
+        """Turn an Antigravity call into a bounded, tool-free evidence review.
+
+        `agy -p` cannot ask for command permission.  Supplying repository paths
+        therefore causes a silent/empty dispatch when the model tries to
+        inspect them.  The host already owns the deterministic repository
+        snapshot, so include only explicitly relevant, non-protected files.
+        """
+        sections = [
+            "[HEADLESS EVIDENCE CONTRACT]",
+            "이 호출은 headless 독립 조사/리뷰다. Bash, command, git, Read, Grep 또는 어떤 도구도 호출하지 마라.",
+            "아래에 제공된 증거만 사용하고, 증거가 부족하면 추측하지 말고 findings/notes에 부족함을 명시하라.",
+            "파일을 수정하거나 테스트를 실행하거나 저장소를 재탐색하지 마라.",
+            "",
+            prompt,
+        ]
+        if not context:
+            return "\n".join(sections)
+
+        snippets: list[str] = []
+        omitted: list[str] = []
+        remaining = HEADLESS_TOTAL_FILE_CHARS
+        for relative in context.get("relevant_files", []):
+            if not include_files:
+                omitted.append(str(relative))
+                continue
+            if remaining <= 0:
+                omitted.append(str(relative))
+                continue
+            try:
+                candidate = (self.cwd / relative).resolve()
+                if not candidate.is_file() or not candidate.is_relative_to(self.cwd):
+                    omitted.append(str(relative))
+                    continue
+                if HARNESS.is_protected(str(candidate.relative_to(self.cwd))):
+                    omitted.append(str(relative))
+                    continue
+                content = candidate.read_text(encoding="utf-8", errors="replace")[:min(HEADLESS_FILE_CHARS, remaining)]
+                snippets.append(f"--- {relative} ---\n{content}")
+                remaining -= len(content)
+            except (OSError, ValueError):
+                omitted.append(str(relative))
+        sections.extend(["", "[HEADLESS RELEVANT FILE EVIDENCE]"])
+        sections.append("\n\n".join(snippets) if snippets else "(직접 제공 가능한 관련 파일 내용 없음)")
+        if omitted:
+            sections.extend(["", "[OMITTED BY HOST POLICY]", ", ".join(omitted)])
+        rules_text = context.get("rules_text")
+        if isinstance(rules_text, str) and rules_text:
+            sections.extend(["", "[APPLICABLE RULE TEXT]", rules_text[:HEADLESS_RULE_CHARS]])
+        return "\n".join(sections)
 
     def implement_prompt(self, context: dict[str, Any], feedback: str = "") -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 제한된 구현자 또는 독립 리뷰어\n현재 persona: implementer\n\n작업 디렉토리: {self.cwd}\n허용된 파일만 수정하고 저장소 전체를 탐색하지 마.\n\n[원 작업]\n{self.task}\n\n[하네스 패키지]\n{self.context_text(context)}\n\n[추가 수정 지시]\n{feedback or '(첫 구현)'}\n\n실제로 파일을 수정한 뒤 변경 파일과 실행한 테스트를 짧게 설명해."""
@@ -363,7 +451,7 @@ class HostOrchestrator:
 
     def research_prompt(self, context: dict[str, Any], focus: str, instruction: str) -> str:
         persona = "red-team" if focus == "risks-tests" else "researcher"
-        return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: {persona}\n\n코드를 수정하거나 계획을 확정하지 말고 아래 초점만 조사한다. 저장소 컨텍스트에 없는 사실은 추측하지 않는다.\n[작업]\n{self.task}\n[컨텍스트]\n{self.context_text(context)}\n[조사 초점]\n{instruction}\n\nJSON으로만 답해: {{"focus":"{focus}","findings":"","evidence":[{{"source":"","fact":"","relevance":""}}],"risks":[],"testImplications":[]}}"""
+        return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: {persona}\n\n코드를 수정하거나 계획을 확정하지 말고 아래 초점만 조사한다. 저장소 컨텍스트에 없는 사실은 추측하지 않는다. 구성·자격·기능이 없다고 판단할 때는 반드시 하네스의 discovery_evidence 또는 searched_scopes를 결과에 포함한다.\n[작업]\n{self.task}\n[컨텍스트]\n{self.context_text(context)}\n[조사 초점]\n{instruction}\n\nJSON으로만 답해: {{"focus":"{focus}","findings":"","evidence":[{{"source":"","fact":"","relevance":""}}],"discovery_evidence":[],"risks":[],"testImplications":[]}}"""
 
     def plan_prompt(self, context: dict[str, Any], research: list[dict[str, Any]]) -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: architect\n\nAntigravity 조사와 하네스 패키지만 보고 Codex가 바로 실행할 구현 계획을 작성한다. 허용 파일, 의존성 순서, 통합 단계, 테스트 명령을 포함한다.\n[원 작업]\n{self.task}\n[하네스 패키지]\n{self.context_text(context)}\n[조사 요약]\n{json.dumps(research, ensure_ascii=False)}\n\nJSON으로만 답해: {{"needsClarification":false,"clarifyingQuestions":"","plan":"구현 순서, 파일 소유권, 통합 및 테스트"}}"""
@@ -404,7 +492,7 @@ class HostOrchestrator:
                 ("risks-tests", "실패 경로, 보안·호환성 위험과 필요한 테스트 조사"),
             ]
             with ThreadPoolExecutor(max_workers=3) as pool:
-                futures = [pool.submit(self.dispatch, "agy", f"research-{focus}", self.research_prompt(context, focus, instruction), "research") for focus, instruction in research_foci]
+                futures = [pool.submit(self.dispatch, "agy", f"research-{focus}", self.research_prompt(context, focus, instruction), "research", context) for focus, instruction in research_foci]
                 research = [future.result() for future in futures]
             if any(item.get("dispatchFailed") for item in research):
                 return {"passed": False, "tier": "full", "error": "research_failed"}
@@ -437,7 +525,7 @@ class HostOrchestrator:
             agy_prompt = self.review_prompt(context, verification, tests, plan, "antigravity")
             with ThreadPoolExecutor(max_workers=2) as pool:
                 claude_future = pool.submit(self.claude_call, f"full-review-round-{round_number}", claude_prompt, True)
-                agy_future = pool.submit(self.dispatch, "agy", f"antigravity-review-round-{round_number}", agy_prompt, "review")
+                agy_future = pool.submit(self.dispatch, "agy", f"antigravity-review-round-{round_number}", agy_prompt, "review", context)
                 claude_review = claude_future.result()
                 agy_review = agy_future.result()
             HARNESS.write_json(self.run_dir / "review-claude.json", claude_review)

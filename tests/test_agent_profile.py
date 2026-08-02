@@ -15,9 +15,9 @@ from agent_profile import load_profile_contract, render_agent_profile, resolve_p
 
 
 class AgentProfileTests(unittest.TestCase):
-    def test_contract_contains_three_stable_roles(self):
+    def test_contract_contains_four_stable_roles(self):
         contract = load_profile_contract()
-        self.assertEqual(set(contract["agents"]), {"claude", "codex", "antigravity"})
+        self.assertEqual(set(contract["agents"]), {"claude", "codex", "antigravity", "roda"})
         self.assertEqual(contract["common_style"]["id"], "plain-high-school-v1")
         self.assertEqual(contract["common_style"]["forbidden_formatting"], ["###", "**"])
 
@@ -26,6 +26,13 @@ class AgentProfileTests(unittest.TestCase):
         self.assertEqual(resolve_persona("codex", phase="FullExecute"), "implementer")
         self.assertEqual(resolve_persona("agy", phase="FullResearch"), "researcher")
         self.assertEqual(resolve_persona("gemini", phase="FullCodeReviewSkill"), "auditor")
+        self.assertEqual(resolve_persona("gemma", phase="LocalProcessing"), "local-processor")
+
+    def test_roda_profile_is_canonical(self):
+        rendered = render_agent_profile("roda")
+        self.assertIn("Roda (로다)", rendered)
+        self.assertIn("로컬 Gemma4 처리·대화 에이전트", rendered)
+        self.assertIn("로컬 처리 담당자", rendered)
 
     def test_rendered_profile_contains_identity_persona_and_shared_style(self):
         rendered = render_agent_profile("codex", "code-reviewer")

@@ -20,7 +20,7 @@
 # This does NOT try to extract a structured verdict from Codex's output —
 # unlike scoring, "what Codex actually changed" is never trusted from its own
 # self-report. The caller must independently verify via a real `git diff`
-# after this returns (see gatherVerificationContext() in verify-task-v2.js).
+# after this returns (see snapshot_and_tests() in bin/verify-task-harness.py).
 # This script only reports whether the process itself completed cleanly.
 set -uo pipefail
 
@@ -94,7 +94,7 @@ if [ ! -f "$PROMPT_FILE" ]; then
 fi
 
 # CWD must be a real git repo (2026-07-29, found in code review before ever
-# hit live): every caller of this script (verify-task-v2.js's own design
+# hit live): every caller of this script (the host orchestrator's design
 # doc says cwd is mandatory specifically so it can run `git status`/`git
 # diff` unconditionally; discord-bot.py's !코덱스 verifies via before/after
 # `git diff`/`git status` snapshots, never trusting Codex's self-report)

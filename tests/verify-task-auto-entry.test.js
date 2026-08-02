@@ -8,7 +8,7 @@ const test = require('node:test')
 const repo = path.resolve(__dirname, '..')
 const submitHook = path.join(repo, 'hooks/verify-task-intent-submit.sh')
 const gateHook = path.join(repo, 'hooks/verify-task-pre-edit-gate.sh')
-const postHook = path.join(repo, 'hooks/verify-task-post-tool-check.sh')
+const hostOrchestrator = path.join(repo, 'bin/verify-task-orchestrator.py')
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'verify-task-auto-entry-'))
@@ -16,6 +16,8 @@ function fixture() {
   const cwd = path.join(root, 'project')
   fs.mkdirSync(home, { recursive: true })
   fs.mkdirSync(cwd, { recursive: true })
+  const initialized = spawnSync('git', ['init', '-q'], { cwd, encoding: 'utf8' })
+  assert.equal(initialized.status, 0, initialized.stderr)
   return { root, home, cwd, sessionId: 'session-test-123' }
 }
 
@@ -34,7 +36,21 @@ function state(env) {
   ))
 }
 
-test('coding prompt creates a gate and injects the Workflow instruction', () => {
+function runHost(env, cwd = env.cwd, task = '코드 수정') {
+  return spawnSync('python3', [
+    hostOrchestrator,
+    '--task', task,
+    '--cwd', cwd,
+    '--run-dir', path.join(env.root, 'verify-run'),
+    '--session-id', env.sessionId,
+    '--dry-run',
+  ], {
+    encoding: 'utf8',
+    env: { ...process.env, HOME: env.home },
+  })
+}
+
+test('coding prompt creates a gate and injects the host orchestrator instruction', () => {
   const env = fixture()
   try {
     const result = run(submitHook, {
@@ -43,7 +59,7 @@ test('coding prompt creates a gate and injects the Workflow instruction', () => 
       prompt: '이 기능을 구현하고 테스트를 추가해줘',
     }, env)
     assert.equal(result.status, 0)
-    assert.match(result.stdout, /additionalContext/)
+    assert.match(result.stdout, /verify-task-orchestrator\.py/)
     assert.equal(state(env).status, 'gate_required')
     assert.equal(state(env).cwd, env.cwd)
   } finally {
@@ -51,7 +67,7 @@ test('coding prompt creates a gate and injects the Workflow instruction', () => 
   }
 })
 
-test('main Edit is denied until a successful Workflow result is observed', () => {
+test('main Edit is denied until the host orchestrator records success', () => {
   const env = fixture()
   try {
     run(submitHook, {
@@ -63,17 +79,8 @@ test('main Edit is denied until a successful Workflow result is observed', () =>
     const before = run(gateHook, editInput, env)
     assert.match(before.stdout, /permissionDecision.*deny/s)
 
-    const post = run(postHook, {
-      session_id: env.sessionId,
-      cwd: env.cwd,
-      tool_name: 'Workflow',
-      tool_input: {
-        scriptPath: '~/.claude/workflows/verify-task-v2.js',
-        args: { task: '코드 수정 후 리뷰', cwd: env.cwd },
-      },
-      tool_response: { structuredContent: { finalVerdict: { passed: true } } },
-    }, env)
-    assert.equal(post.status, 0)
+    const post = runHost(env, env.cwd, '코드 수정 후 리뷰')
+    assert.equal(post.status, 0, post.stdout || post.stderr)
     assert.equal(state(env).status, 'workflow_completed')
 
     const after = run(gateHook, editInput, env)
@@ -83,7 +90,7 @@ test('main Edit is denied until a successful Workflow result is observed', () =>
   }
 })
 
-test('failed Workflow keeps the gate closed, while subagent writes bypass it', () => {
+test('failed host orchestration keeps the gate closed, while subagent writes bypass it', () => {
   const env = fixture()
   try {
     run(submitHook, {
@@ -91,16 +98,10 @@ test('failed Workflow keeps the gate closed, while subagent writes bypass it', (
       cwd: env.cwd,
       prompt: '버그를 수정해줘',
     }, env)
-    run(postHook, {
-      session_id: env.sessionId,
-      cwd: env.cwd,
-      tool_name: 'Workflow',
-      tool_input: {
-        name: 'verify-task-v2',
-        args: { task: '버그 수정', cwd: env.cwd },
-      },
-      tool_response: { structuredContent: { finalVerdict: { passed: false } } },
-    }, env)
+    const failedCwd = path.join(env.root, 'not-a-git-project')
+    fs.mkdirSync(failedCwd)
+    const result = runHost(env, failedCwd, '버그 수정')
+    assert.notEqual(result.status, 0)
     assert.equal(state(env).status, 'workflow_failed')
     assert.match(run(gateHook, { session_id: env.sessionId, cwd: env.cwd }, env).stdout, /permissionDecision.*deny/s)
     assert.equal(run(gateHook, { session_id: env.sessionId, cwd: env.cwd, agent_id: 'subagent-1' }, env).stdout, '')
@@ -109,7 +110,7 @@ test('failed Workflow keeps the gate closed, while subagent writes bypass it', (
   }
 })
 
-test('Workflow for another cwd cannot open the current session gate', () => {
+test('host orchestration for another cwd cannot open the current session gate', () => {
   const env = fixture()
   try {
     run(submitHook, {
@@ -117,17 +118,14 @@ test('Workflow for another cwd cannot open the current session gate', () => {
       cwd: env.cwd,
       prompt: '코드 수정해줘',
     }, env)
-    run(postHook, {
-      session_id: env.sessionId,
-      cwd: env.cwd,
-      tool_name: 'Workflow',
-      tool_input: {
-        scriptPath: '~/.claude/workflows/verify-task-v2.js',
-        args: { task: '다른 저장소 작업', cwd: path.join(env.root, 'other-project') },
-      },
-      tool_response: { structuredContent: { finalVerdict: { passed: true } } },
-    }, env)
+    const otherCwd = path.join(env.root, 'other-project')
+    fs.mkdirSync(otherCwd)
+    const initialized = spawnSync('git', ['init', '-q'], { cwd: otherCwd, encoding: 'utf8' })
+    assert.equal(initialized.status, 0, initialized.stderr)
+    const result = runHost(env, otherCwd, '다른 저장소 작업')
+    assert.equal(result.status, 0, result.stdout || result.stderr)
     assert.equal(state(env).status, 'gate_required')
+    assert.equal(state(env).cwd, env.cwd)
     assert.match(run(gateHook, { session_id: env.sessionId, cwd: env.cwd }, env).stdout, /permissionDecision.*deny/s)
   } finally {
     fs.rmSync(env.root, { recursive: true, force: true })

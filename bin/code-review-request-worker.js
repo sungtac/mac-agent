@@ -22,6 +22,8 @@ const {
 const SCORE_DISPATCH = path.resolve(__dirname, '../workflows/lib/score-dispatch.sh')
 const ALLOWED_SEVERITIES = new Set(['blocker', 'high', 'medium', 'low', 'nit'])
 const ALLOWED_CATEGORIES = new Set(['correctness', 'security', 'performance', 'robustness', 'maintainability', 'tooling', 'scope'])
+const MAX_REVIEW_EVIDENCE_CHARS = 40000
+const MAX_REVIEW_FILE_EVIDENCE_CHARS = 24000
 
 class CodeReviewWorkerError extends Error {
   constructor(code, message) {
@@ -70,6 +72,28 @@ function verifyTarget(repositoryRoot, request) {
   return { root: executionRoot, head }
 }
 
+function cleanupIsolatedWorktree(sourceRoot, worktree, parent) {
+  let removed = !fs.existsSync(worktree)
+  if (!removed) {
+    try {
+      const status = git(worktree, ['status', '--porcelain', '--untracked-files=all'])
+      if (status) {
+        process.stderr.write(`preserving dirty isolated review worktree: ${worktree}\n`)
+        return false
+      }
+      execFileSync('/usr/bin/git', ['-C', sourceRoot, 'worktree', 'remove', worktree], { stdio: 'ignore' })
+      removed = !fs.existsSync(worktree)
+    } catch {
+      process.stderr.write(`preserving unverified isolated review worktree: ${worktree}\n`)
+      return false
+    }
+  }
+  if (removed) {
+    try { fs.rmSync(parent, { recursive: true, force: true }) } catch {}
+  }
+  return removed
+}
+
 function prepareIsolatedWorktree(repositoryRoot, request) {
   const sourceRoot = path.resolve(repositoryRoot || '')
   if (!sourceRoot || !fs.existsSync(sourceRoot)) throw new CodeReviewWorkerError('repository_root_invalid', 'repository root is missing')
@@ -98,21 +122,46 @@ function prepareIsolatedWorktree(repositoryRoot, request) {
     return {
       ...target,
       cleanup() {
-        try { execFileSync('/usr/bin/git', ['-C', sourceRoot, 'worktree', 'remove', '--force', worktree], { stdio: 'ignore' }) } catch {}
-        try { fs.rmSync(parent, { recursive: true, force: true }) } catch {}
+        return cleanupIsolatedWorktree(sourceRoot, worktree, parent)
       },
     }
   } catch (error) {
-    try { execFileSync('/usr/bin/git', ['-C', sourceRoot, 'worktree', 'remove', '--force', worktree], { stdio: 'ignore' }) } catch {}
-    try { fs.rmSync(parent, { recursive: true, force: true }) } catch {}
+    cleanupIsolatedWorktree(sourceRoot, worktree, parent)
     if (error instanceof CodeReviewWorkerError) throw error
     throw new CodeReviewWorkerError('isolated_worktree_failed', 'isolated worktree creation failed')
   }
 }
 
-function createPrompt(request, repositoryRoot, provider) {
+function createPrompt(request, repositoryRoot, provider, evidence = null) {
   const role = provider === 'codex' ? '1차 코드 리뷰어' : '독립 승인 검증자'
+  const headlessContract = provider === 'agy'
+    ? `
+[HEADLESS EVIDENCE CONTRACT]
+이 호출은 headless 독립 리뷰다. Bash, command, git, Read, Grep 또는 어떤 도구도 호출하지 마라.
+아래에 제공된 증거만 사용하고, 증거가 부족하면 추측하지 말고 notes에 명시하라.
+파일을 수정하거나 테스트를 실행하거나 저장소를 재탐색하지 마라.
+`
+    : ''
+  const evidenceText = evidence && provider === 'agy'
+    ? `
+[PRE-GATHERED REVIEW EVIDENCE]
+${evidence.stat}
+${evidence.diff}
+${evidence.files}
+`
+    : ''
+  const procedure = provider === 'agy'
+    ? `1. 제공된 head_sha와 증거의 일치 여부를 확인한다.
+2. 정확성, 보안, 성능, 견고성, 유지보수성을 검토한다.
+3. 실제 근거가 있는 문제만 issues에 기록한다. 테스트를 실행하지 않았으면 통과했다고 말하지 않는다.
+4. 파일을 수정하거나 commit, merge, 외부 전송을 하지 않는다.`
+    : `1. git -C ${repositoryRoot} rev-parse HEAD가 head_sha와 같은지 확인한다.
+2. git show --stat --oneline ${request.target.head_sha}와 해당 커밋의 diff를 읽는다.
+3. 정확성, 보안, 성능, 견고성, 유지보수성을 검토한다.
+4. 실제 근거가 있는 문제만 issues에 기록한다. 테스트를 실행하지 않았으면 통과했다고 말하지 않는다.
+5. 파일을 수정하거나 commit, merge, 외부 전송을 하지 않는다.`
   return `너는 ${role}다. 실제 파일을 수정하지 말고 읽기 전용으로만 검토해.
+${headlessContract}
 
 [검토 대상]
 - repository: ${request.target.repository}
@@ -120,12 +169,10 @@ function createPrompt(request, repositoryRoot, provider) {
 - head_sha: ${request.target.head_sha}
 - local repository root: ${repositoryRoot}
 
-[필수 절차]
-1. git -C ${repositoryRoot} rev-parse HEAD가 head_sha와 같은지 확인한다.
-2. git show --stat --oneline ${request.target.head_sha}와 해당 커밋의 diff를 읽는다.
-3. 정확성, 보안, 성능, 견고성, 유지보수성을 검토한다.
-4. 실제 근거가 있는 문제만 issues에 기록한다. 테스트를 실행하지 않았으면 통과했다고 말하지 않는다.
-5. 파일을 수정하거나 commit, merge, 외부 전송을 하지 않는다.
+[검토 절차]
+${procedure}
+
+${evidenceText}
 
 응답은 반드시 JSON 객체 하나만 반환한다:
 {
@@ -133,6 +180,29 @@ function createPrompt(request, repositoryRoot, provider) {
   "issues": [{"description": "...", "severity": "blocker|high|medium|low|nit", "category": "correctness|security|performance|robustness|maintainability|tooling|scope", "location": "file:line 또는 commit 범위", "evidence": "재현·검증 근거", "remediation": "수정 방향", "blocking": boolean}],
   "notes": "검토 범위와 실행하지 못한 검사의 사실"
 }`
+}
+
+function buildReviewEvidence(repositoryRoot, headSha) {
+  const stat = git(repositoryRoot, ['show', '--stat', '--oneline', '--no-renames', headSha])
+  let diff = git(repositoryRoot, ['show', '--format=fuller', '--binary', '--no-ext-diff', '--no-renames', headSha])
+  if (diff.length > MAX_REVIEW_EVIDENCE_CHARS) diff = diff.slice(0, MAX_REVIEW_EVIDENCE_CHARS) + '\n...(diff truncated by host)'
+  const names = git(repositoryRoot, ['diff-tree', '--no-commit-id', '--name-only', '-r', '--root', headSha])
+    .split('\n').map((value) => value.trim()).filter(Boolean)
+  let remainingFiles = MAX_REVIEW_FILE_EVIDENCE_CHARS
+  const files = names.map((name) => {
+    if (remainingFiles <= 0) return `--- ${name} ---\n(omitted: host evidence budget exhausted)`
+    if (/(^|\/)(\.env|secrets?|credentials?|.*\.(pem|key))($|\/)/i.test(name)) {
+      return `--- ${name} ---\n(omitted by host policy)`
+    }
+    try {
+      const content = git(repositoryRoot, ['show', `${headSha}:${name}`]).slice(0, Math.min(12000, remainingFiles))
+      remainingFiles -= content.length
+      return `--- ${name} ---\n${content}`
+    } catch {
+      return `--- ${name} ---\n(unavailable in target commit)`
+    }
+  }).join('\n\n')
+  return { stat, diff, files }
 }
 
 function writePrompt(content) {
@@ -249,7 +319,7 @@ async function runWorkerOnce(options = {}) {
 
   const prompts = {
     codex: writePrompt(createPrompt(request, target.root, 'codex')),
-    agy: writePrompt(createPrompt(request, target.root, 'agy')),
+    agy: writePrompt(createPrompt(request, target.root, 'agy', buildReviewEvidence(target.root, target.head))),
   }
   try {
     const [codexRaw, antigravityRaw] = await Promise.all([
@@ -319,6 +389,7 @@ module.exports = {
   CodeReviewWorkerError,
   buildReport,
   createPrompt,
+  buildReviewEvidence,
   main,
   parseProviderResult,
   prepareIsolatedWorktree,

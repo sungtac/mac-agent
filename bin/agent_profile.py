@@ -10,7 +10,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE_PATH = ROOT / "config" / "agent-profile-contract.json"
-ALIASES = {"agy": "antigravity", "gemini": "antigravity"}
+ALIASES = {"agy": "antigravity", "gemini": "antigravity", "gemma": "roda"}
 
 
 def load_profile_contract() -> dict[str, Any]:
@@ -31,7 +31,7 @@ def load_profile_contract() -> dict[str, Any]:
         isinstance(item, str) for item in style["forbidden_formatting"]
     ):
         raise ValueError("agent profile 계약의 금지 문법 목록이 잘못됨")
-    for role in ("claude", "codex", "antigravity"):
+    for role in ("claude", "codex", "antigravity", "roda"):
         agent = agents.get(role)
         if not isinstance(agent, dict):
             raise ValueError(f"agent profile 계약에 {role} 역할이 없음")
@@ -57,7 +57,7 @@ def load_profile_contract() -> dict[str, Any]:
 def normalize_role(role: str) -> str:
     normalized = str(role or "").strip().lower()
     normalized = ALIASES.get(normalized, normalized)
-    if normalized not in {"claude", "codex", "antigravity"}:
+    if normalized not in {"claude", "codex", "antigravity", "roda"}:
         raise ValueError(f"지원하지 않는 agent role: {role}")
     return normalized
 

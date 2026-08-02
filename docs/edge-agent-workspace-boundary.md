@@ -2,25 +2,25 @@
 
 상태: v1 provider CLI 경계 적용, `provider_cli_enforced`
 
-이 문서는 엣지 에이전트와 기존 Team OS가 같은 workspace를 공유하는 상태에서,
-병렬 Codex나 런타임 통합을 시작하기 전에 지켜야 할 경계를 기록한다.
+이 문서는 기존 OpenClaw workspace를 퇴역시킨 뒤 엣지 에이전트가 사용하는
+작업공간과 권한 경계를 기록한다.
 
 ## 현재 확인된 구조
 
 - 엣지 에이전트 소스: `/Users/edge_ai/mac-agent`
-- Claude·Codex·Anti Telegram 봇 workspace: `/Users/edge_ai/.openclaw/workspace`
-- Team OS: `/Users/edge_ai/.openclaw/workspace/team_os`
-- Team OS 상태·증거: `/Users/edge_ai/.openclaw/workspace/state`
-- Team OS Telegram 실행 코드: `/Users/edge_ai/.openclaw/workspace/sukja_telegram`
+- Claude·Anti Telegram 봇 workspace: `/Users/edge_ai/.edge-agent-worktrees/telegram-bootstrap`
+- Codex canonical engine workspace: `/Users/edge_ai/tools/multi-agent-starter/engine-repo`
+- 작업별 격리 worktree: `/Users/edge_ai/.edge-agent-worktrees/telegram-tasks`
 - Roda Gemma workspace: `/Users/edge_ai/mac-agent`
+- 퇴역한 OpenClaw workspace: `/Users/edge_ai/.openclaw` (휴지통으로 이동)
 
-현재 `.openclaw/workspace`는 이름과 달리 OpenClaw runtime 자체가 아니라,
-엣지 에이전트와 Team OS가 함께 참조하는 기존 작업공간이다. 따라서 이 단계에서는
-경로를 이동하거나 서비스를 재시작하지 않는다.
+활성 서비스는 `.openclaw`를 참조하지 않는다. 과거 경로는 실수로 재생성되거나
+provider가 진입하는 것을 막기 위한 차단 가드에만 남아 있다.
 
 ## v1 정책
 
-1. `team_os/`, `state/`, `sukja_telegram/`은 엣지 에이전트의 직접 수정 금지 대상이다.
+1. 퇴역한 `.openclaw`와 `~/.edge-agent/retired-openclaw-workspace`는 엣지 에이전트의
+   실행·수정 대상이 아니다.
 2. Roda Gemma는 도구·파일·셸 권한 없이 대화 전용으로 유지한다.
 3. worktree 기반 병렬 실행은 전역 상태·락·병합 계약이 확정될 때까지 활성화하지 않는다.
 4. 현재 manifest는 `provider_cli_enforced`다. provider CLI와 그 하위 도구의 보호 경로 쓰기를 sandbox로 차단한다.
@@ -32,11 +32,13 @@
 
 ## 경계가 아직 강제되지 않는 이유
 
-현재 Telegram Claude/Codex/Anti와 Discord의 provider 실행은 공용 workspace에서
-CLI를 실행하되 `edge-agent-provider-sandbox.sh`를 거친다. 이 sandbox는 provider
-CLI와 그 하위 도구의 `team_os/`, `state/`, `sukja_telegram/` 쓰기를 차단한다.
-단, Codex는 자체 `workspace-write` sandbox와 외부 `sandbox-exec`를 중첩할 수 없으므로,
-Codex에 대해서는 내부 sandbox를 사용하고 legacy shared workspace 실행 자체를 거부한다.
+현재 Telegram Claude/Anti provider 실행과 Codex canonical engine의 provider 호출은
+Edge Agent sandbox 계약을 거친다. 이 sandbox는 provider
+CLI와 그 하위 도구의 퇴역한 OpenClaw 경로 쓰기를 차단한다. 단, Codex는 자체
+`workspace-write` sandbox와 외부 `sandbox-exec`를 중첩할 수 없으므로, Codex에
+대해서는 engine adapter가 `edge-agent-provider-sandbox.sh`를 호출하고 read-only
+기본값을 사용하며, 퇴역한 OpenClaw 경로 진입 자체를 거부한다. 기존 직접 Codex
+adapter는 parity 확인 전까지 disabled compatibility 경로다.
 봇 자체의 로그·상태 쓰기와 watchdog이 직접 실행하는 별도 Claude 메인 세션은 이
 provider CLI 경계에 포함되지 않는다.
 
@@ -52,13 +54,13 @@ provider CLI 경계에 포함되지 않는다.
 
 ```bash
 python3 bin/edge-agent-write-policy.py --json \
-  /Users/edge_ai/.openclaw/workspace/team_os \
-  /Users/edge_ai/.openclaw/workspace/projects/example.txt
+  /Users/edge_ai/.edge-agent-worktrees/telegram-bootstrap \
+  /Users/edge_ai/.openclaw/workspace/team_os
 ```
 
-`team_os` 아래 경로는 `protected`로 판정되고, 보호 경로 밖의 기존 workspace
-경로는 `legacy_workspace_allowed`로 판정된다. `--strict`를 붙이면 허용되지 않는
-경로가 하나라도 있을 때 non-zero를 반환하지만, 파일이나 서비스를 변경하지 않는다.
+활성 Edge Agent worktree는 명시된 실행 경로로 사용하고, `.openclaw` 아래 경로는
+퇴역 경로로 간주해 허용하지 않는다. `--strict`를 붙이면 허용되지 않는 경로가
+하나라도 있을 때 non-zero를 반환하지만, 파일이나 서비스를 변경하지 않는다.
 실제 provider 실행은 [edge-agent-provider-sandbox.sh](../bin/edge-agent-provider-sandbox.sh)를
 통해 동일한 보호 정책을 적용한다.
 

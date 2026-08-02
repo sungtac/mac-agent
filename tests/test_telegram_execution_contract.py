@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import ast
 import json
 import os
 import sys
@@ -22,9 +23,13 @@ sys.path.insert(0, str(BIN))
 from edge_agent_telegram_delivery import create_delivery, load_delivery  # noqa: E402
 _ENV_KEYS = ("TELEGRAM_AGENT_ROLE", "TELEGRAM_AGENT_CHAT_ID", "TELEGRAM_AGENT_TOKEN_FILE")
 _ENV_SNAPSHOT = {key: os.environ.get(key) for key in _ENV_KEYS}
+_TEST_TOKEN_ROOT = tempfile.TemporaryDirectory()
+_TEST_TOKEN_FILE = Path(_TEST_TOKEN_ROOT.name) / "claude.token"
+_TEST_TOKEN_FILE.write_text("123456:unit-test-token", encoding="utf-8")
+_TEST_TOKEN_FILE.chmod(0o600)
 os.environ["TELEGRAM_AGENT_ROLE"] = "claude"
 os.environ["TELEGRAM_AGENT_CHAT_ID"] = "-1003952617795"
-os.environ["TELEGRAM_AGENT_TOKEN_FILE"] = str(Path.home() / ".config" / "agent-telegram" / "claude.token")
+os.environ["TELEGRAM_AGENT_TOKEN_FILE"] = str(_TEST_TOKEN_FILE)
 SPEC = importlib.util.spec_from_file_location("telegram_agent_bot_execution_contract", BIN / "telegram-agent-bot.py")
 BOT = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
@@ -81,6 +86,46 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         self.delivery_root.cleanup()
+
+    def test_conflict_burst_persists_a_bounded_restart_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original_file = BOT._CONFLICT_COOLDOWN_FILE
+            original_seconds = BOT.CONFLICT_RESTART_COOLDOWN_SECONDS
+            BOT._CONFLICT_COOLDOWN_FILE = Path(directory) / "cooldown.json"
+            BOT.CONFLICT_RESTART_COOLDOWN_SECONDS = 60
+            try:
+                with patch.object(BOT.time, "time", return_value=100):
+                    BOT._write_conflict_cooldown()
+                self.assertTrue(BOT._CONFLICT_COOLDOWN_FILE.is_file())
+                with patch.object(BOT.time, "time", return_value=101), patch.object(BOT.time, "sleep") as sleep:
+                    BOT._wait_for_conflict_cooldown()
+                sleep.assert_called_once()
+                self.assertLessEqual(sleep.call_args.args[0], 60)
+                BOT._clear_conflict_cooldown()
+                self.assertFalse(BOT._CONFLICT_COOLDOWN_FILE.exists())
+            finally:
+                BOT._CONFLICT_COOLDOWN_FILE = original_file
+                BOT.CONFLICT_RESTART_COOLDOWN_SECONDS = original_seconds
+
+    def test_singleton_lock_is_acquired_before_polling_application(self):
+        tree = ast.parse((BIN / "telegram-agent-bot.py").read_text(encoding="utf-8"))
+        lock_line = next(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "_acquire_singleton_lock"
+        )
+        builder_line = next(
+            node.lineno
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "builder"
+            and isinstance(node.func.value, ast.Name)
+            and node.func.value.id == "Application"
+        )
+        self.assertLess(lock_line, builder_line)
 
     async def test_existing_worktree_requires_matching_owner_metadata(self):
         with tempfile.TemporaryDirectory() as directory:

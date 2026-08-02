@@ -1,0 +1,22 @@
+name: active-edge-agent-tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  active-contracts:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - run: python -m pip install --disable-pip-version-check -r requirements.txt
+      - run: bash bin/run-active-tests.sh
+      - run: node --test tests/*.test.js
+      - run: python -m compileall -q bin skills
+      - run: git diff --check

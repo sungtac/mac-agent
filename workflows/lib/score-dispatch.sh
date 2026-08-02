@@ -17,7 +17,7 @@ TOOL="${1:?usage: score-dispatch.sh <codex|agy> <prompt-file> [schema-kind]}"
 PROMPT_FILE="${2:?usage: score-dispatch.sh <codex|agy> <prompt-file> [schema-kind]}"
 # schema-kind: which caller's JSON schema the failure envelope must satisfy
 # (its required fields). Optional, defaults to the rubric-compatible envelope
-# for generic callers. verify-task-v2.js passes this explicitly. The
+# for generic callers. The host orchestrator passes this explicitly. The
 # many different schemas per stage) passes this explicitly. Discovered
 # 2026-07-27/28: a single fixed rubric-shaped envelope only matches v1's
 # schema — every v2 stage schema (plan/critique/reconcile/review/light-eval/
@@ -48,7 +48,7 @@ if kind == "rubric":
     print(json.dumps(envelope, ensure_ascii=False))
     sys.exit(0)
 
-# v2(verify-task-v2.js) 각 단계 스키마의 required 필드를 정확히 채워서
+# v2 각 단계 스키마의 required 필드를 정확히 채워서
 # 그 단계의 JSON Schema 검증을 통과시키고, 공통 "dispatchFailed" 마커로
 # 도구 실패를 스키마와 무관하게 판별 가능하게 한다(문자열 문구 동기화가
 # 아니라 boolean 필드 하나면 되므로 v1보다 더 견고함).
@@ -120,6 +120,7 @@ fi
 record_verify_metric() {
   [ -n "${VERIFY_METRICS_FILE:-}" ] || return 0
   python3 - "$VERIFY_METRICS_FILE" "$PROMPT_FILE" "${VERIFY_TASK_ID:-unknown}" "${VERIFY_AGENT:-unknown}" "${VERIFY_ROLE:-unknown}" <<'PYEOF' || true
+import fcntl
 import json
 import os
 import sys
@@ -136,12 +137,15 @@ record = {
     "agent": agent,
     "role": role,
     "round": None,
-    "model": None,
-    "effort": None,
-    "input_tokens": 0,
-    "output_tokens": 0,
-    "cache_read_tokens": 0,
-    "cache_creation_tokens": 0,
+    "model": os.environ.get("VERIFY_MODEL"),
+    "effort": os.environ.get("VERIFY_EFFORT"),
+    # Provider usage is not exposed by this shell boundary. Unknown is
+    # materially different from zero and must not make token accounting look
+    # complete when only package size was measured.
+    "input_tokens": None,
+    "output_tokens": None,
+    "cache_read_tokens": None,
+    "cache_creation_tokens": None,
     "package_bytes": package_bytes,
     "package_tokens": max(1, package_bytes // 4),
     "prefix_fingerprint": None,
@@ -149,7 +153,10 @@ record = {
 path = Path(metrics_path)
 path.parent.mkdir(parents=True, exist_ok=True)
 with path.open("a", encoding="utf-8") as handle:
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
     handle.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    handle.flush()
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 PYEOF
 }
 
@@ -322,25 +329,6 @@ shutil.copyfile(sys.argv[1], sys.argv[2])
 PYEOF
   then
     AGY_REVIEW_PROFILE_ERROR="Antigravity review 기본 프로필 복사 실패: $base_profile"
-    return 1
-  fi
-
-  if [ "${EDGE_AGENT_REVIEW_PROFILE+x}" != x ] && ! python3 - "$AGY_REVIEW_PROFILE_TEMP" <<'PYEOF'
-import sys
-
-profile_path = sys.argv[1]
-with open(profile_path, "rb") as profile:
-    lines = profile.readlines()
-with open(profile_path, "wb") as profile:
-    for line in lines:
-        stripped = line.strip()
-        if (stripped.startswith(b'(allow file-write* (subpath "')
-                and (b'/antigravity-cli/log' in stripped or b'/antigravity-cli/crashes' in stripped)):
-            continue
-        profile.write(line)
-PYEOF
-  then
-    AGY_REVIEW_PROFILE_ERROR="기본 Antigravity review 프로필의 고정 로그 허용 규칙 제거 실패"
     return 1
   fi
 

@@ -7,10 +7,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "bin" / "edge-agent-provider-sandbox.sh"
-PROTECTED_TARGET = Path("/Users/edge_ai/.openclaw/workspace/team_os/.edge-agent-canary-probe")
+PROTECTED_ROOT = Path.home() / ".edge-agent" / "protected-canary"
+PROTECTED_TARGET = PROTECTED_ROOT / ".edge-agent-canary-probe"
 
 
 class ProviderSandboxCanaryTests(unittest.TestCase):
+    def setUp(self):
+        PROTECTED_ROOT.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        try:
+            PROTECTED_ROOT.rmdir()
+        except OSError:
+            pass
+
     def _make_worktree(self, temp_dir: str) -> Path:
         root = Path(temp_dir) / "repo"
         worktree = Path(temp_dir) / "worktree"
@@ -84,18 +94,59 @@ class ProviderSandboxCanaryTests(unittest.TestCase):
             self.assertEqual(allowed_result.returncode, 0, allowed_result.stderr)
             self.assertTrue(allowed_target.is_file())
 
-    def test_codex_legacy_shared_workspace_is_rejected_before_nested_sandbox(self):
+    def test_codex_retired_openclaw_workspace_is_rejected_before_nested_sandbox(self):
         with tempfile.TemporaryDirectory(prefix="edge-agent-codex-wrapper-") as temp_dir:
             fake_codex = Path(temp_dir) / "codex"
             fake_codex.write_text("#!/bin/sh\nexit 0\n")
             fake_codex.chmod(0o755)
             result = subprocess.run(
-                [str(WRAPPER), str(fake_codex), "-C", "/Users/edge_ai/.openclaw/workspace"],
+                [str(WRAPPER), str(fake_codex), "-C", str(Path.home() / ".openclaw" / "workspace")],
                 capture_output=True,
                 text=True,
                 check=False,
             )
             self.assertNotEqual(result.returncode, 0)
+
+    def test_codex_combined_cd_option_is_checked(self):
+        with tempfile.TemporaryDirectory(prefix="edge-agent-codex-wrapper-") as temp_dir:
+            fake_codex = Path(temp_dir) / "codex"
+            fake_codex.write_text("#!/bin/sh\nexit 0\n")
+            fake_codex.chmod(0o755)
+            result = subprocess.run(
+                [str(WRAPPER), str(fake_codex), "-C" + str(Path.home() / ".openclaw" / "workspace")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_codex_relative_traversal_to_retired_path_is_rejected(self):
+        with tempfile.TemporaryDirectory(prefix="edge-agent-codex-wrapper-") as temp_dir:
+            fake_codex = Path(temp_dir) / "codex"
+            fake_codex.write_text("#!/bin/sh\nexit 0\n")
+            fake_codex.chmod(0o755)
+            result = subprocess.run(
+                [str(WRAPPER), str(fake_codex), "-C", "../.openclaw/nonexistent"],
+                cwd=ROOT,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertNotEqual(result.returncode, 0)
+
+    def test_codex_options_after_separator_are_not_reinterpreted(self):
+        with tempfile.TemporaryDirectory(prefix="edge-agent-codex-wrapper-") as temp_dir:
+            fake_codex = Path(temp_dir) / "codex"
+            fake_codex.write_text("#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            fake_codex.chmod(0o755)
+            result = subprocess.run(
+                [str(WRAPPER), str(fake_codex), "--", "-C", str(Path.home() / ".openclaw" / "workspace")],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("-C", result.stdout)
 
     def test_review_mode_denies_repository_writes(self):
         with tempfile.TemporaryDirectory(prefix="edge-agent-review-canary-") as temp_dir:

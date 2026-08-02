@@ -1,5 +1,9 @@
 # token-cost-report.sh (토큰비용 대시보드 일일 크론)
 
+상태 메모: Discord 알림 경로는 2026-08-02 퇴역했다. `discord-notify.sh`는
+호환성 shim으로 남아 있지만 외부 전송은 수행하지 않는다. 토큰 비용 리포트 자체와
+로컬/Drive 저장 경로는 계속 활성이다.
+
 `cron/token-cost-report.sh` — 매일 23:00 `launchd`
 (`~/Library/LaunchAgents/com.macagent.token-cost-report.plist`, 레이블
 `com.macagent.token-cost-report`, `Hour: 23, Minute: 0`, `Weekday` 키 없음=매일)로 실행.

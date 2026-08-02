@@ -13,9 +13,13 @@ from unittest.mock import patch
 
 BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 sys.path.insert(0, str(BIN_DIR))
-os.environ.setdefault("TELEGRAM_AGENT_ROLE", "antigravity")
-os.environ.setdefault("TELEGRAM_AGENT_CHAT_ID", "-1003952617795")
-os.environ.setdefault("TELEGRAM_AGENT_TOKEN_FILE", str(Path.home() / ".config" / "agent-telegram" / "antigravity.token"))
+_TOKEN_ROOT = tempfile.TemporaryDirectory()
+_TOKEN_FILE = Path(_TOKEN_ROOT.name) / "antigravity.token"
+_TOKEN_FILE.write_text("123456:unit-test-token", encoding="utf-8")
+_TOKEN_FILE.chmod(0o600)
+os.environ["TELEGRAM_AGENT_ROLE"] = "antigravity"
+os.environ["TELEGRAM_AGENT_CHAT_ID"] = "-1003952617795"
+os.environ["TELEGRAM_AGENT_TOKEN_FILE"] = str(_TOKEN_FILE)
 SPEC = importlib.util.spec_from_file_location("telegram_agent_bot", BIN_DIR / "telegram-agent-bot.py")
 BOT_MODULE = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
@@ -79,9 +83,11 @@ class AntigravityIdentityTests(unittest.TestCase):
             self.assertIsNone(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")))
             self.assertIsNone(BOT_MODULE.addressed_text(update("로다야 안녕")))
         with patch.object(BOT_MODULE, "ROLE", "codex"):
-            self.assertIsNone(BOT_MODULE.addressed_text(update("안녕하세요")))
+            self.assertEqual(BOT_MODULE.addressed_text(update("안녕하세요")), "안녕하세요")
             self.assertEqual(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")), "코덱스야 확인해줘")
             self.assertEqual(BOT_MODULE.addressed_text(update("각자 버그를 수정해줘")), "각자 버그를 수정해줘")
+        with patch.object(BOT_MODULE, "ROLE", "antigravity"):
+            self.assertEqual(BOT_MODULE.addressed_text(update("안녕하세요")), "안녕하세요")
 
 
 if __name__ == "__main__":

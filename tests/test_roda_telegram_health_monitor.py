@@ -453,6 +453,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
             original = {
                 "CODEX_BIN": health.CODEX_BIN,
                 "REPAIR_ROOT": health.REPAIR_ROOT,
+                "AUTO_REPAIR_APPROVAL_FILE": health.AUTO_REPAIR_APPROVAL_FILE,
                 "repository_lifecycle_lock": health.repository_lifecycle_lock,
                 "CODEX_DIAGNOSIS_ENABLED": health.CODEX_DIAGNOSIS_ENABLED,
                 "AUTO_REPAIR_ENABLED": health.AUTO_REPAIR_ENABLED,
@@ -479,12 +480,18 @@ class RodaHealthMonitorTests(unittest.TestCase):
 
             health.CODEX_BIN = codex_bin
             health.REPAIR_ROOT = Path(td) / "repair"
+            health.AUTO_REPAIR_APPROVAL_FILE = Path(td) / "approvals.json"
+            health.AUTO_REPAIR_APPROVAL_FILE.write_text(
+                '{"approvals":{"repair-fingerprint":{"approved":true,"expires_at":1800000000}}}',
+                encoding="utf-8",
+            )
+            health.AUTO_REPAIR_APPROVAL_FILE.chmod(0o600)
             health.repository_lifecycle_lock = None
             health.CODEX_DIAGNOSIS_ENABLED = True
             health.AUTO_REPAIR_ENABLED = True
             try:
                 with mock.patch.object(health.subprocess, "run", side_effect=run), \
-                        mock.patch.object(health, "_merge_repair_commit_and_restart", return_value="main에 추적 파일 변경이 있어 자동 병합하지 않았습니다."), \
+                        mock.patch.object(health, "_merge_repair_commit_and_restart", return_value="main 작업공간이 깨끗하지 않아 자동 병합하지 않았습니다."), \
                         mock.patch.object(health.time, "time", return_value=1700000000):
                     first = health._run_codex_repair_impl(event, state)
                     worktree.mkdir(parents=True)
@@ -493,11 +500,41 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 for name, value in original.items():
                     setattr(health, name, value)
 
-        self.assertIn("main에 추적 파일 변경", first)
-        self.assertIn("main에 추적 파일 변경", second)
+        self.assertIn("작업공간이 깨끗하지 않아", first)
+        self.assertIn("작업공간이 깨끗하지 않아", second)
         self.assertEqual(list(state["pending_merges"]), [event["fingerprint"]])
         self.assertEqual(state["pending_merges"][event["fingerprint"]]["repair_commit"], "repair-commit")
         self.assertEqual(state["pending_merges"][event["fingerprint"]]["queued_at"], 1700000000)
+
+    def test_automatic_repair_requires_explicit_fingerprint_approval(self):
+        event = {"role": "codex", "code": "empty_response", "fingerprint": "unapproved"}
+        original = (health.AUTO_REPAIR_ENABLED, health.AUTO_REPAIR_APPROVAL_FILE)
+        with tempfile.TemporaryDirectory() as td:
+            health.AUTO_REPAIR_ENABLED = True
+            health.AUTO_REPAIR_APPROVAL_FILE = Path(td) / "approvals.json"
+            health.AUTO_REPAIR_APPROVAL_FILE.write_text(
+                '{"approvals":{"different":{"approved":true,"expires_at":9999999999}}}',
+                encoding="utf-8",
+            )
+            try:
+                result = health._run_codex_repair_impl(event, {})
+            finally:
+                health.AUTO_REPAIR_ENABLED, health.AUTO_REPAIR_APPROVAL_FILE = original
+        self.assertIn("자동 복구 승인 없음", result)
+
+    def test_expired_repair_approval_is_rejected(self):
+        event = {"fingerprint": "expired"}
+        original = health.AUTO_REPAIR_APPROVAL_FILE
+        with tempfile.TemporaryDirectory() as td:
+            health.AUTO_REPAIR_APPROVAL_FILE = Path(td) / "approvals.json"
+            health.AUTO_REPAIR_APPROVAL_FILE.write_text(
+                '{"approvals":{"expired":{"approved":true,"expires_at":1}}}',
+                encoding="utf-8",
+            )
+            try:
+                self.assertFalse(health._repair_approval_granted(event, now=2))
+            finally:
+                health.AUTO_REPAIR_APPROVAL_FILE = original
 
     def test_pending_merge_retry_reuses_commit_without_rediagnosis_and_orders_success_followup(self):
         fingerprint = "queued-fingerprint"
@@ -523,6 +560,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
 
         with mock.patch.object(health.time, "time", return_value=1700000001), \
                 mock.patch.object(health, "_merge_repair_commit_and_restart", side_effect=merge), \
+                mock.patch.object(health, "_repair_approval_granted", return_value=True), \
                 mock.patch.object(health, "_run_codex_repair", side_effect=AssertionError("rediagnosis must not run")), \
                 mock.patch.object(health, "_save_state", side_effect=lambda _state: sequence.append(("save", None))), \
                 mock.patch.object(health, "_send_alert", side_effect=lambda message: sequence.append(("alert", message))):
@@ -548,6 +586,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
         state = {"pending_merges": {fingerprint: info}, "repair_results": {}, "recovery_watch": {}}
         with mock.patch.object(health.time, "time", return_value=1700000001), \
                 mock.patch.object(health, "_merge_repair_commit_and_restart", return_value="Codex 수정은 생성됐지만 main 병합에 실패했습니다: conflict"), \
+                mock.patch.object(health, "_repair_approval_granted", return_value=True), \
                 mock.patch.object(health, "_save_state") as save_state, \
                 mock.patch.object(health, "_send_alert") as send_alert:
             health._retry_pending_merges(state)
@@ -585,6 +624,26 @@ class RodaHealthMonitorTests(unittest.TestCase):
         send_alert.assert_called_once()
         self.assertIn("saved-commit", send_alert.call_args.args[0])
 
+    def test_pending_merge_without_approval_never_merges(self):
+        fingerprint = "approval-required"
+        state = {
+            "pending_merges": {
+                fingerprint: {
+                    "role": "codex",
+                    "code": "empty_response",
+                    "repair_commit": "saved-commit",
+                    "worktree": "/tmp/repair-worktree",
+                    "queued_at": 1700000000,
+                }
+            }
+        }
+        with mock.patch.object(health.time, "time", return_value=1700000001), \
+                mock.patch.object(health, "_repair_approval_granted", return_value=False), \
+                mock.patch.object(health, "_merge_repair_commit_and_restart") as merge:
+            health._retry_pending_merges(state)
+        merge.assert_not_called()
+        self.assertIn(fingerprint, state["pending_merges"])
+
     def test_merge_failure_never_restarts_but_success_restarts_after_merge(self):
         original_lock = health.integration_lock
         health.integration_lock = None
@@ -598,7 +657,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 result = health._merge_repair_commit_and_restart(
                     role="codex", code="empty_response", repair_commit="saved-commit", fingerprint="fp"
                 )
-            self.assertIn("추적 파일 변경", result)
+            self.assertIn("작업공간이 깨끗하지 않아", result)
             self.assertEqual(run.call_count, 1)
 
             commands = []
@@ -641,6 +700,23 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 )
             self.assertIn("서비스 재기동 완료", result)
             self.assertTrue(any(str(health.RESTART_HELPER) in str(call.args[0]) for call in run.call_args_list))
+        finally:
+            health.integration_lock = original_lock
+
+    def test_merge_fails_closed_when_git_status_fails(self):
+        original_lock = health.integration_lock
+        health.integration_lock = None
+        try:
+            with mock.patch.object(
+                health.subprocess,
+                "run",
+                return_value=mock.Mock(returncode=128, stdout="", stderr="not a repository"),
+            ) as run:
+                result = health._merge_repair_commit_and_restart(
+                    role="codex", code="empty_response", repair_commit="saved-commit", fingerprint="fp"
+                )
+            self.assertIn("상태를 확인하지 못해", result)
+            self.assertEqual(run.call_count, 1)
         finally:
             health.integration_lock = original_lock
 

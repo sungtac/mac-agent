@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -15,7 +16,8 @@ DEFAULT_FLAGS = {
 
 def load_flags(path: str | Path | None = None) -> dict[str, Any]:
     if path is None:
-        path = Path(__file__).resolve().parents[2] / "state" / "runtime_flags.json"
+        state_root = Path(os.environ.get("EDGE_AGENT_STATE_ROOT", "~/.edge-agent/state")).expanduser().resolve()
+        path = state_root / "skills" / "quota_resume" / "runtime_flags.json"
     p = Path(path)
     data = {}
     if p.exists():

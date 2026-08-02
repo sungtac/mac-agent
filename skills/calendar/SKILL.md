@@ -17,7 +17,7 @@ python3 "$HOME/mac-agent/skills/calendar/google_calendar.py" upcoming --days 7 -
 python3 "$HOME/mac-agent/skills/calendar/google_calendar.py" add --title "제목" --start "2026-05-14T15:00:00+09:00" --end "2026-05-14T16:00:00+09:00"
 ```
 
-Token/client files live under `~/.openclaw/secrets/` and must not be printed.
+Token/client files live under `~/.edge-agent/secrets/calendar/` and must not be printed.
 
 ## Event creation rules
 

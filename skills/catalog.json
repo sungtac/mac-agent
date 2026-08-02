@@ -1,0 +1,15 @@
+{
+  "schema": "edge_agent_skill_catalog.v1",
+  "root": "skills",
+  "skills": [
+    {"id":"calendar","manifest":"calendar/SKILL.md","category":"domain","status":"active","runtime_consumers":["calendar callers"],"tests":["calendar/tests/test_calendar.py"],"state_root":"~/.edge-agent/state/skills/calendar.json","auth_root":"~/.edge-agent/secrets/calendar/"},
+    {"id":"code-review","manifest":"code-review/SKILL.md","category":"quality","status":"active","runtime_consumers":["code review workflow"],"tests":["tests/test_code_review_scripts.py"],"state_root":"~/.edge-agent/state/code-review","auth_root":null},
+    {"id":"command-registry","manifest":"command-registry/SKILL.md","category":"safety","status":"active","runtime_consumers":["command validation"],"tests":["command-registry/tests/test_command_registry.py"],"state_root":"~/.edge-agent/state/skills/command-registry.json","auth_root":null},
+    {"id":"edge-agent-behavior","manifest":"edge-agent-behavior/SKILL.md","category":"core","status":"active","runtime_consumers":["capability registry"],"tests":["tests/test_edge_agent_capability_registry.py"],"state_root":null,"auth_root":null},
+    {"id":"harness-memory","manifest":"harness-memory/SKILL.md","category":"operations","status":"active","runtime_consumers":["debugging and retry workflows"],"tests":["harness-memory/tests/test_harness_memory.py"],"state_root":"~/.edge-agent/state/skills/harness-memory.json","auth_root":null},
+    {"id":"hermes_runtime","manifest":"hermes_runtime/SKILL.md","category":"operations","status":"active","runtime_consumers":["Hermes lifecycle workflows"],"tests":["hermes_runtime/tests/test_hermes_runtime_skill.py"],"state_root":"workspace Hermes ledger","auth_root":null},
+    {"id":"product_research","manifest":"product_research/SKILL.md","category":"domain","status":"active","runtime_consumers":["provider skill context"],"tests":["product_research/tests/"],"state_root":null,"auth_root":null},
+    {"id":"quota_resume","manifest":"quota_resume/SKILL.md","category":"operations","status":"active","runtime_consumers":["quota and resume workflows"],"tests":["quota_resume/tests/"],"state_root":"~/.edge-agent/state/skills/quota_resume.json","auth_root":null},
+    {"id":"roda-public-search","manifest":"roda_public_search/SKILL.md","category":"domain","status":"active","runtime_consumers":["Roda Gemma"],"tests":["tests/test_edge_agent_skill_connector.py"],"state_root":null,"auth_root":null}
+  ]
+}

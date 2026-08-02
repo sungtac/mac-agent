@@ -1,6 +1,6 @@
 # Edge Agent domain-skill integration contract
 
-This directory is the migration boundary for OpenClaw domain skills.
+This directory is the migration boundary for former OpenClaw domain skills.
 
 ## Portable candidates
 
@@ -12,8 +12,8 @@ This directory is the migration boundary for OpenClaw domain skills.
 
 ## Rules
 
-1. A domain skill may not import OpenClaw modules or write under
-   `.openclaw/workspace`.
+1. A domain skill may not import OpenClaw modules or write to retired OpenClaw
+   paths; active state belongs under the Edge Agent runtime contract.
 2. Persistent state uses the Edge Agent runtime state contract.
 3. External sends, deletions, account changes, and fallback switches remain
    user-review gated.

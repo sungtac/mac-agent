@@ -5,22 +5,23 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TELEGRAM_ROOT = Path.home() / ".openclaw" / "workspace"
+EDGE_WORKTREE = Path.home() / ".edge-agent-worktrees" / "telegram-bootstrap"
 
 
 class SharedChannelEnvironmentTests(unittest.TestCase):
-    def test_discord_uses_openclaw_workspace_as_free_chat_cwd(self):
+    def test_discord_uses_edge_agent_worktree_as_free_chat_cwd(self):
         source = (ROOT / "bin" / "discord-bot.py").read_text(encoding="utf-8")
-        self.assertIn("OPENCLAW_WORKSPACE", source)
-        self.assertIn("FREE_CHAT_CWD = OPENCLAW_WORKSPACE", source)
-        self.assertIn('"OPENCLAW_HOME": str(OPENCLAW_HOME)', source)
-        self.assertIn('"OPENCLAW_WORKSPACE": str(OPENCLAW_WORKSPACE)', source)
+        self.assertIn("EDGE_AGENT_WORKSPACE", source)
+        self.assertIn("FREE_CHAT_CWD = EDGE_AGENT_WORKSPACE", source)
+        self.assertIn('"EDGE_AGENT_HOME": str(EDGE_AGENT_HOME)', source)
+        self.assertIn('"EDGE_AGENT_WORKSPACE": str(EDGE_AGENT_WORKSPACE)', source)
+        self.assertNotIn('Path.home() / ".openclaw"', source)
 
-    def test_telegram_honors_the_same_workspace_environment_variable(self):
-        config = (TELEGRAM_ROOT / "sukja_telegram" / "config.py").read_text(encoding="utf-8")
-        runner = (TELEGRAM_ROOT / "sukja_telegram" / "telegram_runner.py").read_text(encoding="utf-8")
-        self.assertIn('os.environ.get("OPENCLAW_WORKSPACE"', config)
-        self.assertIn('os.environ.get("OPENCLAW_WORKSPACE"', runner)
+    def test_telegram_uses_the_edge_agent_worktree_by_default(self):
+        source = (ROOT / "bin" / "telegram-agent-bot.py").read_text(encoding="utf-8")
+        self.assertIn('TELEGRAM_AGENT_WORKSPACE', source)
+        self.assertIn('HOME / ".edge-agent-worktrees" / "telegram-bootstrap"', source)
+        self.assertEqual(EDGE_WORKTREE, Path.home() / ".edge-agent-worktrees" / "telegram-bootstrap")
 
 
 if __name__ == "__main__":

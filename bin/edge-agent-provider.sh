@@ -25,17 +25,27 @@ if [ -z "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_STARTED=1
 fi
 
+REQUEST_PROMPT="$(cat "$PROMPT_FILE")"
 CAPABILITY_PREFLIGHT_CONTEXT="$(python3 "$CAPABILITY_PREFLIGHT" --workdir "$WORKDIR" --format prompt 2>/dev/null || printf '%s' '[Capability-first preflight unavailable: treat capabilities as unknown and verify before declaring unavailable.]')"
-PROMPT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$(cat "$PROMPT_FILE")")"
-PROMPT="$CAPABILITY_PREFLIGHT_CONTEXT
+SKILL_CONTEXT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$REQUEST_PROMPT")"
+PROMPT="$CAPABILITY_PREFLIGHT_CONTEXT"
+if [ -n "$SKILL_CONTEXT" ]; then
+  PROMPT="$PROMPT
 
-$PROMPT"
+$SKILL_CONTEXT"
+fi
 if [ -n "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_CONTEXT="$(python3 "$SESSION_BRIDGE" context "$EDGE_AGENT_LOGICAL_SESSION_ID")"
-  PROMPT="$SESSION_CONTEXT\n\n[터미널 작업 요청]\n$(cat "$PROMPT_FILE")"
-else
-  PROMPT="$PROMPT\n\n[터미널 작업 요청]\n$(cat "$PROMPT_FILE")"
+  if [ -n "$SESSION_CONTEXT" ]; then
+    PROMPT="$PROMPT
+
+$SESSION_CONTEXT"
+  fi
 fi
+PROMPT="$PROMPT
+
+[터미널 작업 요청]
+$REQUEST_PROMPT"
 
 case "$PROVIDER" in
   claude)

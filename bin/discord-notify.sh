@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Posts a one-off message to the configured Discord channel via the bot's
+# Legacy compatibility shim for the retired Discord notification channel.
+# It intentionally does not send messages after Discord retirement.
+# The old implementation posted a one-off message to the configured Discord channel via the bot's
 # REST API (no Gateway connection needed — this doesn't require the
 # discord-bot.py process to be running). Used by other scripts
-# (weekly-report.sh, work-log-stop-check.sh, verify-task-v2.js) to push
+# (weekly-report.sh, work-log-stop-check.sh, verify-task-orchestrator.py) to push
 # escalation/failure notifications one-way, Mac → Discord.
 #
 # Usage: discord-notify.sh "message text"
@@ -20,6 +22,9 @@ set -uo pipefail
 
 CONFIG="$HOME/.claude/discord-bot/config.json"
 MESSAGE="${1:?usage: discord-notify.sh <message>}"
+
+echo "discord-notify: Discord is retired; notification suppressed" >&2
+exit 0
 
 if [ ! -f "$CONFIG" ]; then
   echo "discord-notify: config not found at $CONFIG, skipping" >&2

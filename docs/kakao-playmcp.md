@@ -1,5 +1,8 @@
 # kakao-playmcp (카카오톡 모닝 브리핑 — Play MCP 연동)
 
+상태 메모: 카카오톡 모닝 브리핑은 활성 기능이다. 다만 실패 시 Discord로 보내던
+보조 알림 경로는 2026-08-02 퇴역했고, `discord-notify.sh`는 외부 전송 없이 종료한다.
+
 `cron/kakao-morning-briefing.sh` — 매일 09:00 `launchd`(`~/Library/LaunchAgents/com.macagent.kakao-morning-briefing.plist`, 레이블 `com.macagent.kakao-morning-briefing`, `Hour: 9, Minute: 0`, `Weekday` 키 없음=매일)로 실행. 오늘 구글캘린더 일정 + 오늘 날씨(기상청 단기예보, 광주광역시 격자좌표) + 뉴스 브리핑(종합/IT·AI/경제)을 카카오톡 "나에게 보내기"로 발송한다.
 
 ## 배경 — 왜 필요했나

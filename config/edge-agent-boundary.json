@@ -5,10 +5,11 @@
   "edge_agent_source_root": "/Users/edge_ai/mac-agent",
   "legacy_shared_workspace": "/Users/edge_ai/.openclaw/workspace",
   "legacy_workspace_policy": {
-    "mode": "quarantined_preserve_uncommitted",
+    "mode": "retired_removed",
     "active_provider_workloads": false,
     "write_authority": "none",
-    "owner_review_required_before_reactivation": true
+    "owner_review_required_before_reactivation": true,
+    "retirement_destination": "/Users/edge_ai/.Trash/openclaw-20260801"
   },
   "worktree_ownership_manifest": "/Users/edge_ai/.edge-agent-worktrees/OWNERSHIP.md",
   "protected_roots": [
@@ -19,11 +20,9 @@
   "direct_local_roda_workspace": "/Users/edge_ai/mac-agent",
   "runtime_services": {
     "telegram_claude": "com.macagent.telegram-claude",
-    "telegram_codex": "com.macagent.telegram-codex",
+    "telegram_codex": "com.multiagent.engine",
     "telegram_antigravity": "com.macagent.telegram-antigravity",
-    "telegram_roda_gemma": "com.macagent.telegram-roda-gemma",
-    "discord_claude": "com.macagent.discord-bot",
-    "discord_codex": "com.macagent.codex-bot"
+    "telegram_roda_gemma": "com.macagent.telegram-roda-gemma"
   },
   "policy": {
     "team_os_direct_write": "deny_at_provider_cli_boundary",

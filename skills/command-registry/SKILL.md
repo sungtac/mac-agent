@@ -23,8 +23,8 @@ Do **not** use this skill to execute commands. It only validates and records com
 ## required_tools
 
 - Python 3
-- `skills/command-registry/command_registry.py` (실행 경로는 OpenClaw workspace root 기준)
-- Local record file is created on demand under the workspace state directory.
+- `skills/command-registry/command_registry.py` (기본 상태 경로는 `~/.edge-agent/state/skills/`)
+- Local record file is created on demand under the Edge Agent state directory.
 
 ## inputs
 

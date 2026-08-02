@@ -26,7 +26,7 @@ except ImportError:  # system-Python test loader; launchd uses the repo bin path
 
 HOME = Path.home()
 STATE_FILE = Path(os.environ.get("RODA_GEMMA_HEALTH_STATE_FILE", "~/.edge-agent/state/telegram-health-monitor.json")).expanduser()
-TOKEN_FILE = Path(os.environ.get("RODA_GEMMA_TOKEN_FILE", "~/.config/roda-gemma/telegram.token")).expanduser()
+TOKEN_FILE = Path(os.environ.get("RODA_GEMMA_TOKEN_FILE", "~/.edge-agent/secrets/roda-gemma/telegram.token")).expanduser()
 POLL_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_POLL_SECONDS", "30"))
 NO_RESPONSE_SECONDS = int(os.environ.get("RODA_GEMMA_HEALTH_NO_RESPONSE_SECONDS", "300"))
 SERVICE_DOWN_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_SERVICE_DOWN_GRACE_SECONDS", "90"))
@@ -48,7 +48,17 @@ STATE_SCHEMA_VERSION = 3
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
-AUTO_REPAIR_ENABLED = os.environ.get("RODA_GEMMA_AUTO_REPAIR_ENABLED", "1") == "1"
+# Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
+# remain enabled without granting the health monitor commit/merge/restart
+# authority.  This default is deliberately fail-closed for a long-running
+# launchd service.
+AUTO_REPAIR_ENABLED = os.environ.get("RODA_GEMMA_AUTO_REPAIR_ENABLED", "0") == "1"
+AUTO_REPAIR_APPROVAL_FILE = Path(
+    os.environ.get(
+        "RODA_GEMMA_AUTO_REPAIR_APPROVAL_FILE",
+        "~/.edge-agent/state/roda-auto-repair-approvals.json",
+    )
+).expanduser()
 CODEX_BIN = Path(os.environ.get("RODA_GEMMA_CODEX_BIN", "/opt/homebrew/bin/codex"))
 SOURCE_REPO = Path(os.environ.get("RODA_GEMMA_CODEX_SOURCE_REPO", "~/mac-agent")).expanduser().resolve()
 DIAGNOSIS_ROOT = Path(os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ROOT", "~/.edge-agent-worktrees/health-diagnoses")).expanduser().resolve()
@@ -66,8 +76,8 @@ TARGETS = {
         "log": HOME / ".claude/hooks-state/telegram-claude/stderr.log",
     },
     "codex": {
-        "label": "com.macagent.telegram-codex",
-        "log": HOME / ".claude/hooks-state/telegram-codex/stderr.log",
+        "label": "com.multiagent.engine",
+        "log": HOME / ".edge-agent/state/multiagent-engine/stderr.log",
     },
     "antigravity": {
         "label": "com.macagent.telegram-antigravity",
@@ -713,6 +723,37 @@ def _planned_restart_active(role: str, *, now: float | None = None) -> bool:
         return False
 
 
+def _repair_approval_granted(event: dict, *, now: float | None = None) -> bool:
+    """Return True only for an explicit, unexpired, fingerprinted approval.
+
+    The approval file is intentionally separate from the health state file so
+    a provider failure cannot manufacture its own approval by mutating the
+    monitor's ordinary event state.  The file contains metadata only; it must
+    be created by an operator or a separately reviewed control plane.
+    """
+    fingerprint = str(event.get("fingerprint", "")).strip()
+    if not fingerprint or AUTO_REPAIR_APPROVAL_FILE.is_symlink() or not AUTO_REPAIR_APPROVAL_FILE.is_file():
+        return False
+    try:
+        if AUTO_REPAIR_APPROVAL_FILE.stat().st_mode & 0o077:
+            return False
+    except OSError:
+        return False
+    try:
+        payload = json.loads(AUTO_REPAIR_APPROVAL_FILE.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return False
+    approvals = payload.get("approvals", {}) if isinstance(payload, dict) else {}
+    approval = approvals.get(fingerprint) if isinstance(approvals, dict) else None
+    if not isinstance(approval, dict) or approval.get("approved") is not True:
+        return False
+    try:
+        expires_at = float(approval.get("expires_at", 0))
+    except (TypeError, ValueError):
+        return False
+    return expires_at > (time.time() if now is None else now)
+
+
 def _send_alert(text: str) -> None:
     if DRY_RUN:
         print(text)
@@ -743,6 +784,8 @@ def _run_codex_repair_impl(event: dict, state: dict) -> str:
     fingerprint = str(event["fingerprint"])
     if not AUTO_REPAIR_ENABLED:
         return "자동 복구가 비활성화되어 있습니다."
+    if not _repair_approval_granted(event):
+        return "자동 복구 승인 없음: fingerprint별 운영자 승인이 필요합니다."
     worktree = REPAIR_ROOT / fingerprint
     if not worktree.exists():
         REPAIR_ROOT.mkdir(parents=True, exist_ok=True)
@@ -824,7 +867,7 @@ def _run_codex_repair_impl(event: dict, state: dict) -> str:
 
 def _is_retryable_merge_failure(message: str) -> bool:
     return (
-        message.startswith("main에 추적 파일 변경이 있어")
+        message.startswith("main 작업공간이 깨끗하지 않아")
         or message.startswith("Codex 수정은 생성됐지만 main 병합에 실패했습니다")
     )
 
@@ -833,10 +876,25 @@ def _merge_repair_commit_and_restart(*, role: str, code: str, repair_commit: str
     integration = integration_lock(SOURCE_REPO) if integration_lock else contextlib.nullcontext()
     try:
         with integration:
-            source_status = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "status", "--porcelain"], capture_output=True, text=True, check=False).stdout.splitlines()
-            if any(line and not line.startswith("??") for line in source_status):
-                return "main에 추적 파일 변경이 있어 자동 병합하지 않았습니다."
-            source_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
+            status_result = subprocess.run(
+                ["/usr/bin/git", "-C", str(SOURCE_REPO), "status", "--porcelain"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if status_result.returncode != 0:
+                return "main 작업공간 상태를 확인하지 못해 자동 병합하지 않았습니다."
+            if status_result.stdout.splitlines():
+                return "main 작업공간이 깨끗하지 않아 자동 병합하지 않았습니다."
+            head_result = subprocess.run(
+                ["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if head_result.returncode != 0 or not head_result.stdout.strip():
+                return "main HEAD를 확인하지 못해 자동 병합하지 않았습니다."
+            source_head = head_result.stdout.strip()
             merge = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--no-ff", repair_commit, "-m", f"merge: automated Telegram health repair {fingerprint}"], capture_output=True, text=True, check=False)
             if merge.returncode != 0:
                 current_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
@@ -888,6 +946,15 @@ def _retry_pending_merges(state: dict) -> None:
                 _send_alert(f"[Codex 자동복구 대기열 만료]\n대상: {info.get('role')}\n\n{expiry_message}")
             except Exception as exc:
                 print(f"Roda pending-merge expiry alert delivery failed: {type(exc).__name__}: {exc}")
+            continue
+        if not _repair_approval_granted({
+            "role": info.get("role"),
+            "code": info.get("code"),
+            "fingerprint": fingerprint,
+        }):
+            # A queued commit must not become an implicit approval.  Keep it
+            # for explicit review until the fingerprinted approval expires or
+            # an operator removes the queue entry.
             continue
         result = _merge_repair_commit_and_restart(
             role=info["role"], code=info["code"], repair_commit=info["repair_commit"], fingerprint=fingerprint,

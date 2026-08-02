@@ -10,12 +10,26 @@ network configuration.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import os
 import shutil
 import subprocess
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+try:
+    from edge_agent_absence_guard import discover_local_sources
+except ModuleNotFoundError:  # direct import by the Python test loader
+    _guard_path = Path(__file__).with_name("edge_agent_absence_guard.py")
+    _guard_spec = importlib.util.spec_from_file_location("edge_agent_absence_guard", _guard_path)
+    if _guard_spec is None or _guard_spec.loader is None:
+        raise
+    _guard_module = importlib.util.module_from_spec(_guard_spec)
+    sys.modules[_guard_spec.name] = _guard_module
+    _guard_spec.loader.exec_module(_guard_module)
+    discover_local_sources = _guard_module.discover_local_sources
 
 
 @dataclass(frozen=True)
@@ -153,15 +167,29 @@ def collect(workdir: str | os.PathLike[str] | None = None) -> tuple[CapabilityOb
 
 def render_prompt(workdir: str | os.PathLike[str] | None = None) -> str:
     observations = collect(workdir)
+    discovery = discover_local_sources()
     lines = [
         "[Capability-first preflight: read-only observations]",
         "Treat unavailable as a conclusion only when the observation says unavailable; unknown means verify further.",
     ]
     lines.extend(f"- {item.capability}: {item.state} ({item.evidence})" for item in observations)
     lines.append(
+        "[Discovery evidence: environment names and bounded local configuration/service source inventory; secret values withheld]"
+    )
+    lines.append(json.dumps(discovery.as_dict(candidate_limit=40), ensure_ascii=False, separators=(",", ":")))
+    lines.append(
+        "A capability/configuration absence claim must include this discovery evidence or a new searched_scopes block. "
+        "Never convert a missing shell variable or one unsearched path into a global absence claim."
+    )
+    lines.append(
         "These observations do not grant authorization. Still check task scope, user approval, provider cost, "
         "secrets, destructive effects, and external communication before acting."
     )
+    try:
+        from edge_agent_peer_context import snapshot
+        lines.append(snapshot())
+    except (ImportError, OSError, ValueError, TypeError):
+        lines.append("[Peer coordination snapshot: unknown; peer state was not confirmed]")
     return "\n".join(lines)
 
 
