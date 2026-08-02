@@ -71,11 +71,19 @@ class ProviderPilotTests(unittest.TestCase):
             ok, detail = module._usage_gate("codex")
         self.assertFalse(ok)
         self.assertIn("not confirm", detail)
+        ok, detail = module._usage_gate("codex", allow_unmetered=True)
+        self.assertTrue(ok)
+        self.assertIn("explicit", detail)
 
         completed.stdout = "PROCEED - codex 5h창 잔여 N/A / 7d창 잔여 90%\n"
         with patch.object(module.subprocess, "run", return_value=completed):
             ok, _ = module._usage_gate("codex")
         self.assertTrue(ok)
+        completed.stdout = "SKIP: codex 7d창 잔여 4%\n"
+        with patch.object(module.subprocess, "run", return_value=completed):
+            ok, detail = module._usage_gate("codex", allow_unmetered=True)
+        self.assertFalse(ok)
+        self.assertIn("SKIP", detail)
         self.assertFalse(module._usage_gate("agy")[0])
         self.assertTrue(module._usage_gate("agy", allow_unmetered=True)[0])
 

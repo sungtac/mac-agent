@@ -65,6 +65,9 @@ python3 bin/edge_agent_provider_pilot.py \
 추가한다. 결과에는 provider 원문 대신 종료코드·출력 해시·변경 파일만 남는다.
 provider 출력은 메모리에 누적하지 않고 임시 파일에서 해시·바이트 수만 계산하며,
 실행 성공 판정에는 worktree 상태 확인과 `git diff --check` 통과도 포함된다.
+usage 조회가 실패해도 알려진 저사용량 차단은 유지된다. 정말 필요한 경우에만
+`--allow-unmetered-provider`를 추가해 “사용량 미확인” 상태를 명시적으로 인수한다.
+이 옵션은 `SKIP`로 확인된 저사용량을 우회하지 않는다.
 
 ## 2026-08-02 안전 경로 검증
 

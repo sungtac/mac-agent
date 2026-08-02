@@ -86,6 +86,8 @@ def _usage_gate(provider: str, *, allow_unmetered: bool = False) -> tuple[bool, 
     if not decision.startswith("PROCEED"):
         return False, decision or "usage preflight returned no decision"
     if "gate skipped" in lowered or "창 잔여" not in decision:
+        if allow_unmetered:
+            return True, "usage window was not readable; explicit --allow-unmetered-provider override"
         return False, "usage preflight did not confirm a readable provider window"
     return True, decision
 
@@ -191,7 +193,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--workdir", required=True)
     parser.add_argument("--execute", action="store_true", help="start the provider process")
     parser.add_argument("--confirm-live-provider", action="store_true", help="explicitly approve provider usage/cost")
-    parser.add_argument("--allow-unmetered-provider", action="store_true", help="explicitly allow Antigravity without a numeric usage gate")
+    parser.add_argument(
+        "--allow-unmetered-provider",
+        action="store_true",
+        help="explicitly allow execution when the provider usage window is unavailable (never overrides a known low quota)",
+    )
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
