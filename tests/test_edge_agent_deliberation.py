@@ -46,9 +46,27 @@ class DeliberationStoreTests(unittest.TestCase):
                 transcript = store._bus.transcript(session_id)
         result = payload["results"]["roda"]
         self.assertTrue(result["trusted"])
+        self.assertIn(f"{session_id}-roda-round-1", result["evidence_refs"])
         self.assertEqual(result["agent_message"]["key_id"], "agent-message-v1")
+        self.assertIn(f"{session_id}-roda-round-1", result["agent_message"]["evidence_refs"])
         self.assertEqual(transcript[0].from_role, "roda")
         self.assertIn("claude", transcript[0].to)
+
+    def test_render_records_recipient_delivery_ack(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 103)
+                store.start(session_id, "전달 증명")
+                store.record(session_id, "roda", status="completed", summary="peer 결과")
+                self.assertIn("bus_delivery=not_requested", store.render(session_id))
+                rendered = store.render(session_id, consumer_role="claude")
+                self.assertIn("bus_delivery=role=claude;claimed=1;acked=1", rendered)
+                item = store._bus._read(session_id)["messages"][0]
+                self.assertEqual(item["deliveries"]["claude"]["status"], "acked")
 
     def test_gemma_legacy_role_alias_is_normalized_to_roda(self):
         with tempfile.TemporaryDirectory() as directory:

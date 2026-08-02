@@ -195,10 +195,15 @@ class DeliberationStore:
             results = dict(payload.get("results") or {})
             max_rounds = max(1, min(DEFAULT_MAX_ROUNDS, int(payload.get("max_rounds", DEFAULT_MAX_ROUNDS))))
             current_round = max(1, min(max_rounds, int(round_number or payload.get("round", 1))))
+            source_event_id = f"{session_id}-{role}-round-{current_round}"
+            # A result must remain traceable even when a provider does not
+            # supply extra evidence references.  The signed source event is
+            # the minimum request-matched provenance anchor.
+            effective_evidence_refs = tuple(dict.fromkeys((*evidence_refs, source_event_id)))[:20]
             result = {
                 "status": status,
                 "summary": _bounded(summary),
-                "evidence_refs": list(evidence_refs)[:20],
+                "evidence_refs": list(effective_evidence_refs),
                 "recorded_epoch": time.time(),
                 "round": current_round,
             }
@@ -214,10 +219,10 @@ class DeliberationStore:
                     to=recipients or ("claude",),
                     purpose="deliberation_result",
                     summary=result["summary"],
-                    source_event_id=f"{session_id}-{role}-round-{current_round}",
+                    source_event_id=source_event_id,
                     key_id=self._message_key_id(),
                     signing_key=signing_key,
-                    evidence_refs=tuple(evidence_refs),
+                    evidence_refs=effective_evidence_refs,
                     round=current_round,
                 )
                 verify_message(envelope, signing_key, expected_key_id=self._message_key_id())
@@ -230,7 +235,7 @@ class DeliberationStore:
                 if not self._dedup.accept(envelope, signing_key, expected_key_id=self._message_key_id()):
                     return payload
             result["origin"] = "agent"
-            result["source_event_id"] = f"{session_id}-{role}-round-{current_round}"
+            result["source_event_id"] = source_event_id
             result["handled_by"] = [role]
             results[role] = result
             payload["results"] = results
@@ -304,7 +309,7 @@ class DeliberationStore:
             interval_seconds=interval_seconds,
         )
 
-    def render(self, session_id: str) -> str:
+    def render(self, session_id: str, *, consumer_role: str | None = None) -> str:
         payload = self.snapshot(session_id) or {}
         lines = [
             "[Deliberation barrier result: bounded shared evidence]",
@@ -317,6 +322,26 @@ class DeliberationStore:
                 lines.append(f"- {role}: status=not_observed; trusted=False; summary=검증된 결과 없음")
                 continue
             lines.append(f"- {role}: status={item.get('status', 'not_observed')}; trusted=True; summary={_bounded(item.get('summary', ''))}")
+        bus_ack_status = "not_requested"
+        if consumer_role in (payload.get("expected_roles") or EXPECTED_ROLES):
+            owner = f"render-{consumer_role}"
+            try:
+                claimed = self._bus.claim(
+                    consumer_role,
+                    session_id=session_id,
+                    owner=owner,
+                    limit=100,
+                )
+                acknowledged = 0
+                for item in claimed:
+                    if self._bus.acknowledge(session_id, str(item["message_id"]), owner=owner):
+                        acknowledged += 1
+                bus_ack_status = f"role={consumer_role};claimed={len(claimed)};acked={acknowledged}"
+            except MessageBusError:
+                # Rendering signed compatibility evidence must remain
+                # available even if an old or externally modified bus entry
+                # cannot be leased.  The status is visible to the caller.
+                bus_ack_status = f"role={consumer_role};ack_error"
         peer_messages = self._bus.transcript(session_id, include_acked=True, limit=24)
         if peer_messages:
             lines.append("[peer message bus transcript]")
@@ -325,6 +350,7 @@ class DeliberationStore:
                     f"- {message.from_role} -> {','.join(message.to)}; round={message.round}; "
                     f"purpose={message.purpose}; summary={_bounded(message.summary)}"
                 )
+        lines.append(f"bus_delivery={bus_ack_status}")
         lines.append(f"barrier_status={payload.get('status', 'not_observed')}; round={payload.get('round', 1)}")
         return "\n".join(lines)[:7200]
 
