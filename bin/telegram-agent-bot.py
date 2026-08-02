@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import fcntl
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -156,6 +157,59 @@ CLI = ROLES[ROLE]["binary"]
 ROLE_LABELS = {role: cfg["label"] for role, cfg in ROLES.items()}
 ROLE_USERNAMES = {role: cfg["username"] for role, cfg in ROLES.items()}
 ROLE_WAKE_WORDS = {role: cfg["wake_words"] for role, cfg in ROLES.items()}
+
+SHADOW_OBSERVER = None
+_SHADOW_IMPORT_ATTEMPTED = False
+_SHADOW_IMPORT_ERROR_REPORTED = False
+
+
+def _shadow_flag_enabled() -> bool:
+    return os.environ.get("EDGE_AGENT_SHADOW_OBSERVER_ENABLED", "").strip().casefold() in {
+        "1", "true", "yes", "on",
+    }
+
+
+def _get_shadow_observer():
+    """Load Shadow Mode only when explicitly enabled; never block legacy startup."""
+
+    global SHADOW_OBSERVER, _SHADOW_IMPORT_ATTEMPTED, _SHADOW_IMPORT_ERROR_REPORTED
+    if not _shadow_flag_enabled() or _SHADOW_IMPORT_ATTEMPTED:
+        return SHADOW_OBSERVER
+    _SHADOW_IMPORT_ATTEMPTED = True
+    try:
+        module = importlib.import_module("edge_agent_shadow_observer")
+        config = module.load_config()
+        if not config.enabled:
+            return None
+        observer = module.ShadowObserver(config)
+        if not observer.start():
+            return None
+        SHADOW_OBSERVER = observer
+        return SHADOW_OBSERVER
+    except Exception as exc:
+        if not _SHADOW_IMPORT_ERROR_REPORTED:
+            _SHADOW_IMPORT_ERROR_REPORTED = True
+            log(f"Shadow Observer 비활성화(legacy 계속): {type(exc).__name__}")
+        return None
+
+
+def _observe_shadow_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Best-effort ingress observation; never changes the legacy path."""
+
+    try:
+        observer = _get_shadow_observer()
+        if observer is None:
+            return
+        bot = getattr(context, "bot", None)
+        bot_id = getattr(bot, "id", None) or ROLE
+        observer.record_update(
+            update,
+            bot_id=bot_id,
+            bot_role=ROLE,
+            legacy_target=ROLE,
+        )
+    except Exception as exc:  # pragma: no cover - final fail-open boundary
+        log(f"Shadow Observer 오류(legacy 처리 계속): {type(exc).__name__}")
 
 # Telegram has one polling process per provider. These words are understood
 # by the independent Roda bot, so the three provider bots must stay silent
@@ -1558,6 +1612,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Username mismatch is checked once, hard, in _post_init (process exits
     # before ever reaching here if it's wrong) — no need to re-check per
     # message.
+    _observe_shadow_update(update, context)
     text = addressed_text(update)
     if text is None:
         return
@@ -2002,6 +2057,7 @@ def main() -> None:
     )
     application.add_handler(MessageHandler(filters.ALL, handle_message))
     application.add_error_handler(on_error)
+    _get_shadow_observer()
     application.run_polling(drop_pending_updates=False, allowed_updates=Update.ALL_TYPES)
     # run_polling() only returns once something (e.g. on_error's conflict-burst
     # handler) calls application.stop_running(). PTB's own stop_running()
@@ -2011,6 +2067,8 @@ def main() -> None:
     # silently defeating the whole point of restarting on a conflict burst.
     # os._exit guarantees the process actually ends so launchd's KeepAlive
     # is guaranteed to relaunch it, regardless of that possibility.
+    if SHADOW_OBSERVER is not None:
+        SHADOW_OBSERVER.stop()
     log("run_polling 종료 — 프로세스 재시작을 위해 종료합니다.")
     os._exit(1)
 
