@@ -14,6 +14,7 @@ from typing import Any, Mapping
 
 from edge_agent_secure_paths import ensure_private_directory, open_lock, read_text
 from edge_agent_agent_message import AgentMessageDedupStore, AgentMessageKeyring, build_message, load_signing_key, verify_message
+from edge_agent_message_bus import MessageBus, MessageBusError
 from edge_agent_ingress import classify as classify_ingress
 
 
@@ -59,6 +60,9 @@ class DeliberationStore:
         # the guard is backed by the shared deliberation root for cross-process
         # duplicate and loop suppression.
         self._dedup = AgentMessageDedupStore(self.root / ".agent-message-dedup.json")
+        # The result JSON remains a compatibility projection.  The durable
+        # bus is now the source of peer-message delivery and task lineage.
+        self._bus = MessageBus(self.root / "message-bus")
 
     def _path(self, session_id: str) -> Path:
         return self.root / f"{_safe_session(session_id)}.json"
@@ -130,12 +134,19 @@ class DeliberationStore:
                 "created_epoch": time.time(),
             }
             self._write(session_id, payload)
+            self._bus.create_session(session_id, str(request), max_rounds=3)
+            self._bus.spawn_task(
+                session_id,
+                session_id,
+                owner="claude",
+                purpose="deliberation_root",
+            )
             return payload
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def record(self, session_id: str, role: str, *, status: str, summary: str, evidence_refs: tuple[str, ...] = ()) -> dict[str, Any]:
+    def record(self, session_id: str, role: str, *, status: str, summary: str, evidence_refs: tuple[str, ...] = (), round_number: int | None = None) -> dict[str, Any]:
         if role == "gemma":
             role = "roda"
         if role not in EXPECTED_ROLES or status not in TERMINAL_STATUSES:
@@ -157,24 +168,27 @@ class DeliberationStore:
                     "created_epoch": time.time(),
                 }
             results = dict(payload.get("results") or {})
+            current_round = max(1, min(3, int(round_number or payload.get("round", 1))))
             result = {
                 "status": status,
                 "summary": _bounded(summary),
                 "evidence_refs": list(evidence_refs)[:20],
                 "recorded_epoch": time.time(),
+                "round": current_round,
             }
             signing_key = self._message_key()
             if signing_key is None:
                 raise ValueError("EDGE_AGENT_MESSAGE_KEY_FILE is required for deliberation results")
             if signing_key is not None:
+                recipients = tuple(item for item in payload.get("expected_roles", EXPECTED_ROLES) if item != role)
                 envelope = build_message(
                     session_id=session_id,
-                    task_id=session_id,
+                    task_id=f"{session_id}-{role}-r{current_round}",
                     from_role=role,
-                    to=("claude",),
+                    to=recipients or ("claude",),
                     purpose="deliberation_result",
                     summary=result["summary"],
-                    source_event_id=f"{session_id}-{role}-round-1",
+                    source_event_id=f"{session_id}-{role}-round-{current_round}",
                     key_id=self._message_key_id(),
                     signing_key=signing_key,
                     evidence_refs=tuple(evidence_refs),
@@ -182,15 +196,32 @@ class DeliberationStore:
                 verify_message(envelope, signing_key, expected_key_id=self._message_key_id())
                 result["agent_message"] = envelope.to_dict()
                 result["trusted"] = True
+                try:
+                    self._bus.publish(envelope, verification_key=signing_key, request=str(payload.get("request", "")))
+                except MessageBusError as exc:
+                    raise ValueError(f"deliberation message bus rejected result: {exc}") from exc
                 if not self._dedup.accept(envelope, signing_key, expected_key_id=self._message_key_id()):
                     return payload
             result["origin"] = "agent"
-            result["source_event_id"] = f"{session_id}-{role}-round-1"
+            result["source_event_id"] = f"{session_id}-{role}-round-{current_round}"
             result["handled_by"] = [role]
             results[role] = result
             payload["results"] = results
+            payload["round"] = max(int(payload.get("round", 1)), current_round)
+            try:
+                self._bus.update_task(session_id, session_id, "running", summary="peer results collecting")
+                if result.get("agent_message"):
+                    self._bus.update_task(session_id, str(result["agent_message"]["task_id"]), "completed", summary=result["summary"])
+            except MessageBusError:
+                # A legacy session may predate the bus projection.  The
+                # signed result remains durable in the compatibility store.
+                pass
             if all(str(results.get(item, {}).get("status")) in TERMINAL_STATUSES for item in payload["expected_roles"]):
                 payload["status"] = "barrier_ready"
+                try:
+                    self._bus.update_task(session_id, session_id, "completed", summary="all expected peer results collected")
+                except MessageBusError:
+                    pass
             self._write(session_id, payload)
             return payload
         finally:
@@ -223,6 +254,14 @@ class DeliberationStore:
                 lines.append(f"- {role}: status=not_observed; trusted=False; summary=검증된 결과 없음")
                 continue
             lines.append(f"- {role}: status={item.get('status', 'not_observed')}; trusted=True; summary={_bounded(item.get('summary', ''))}")
+        peer_messages = self._bus.transcript(session_id, include_acked=True, limit=24)
+        if peer_messages:
+            lines.append("[peer message bus transcript]")
+            for message in peer_messages:
+                lines.append(
+                    f"- {message.from_role} -> {','.join(message.to)}; round={message.round}; "
+                    f"purpose={message.purpose}; summary={_bounded(message.summary)}"
+                )
         lines.append(f"barrier_status={payload.get('status', 'not_observed')}; round={payload.get('round', 1)}")
         return "\n".join(lines)[:7200]
 

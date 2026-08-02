@@ -2,22 +2,28 @@
 """Inventory and safely prune Telegram task worktrees.
 
 The default is read-only.  Apply mode removes only registered, clean,
-terminal, unreferenced worktrees after the retention period.  Dirty or
-ambiguous worktrees are always preserved for manual review.
+terminal, unreferenced worktrees after the retention period.  Dirty worktrees
+require the explicit ``--archive-dirty`` option; they are archived outside
+the worktree before a forced reclaim.  Dirty or ambiguous worktrees are
+otherwise preserved for manual review.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import subprocess
+import tarfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from edge_agent_parallel_locks import repository_lifecycle_lock
+from edge_agent_reflection import read_worktree_metadata
 
 
 SOURCE_REPO = Path(
@@ -37,6 +43,9 @@ SESSION_ROOT = Path(
 ).expanduser().resolve()
 RETENTION_DAYS = max(1, int(os.environ.get("TELEGRAM_TASK_WORKTREE_RETENTION_DAYS", "7")))
 TERMINAL_STATES = {"succeeded", "failed", "cancelled"}
+ARCHIVE_ROOT = Path(
+    os.environ.get("EDGE_AGENT_WORKTREE_ARCHIVE_ROOT", str(Path.home() / ".edge-agent" / "worktree-archives"))
+).expanduser().resolve()
 
 
 def _registered_worktrees(source_repo: Path) -> set[Path]:
@@ -88,8 +97,8 @@ def _referenced_worktrees(plan_root: Path, session_root: Path) -> tuple[set[Path
 
 def _metadata(path: Path) -> dict[str, Any] | None:
     try:
-        payload = json.loads((path / ".edge-agent-task.json").read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload, _ = read_worktree_metadata(path)
+    except (OSError, UnicodeError, RuntimeError, json.JSONDecodeError):
         return None
     if payload.get("schema") != "edge_agent_worktree.v1":
         return None
@@ -152,6 +161,7 @@ def inventory(
                     "age_days": round(age_days, 2),
                     "registered_worktree": registered_state,
                     "dirty": dirty,
+                    "dirty_status": dirty_state,
                     "pending_approval": pending,
                     "active_session": active,
                     "eligible": eligible,
@@ -167,23 +177,85 @@ def inventory(
     }
 
 
-def prune(report: dict[str, Any], *, source_repo: Path = SOURCE_REPO, task_root: Path = TASK_ROOT) -> list[str]:
+def _archive_worktree(path: Path, item: dict[str, Any], *, archive_root: Path) -> Path:
+    """Create a recoverable audit archive before force-reclaiming a dirty tree."""
+    if not path.is_dir() or path.is_symlink():
+        raise RuntimeError("worktree archive target is not a real directory")
+    archive_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(archive_root, 0o700)
+    task_id = path.name
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()[:12]
+    archive = archive_root / f"{task_id}-{digest}-{int(time.time())}.tar.gz"
+    with tarfile.open(archive, "w:gz") as stream:
+        stream.add(path, arcname=path.name, recursive=True, filter=lambda info: None if ".git" in Path(info.name).parts else info)
+        manifest = json.dumps(
+            {
+                "schema": "edge_agent.worktree_archive.v1",
+                "source_path": str(path),
+                "task_id": task_id,
+                "status": item.get("status"),
+                "dirty": item.get("dirty"),
+                "archived_epoch": time.time(),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ).encode("utf-8")
+        info = tarfile.TarInfo(f"{path.name}/ARCHIVE-MANIFEST.json")
+        info.size = len(manifest)
+        info.mode = 0o600
+        stream.addfile(info, fileobj=io.BytesIO(manifest))
+    os.chmod(archive, 0o600)
+    return archive
+
+
+def prune(
+    report: dict[str, Any],
+    *,
+    source_repo: Path = SOURCE_REPO,
+    task_root: Path = TASK_ROOT,
+    archive_dirty: bool = False,
+    archive_root: Path = ARCHIVE_ROOT,
+) -> list[str]:
     removed: list[str] = []
     for item in report.get("items", []):
-        if not item.get("eligible"):
+        eligible = bool(item.get("eligible"))
+        dirty_archive_candidate = bool(
+            archive_dirty
+            and item.get("dirty")
+            and item.get("dirty_status") != "unavailable"
+            and item.get("status") in TERMINAL_STATES
+            and item.get("registered_worktree")
+            and not item.get("pending_approval")
+            and not item.get("active_session")
+            and float(item.get("age_days") or 0.0) >= float(report.get("retention_days") or RETENTION_DAYS)
+        )
+        if not eligible and not dirty_archive_candidate:
             continue
         path = Path(item["path"]).resolve()
         if path.parent != task_root or not path.is_dir():
             continue
+        if dirty_archive_candidate:
+            try:
+                archive = _archive_worktree(path, item, archive_root=archive_root)
+            except (OSError, RuntimeError, tarfile.TarError) as exc:
+                item["reclaim_error"] = type(exc).__name__
+                continue
         with repository_lifecycle_lock(source_repo):
+            command = "remove"
+            args = ["/usr/bin/git", "-C", str(source_repo), "worktree", command]
+            if dirty_archive_candidate:
+                args.append("--force")
+            args.append(str(path))
             result = subprocess.run(
-                ["/usr/bin/git", "-C", str(source_repo), "worktree", "remove", str(path)],
+                args,
                 capture_output=True,
                 text=True,
                 check=False,
             )
         if result.returncode == 0:
             removed.append(str(path))
+            if dirty_archive_candidate:
+                item["archive"] = str(archive)
     return removed
 
 
@@ -191,10 +263,15 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument(
+        "--archive-dirty",
+        action="store_true",
+        help="archive old unreferenced terminal dirty worktrees before force removal",
+    )
     args = parser.parse_args()
     report = inventory()
     if args.apply:
-        report["removed"] = prune(report)
+        report["removed"] = prune(report, archive_dirty=args.archive_dirty)
     if args.json:
         print(json.dumps(report, ensure_ascii=False, indent=2))
     else:

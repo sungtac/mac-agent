@@ -42,9 +42,12 @@ class DeliberationStoreTests(unittest.TestCase):
                 store.start(session_id, "논의 요청")
                 store.record(session_id, "roda", status="completed", summary="실행 의견")
                 payload = store.snapshot(session_id)
+                transcript = store._bus.transcript(session_id)
         result = payload["results"]["roda"]
         self.assertTrue(result["trusted"])
         self.assertEqual(result["agent_message"]["key_id"], "agent-message-v1")
+        self.assertEqual(transcript[0].from_role, "roda")
+        self.assertIn("claude", transcript[0].to)
 
     def test_gemma_legacy_role_alias_is_normalized_to_roda(self):
         with tempfile.TemporaryDirectory() as directory:

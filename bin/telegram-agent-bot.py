@@ -36,7 +36,7 @@ from edge_agent_locks import canonical_repository_root
 from edge_agent_capability_preflight import render_prompt
 from edge_agent_claim_store import ClaimStore, ClaimStoreError
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
-from edge_agent_reflection import update_worktree_metadata, write_reflection, write_worktree_metadata
+from edge_agent_reflection import read_worktree_metadata, update_worktree_metadata, write_reflection, write_worktree_metadata
 from edge_agent_telegram_delivery import (
     DeliveryStoreError,
     create_delivery,
@@ -460,9 +460,8 @@ async def _egress_send(chat_id: object, delivery_id: object, chunk_index: int, s
 def _update_task_worktree_status(status: str) -> None:
     if ACTIVE_TASK_WORKSPACE is None:
         return
-    metadata = ACTIVE_TASK_WORKSPACE / ".edge-agent-task.json"
     try:
-        payload = json.loads(read_text(metadata))
+        payload, _ = read_worktree_metadata(ACTIVE_TASK_WORKSPACE)
         update_worktree_metadata(
             ACTIVE_TASK_WORKSPACE,
             task_id=str(payload["task_id"]),
@@ -547,7 +546,7 @@ async def _handle_delivery_retry(message, context) -> None:
             and retry_workspace.parent == CODEX_TASK_WORKTREE_ROOT
         ):
             try:
-                metadata = json.loads(read_text(retry_workspace / ".edge-agent-task.json"))
+                metadata, _ = read_worktree_metadata(retry_workspace)
                 if (
                     metadata.get("schema") != "edge_agent_worktree.v1"
                     or str(metadata.get("role")) != ROLE
@@ -580,10 +579,9 @@ async def _create_task_worktree(task_id: str, *, on_wait=None) -> Path:
     target = CODEX_TASK_WORKTREE_ROOT / task_id
     reject_symlink_components(target)
     if target.exists():
-        metadata_path = target / ".edge-agent-task.json"
         try:
-            metadata = json.loads(read_text(metadata_path))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            metadata, _ = read_worktree_metadata(target)
+        except (OSError, UnicodeError, RuntimeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
                 f"기존 Telegram 작업 worktree의 소유권 메타데이터를 확인할 수 없습니다: {target}"
             ) from exc
@@ -1919,8 +1917,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 ensure_private_directory(CODEX_TASK_WORKTREE_ROOT)
                 if pending_plan is not None:
                     candidate = reject_symlink_components(Path(str(pending_plan.get("workspace", ""))).expanduser())
-                    metadata_path = candidate / ".edge-agent-task.json"
-                    metadata = json.loads(read_text(metadata_path))
+                    metadata, _ = read_worktree_metadata(candidate)
                     if (
                         candidate.parent != CODEX_TASK_WORKTREE_ROOT
                         or metadata.get("schema") != "edge_agent_worktree.v1"
