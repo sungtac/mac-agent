@@ -83,8 +83,8 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
         self.assertEqual(second.resolution.status, "resolved")
         self.assertIn("https://example.com/watch", second.prompt_block)
         self.assertNotIn("?v=private", second.prompt_block)
-        self.assertTrue(looks_like_anaphoric_reference("팩트체크 해줘", self.store.anchors(channel="telegram", chat_id="chat-1")))
-        self.assertFalse(looks_like_anaphoric_reference("안녕하세요", self.store.anchors(channel="telegram", chat_id="chat-1")))
+        self.assertTrue(looks_like_anaphoric_reference("팩트체크 해줘", self.store.anchors(channel="telegram", chat_id="chat-1", now="2026-08-01T08:47:00+00:00")))
+        self.assertFalse(looks_like_anaphoric_reference("안녕하세요", self.store.anchors(channel="telegram", chat_id="chat-1", now="2026-08-01T08:47:00+00:00")))
 
     def test_ttl_marks_stale_without_deleting_and_reply_overrides_ttl(self):
         self.store.prepare(
@@ -95,7 +95,7 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
             channel="telegram", chat_id="chat-1", text="팩트체크 해줘", now="2026-08-01T09:00:01+00:00",
         )
         self.assertEqual(stale.status, "stale")
-        self.assertEqual(len(self.store.anchors(channel="telegram", chat_id="chat-1")), 1)
+        self.assertEqual(len(self.store.anchors(channel="telegram", chat_id="chat-1", now="2026-08-01T09:00:01+00:00")), 1)
         replied = self.store.resolve_anchor(
             channel="telegram", chat_id="chat-1", text="확인해줘", reply_to_message_id=20,
             now="2026-08-01T09:00:02+00:00",
@@ -159,7 +159,7 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
             )
         with ThreadPoolExecutor(max_workers=8) as pool:
             self.assertTrue(all(pool.map(write, range(8))))
-        self.assertEqual(len(self.store.anchors(channel="telegram", chat_id="chat-lock")), 8)
+        self.assertEqual(len(self.store.anchors(channel="telegram", chat_id="chat-lock", now="2026-08-01T08:50:00+00:00")), 8)
 
     def test_chat_specific_native_paths_and_legacy_path(self):
         base = Path(self.tempdir.name) / "claude.json"
