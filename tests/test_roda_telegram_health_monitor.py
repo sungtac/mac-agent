@@ -79,6 +79,9 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(state["incidents"]["generic"]["status"], "superseded")
         self.assertEqual(state["incidents"]["auth-a"]["status"], "superseded")
         self.assertEqual(state["incidents"]["auth-b"]["status"], "superseded")
+        state["alerted"].pop(canonical)
+        remigrated = health._migrate_state(state)
+        self.assertEqual(remigrated["alerted"][canonical], 121)
 
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")

@@ -761,9 +761,18 @@ def _coalesce_specific_incidents(state: dict) -> None:
             "task_id": str(latest.get("task_id") or ""),
             "detail": str(latest.get("detail") or "")[:1000],
         })
+        related_alert_keys = {key for key, _ in matches}
+        related_alert_keys.update(
+            key
+            for key, item in incidents.items()
+            if isinstance(item, dict)
+            and item.get("code") == "auth_error"
+            and str(item.get("role")) == role
+            and canonical_id in str(item.get("resolution") or "")
+        )
         prior_alerts = [
             float(state.get("alerted", {}).get(key, 0) or 0)
-            for key, _ in matches
+            for key in related_alert_keys
             if state.get("alerted", {}).get(key) is not None
         ]
         if prior_alerts:
