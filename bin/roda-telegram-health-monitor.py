@@ -761,6 +761,13 @@ def _coalesce_specific_incidents(state: dict) -> None:
             "task_id": str(latest.get("task_id") or ""),
             "detail": str(latest.get("detail") or "")[:1000],
         })
+        prior_alerts = [
+            float(state.get("alerted", {}).get(key, 0) or 0)
+            for key, _ in matches
+            if state.get("alerted", {}).get(key) is not None
+        ]
+        if prior_alerts:
+            state.setdefault("alerted", {})[canonical_id] = max(prior_alerts)
         for key, item in matches:
             if key == canonical_id:
                 continue

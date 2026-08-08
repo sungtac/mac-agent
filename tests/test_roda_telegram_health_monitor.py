@@ -53,6 +53,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
     def test_migration_coalesces_auth_and_supersedes_recent_generic_error(self):
         state = health._migrate_state({
             "schema_version": 4,
+            "alerted": {"auth-a": 120, "auth-b": 121},
             "incidents": {
                 "generic": {
                     "incident_id": "generic", "role": "claude", "code": "execution_error",
@@ -74,6 +75,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(state["schema_version"], 5)
         self.assertEqual(state["incidents"][canonical]["status"], "open")
         self.assertEqual(state["incidents"][canonical]["detail"], "latest")
+        self.assertEqual(state["alerted"][canonical], 121)
         self.assertEqual(state["incidents"]["generic"]["status"], "superseded")
         self.assertEqual(state["incidents"]["auth-a"]["status"], "superseded")
         self.assertEqual(state["incidents"]["auth-b"]["status"], "superseded")
