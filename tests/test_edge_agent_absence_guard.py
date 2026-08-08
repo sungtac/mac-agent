@@ -42,6 +42,12 @@ class AbsenceGuardTests(unittest.TestCase):
             self.assertTrue(any(item.location == str(secret.resolve()) for item in evidence.candidate_sources))
             self.assertNotIn("must-not-be-read-or-rendered", encoded)
 
+    def test_unrelated_words_across_sentence_boundary_are_not_rejected(self):
+        result = MODULE.validate_provider_payload({
+            "plan": "\ubaa8\ud638\uc131: \uc5c6\uc74c. \uc694\uad6c\uc0ac\ud56d\uacfc \uc218\uc815 \uacbd\uacc4\uac00 \uba85\ud655\ud558\ub2e4.\n\ud30c\uc77c \uc18c\uc720\uad8c\uc740 coach.py\ub85c \uc81c\ud55c\ud55c\ub2e4.",
+        })
+        self.assertTrue(result["validated"])
+
     def test_scoped_absence_requires_complete_search(self):
         incomplete = MODULE.DiscoveryEvidence("x", ("environment",), (), (), False, "now")
         with self.assertRaises(MODULE.UnsupportedAbsenceClaim):

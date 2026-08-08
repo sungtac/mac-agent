@@ -74,6 +74,18 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaisesRegex(ControlPlaneError, "concurrency cap"):
             self.store.start_task("chat", "overflow")
 
+    def test_reconcile_closes_terminal_canonical_sessions(self):
+        self.store.start_task("chat", "task-1")
+        with tempfile.TemporaryDirectory() as sessions:
+            snapshot_dir = Path(sessions) / "snapshots"
+            snapshot_dir.mkdir(parents=True)
+            (snapshot_dir / "session-task-1.json").write_text(
+                '{"schema":"multiagent_engine.logical_session.v1","status":"failed"}',
+                encoding="utf-8",
+            )
+            self.assertEqual(self.store.reconcile_terminal_sessions(sessions), 1)
+        self.assertEqual(self.store.snapshot("chat")["tasks"]["task-1"]["status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()

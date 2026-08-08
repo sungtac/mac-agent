@@ -1,3 +1,5 @@
+import importlib.util
+import os
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -7,10 +9,34 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from edge_agent_deliberation import DeliberationStore, session_id_for_telegram  # noqa: E402
+from edge_agent_deliberation import DeliberationStore, session_id_for_telegram, should_publish_user_result  # noqa: E402
+
+BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
+_BOT_TOKEN_ROOT = tempfile.TemporaryDirectory()
+_BOT_TOKEN_FILE = Path(_BOT_TOKEN_ROOT.name) / "claude.token"
+_BOT_TOKEN_FILE.write_text("123456:unit-test-token", encoding="utf-8")
+_BOT_TOKEN_FILE.chmod(0o600)
+_BOT_RUNTIME_HOME_ROOT = tempfile.TemporaryDirectory()
+os.environ.setdefault("TELEGRAM_AGENT_ROLE", "claude")
+os.environ.setdefault("TELEGRAM_AGENT_CHAT_ID", "-1003952617795")
+os.environ.setdefault("TELEGRAM_AGENT_TOKEN_FILE", str(_BOT_TOKEN_FILE))
+_BOT_SPEC = importlib.util.spec_from_file_location(
+    "telegram_agent_bot_for_deliberation_tests", BIN_DIR / "telegram-agent-bot.py"
+)
+BOT_MODULE = importlib.util.module_from_spec(_BOT_SPEC)
+assert _BOT_SPEC and _BOT_SPEC.loader
+with patch.object(Path, "home", return_value=Path(_BOT_RUNTIME_HOME_ROOT.name)):
+    _BOT_SPEC.loader.exec_module(BOT_MODULE)
 
 
 class DeliberationStoreTests(unittest.TestCase):
+    def test_only_coordinator_publishes_a_deliberation_result(self):
+        self.assertTrue(should_publish_user_result("claude", "delib-1"))
+        self.assertFalse(should_publish_user_result("codex", "delib-1"))
+        self.assertFalse(should_publish_user_result("antigravity", "delib-1"))
+        self.assertFalse(should_publish_user_result("roda", "delib-1"))
+        self.assertTrue(should_publish_user_result("codex", None))
+
     def test_barrier_is_durable_and_ready_only_after_all_roles(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
@@ -123,6 +149,50 @@ class DeliberationStoreTests(unittest.TestCase):
                 store.record(session_id, "claude", status="failed", summary="provider usage limit", round_number=2)
                 self.assertEqual(store.round_state(session_id, 2), "failed")
                 self.assertNotEqual(store.snapshot(session_id)["status"], "barrier_ready")
+
+    def test_failed_claude_is_visible_for_codex_coordinator_takeover(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 105)
+                store.start(session_id, "fallback test")
+                store.record(session_id, "claude", status="failed", summary="provider failure")
+                store.record(session_id, "codex", status="completed", summary="codex evidence")
+                self.assertTrue(store.coordinator_failed(session_id, 1))
+
+
+    def test_barrier_timeout_message_lists_incomplete_roles_without_claiming_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                with patch.object(BOT_MODULE, "DeliberationStore", lambda *a, **k: DeliberationStore(directory)):
+                    store = DeliberationStore(directory)
+                    session_id = session_id_for_telegram("-1", 104)
+                    store.start(session_id, "3차 barrier 타임아웃")
+                    for role in ("claude", "codex", "antigravity"):
+                        store.record(session_id, role, status="completed", summary=f"{role} 1차")
+                    store.record(session_id, "roda", status="completed", summary="roda 1차")
+                    for role in ("claude", "codex", "antigravity", "roda"):
+                        store.record(session_id, role, status="completed", summary=f"{role} 2차", round_number=2)
+                    # codex only reaches round 3; antigravity and roda never complete it.
+                    store.record(session_id, "claude", status="completed", summary="claude 최종", round_number=3)
+                    store.record(session_id, "codex", status="failed", summary="usage limit", round_number=3)
+
+                    with self.assertRaises(RuntimeError):
+                        BOT_MODULE._require_deliberation_round(session_id, 3, timeout_seconds=0)
+
+                    message = BOT_MODULE._deliberation_barrier_timeout_message(
+                        session_id, 3, RuntimeError("deliberation round 3 barrier timeout")
+                    )
+                    self.assertIn("antigravity", message)
+                    self.assertIn("roda", message)
+                    self.assertIn("codex", message)
+                    self.assertIn("완료한 것으로 처리하지 않았습니다", message)
 
 
 if __name__ == "__main__":

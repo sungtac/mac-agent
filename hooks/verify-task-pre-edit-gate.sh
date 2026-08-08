@@ -2,6 +2,14 @@
 # PreToolUse(Edit|Write) gate for the main Claude session.
 # Internal subagents are allowed to write their isolated temporary artifacts;
 # the outer session must have a successful verify-task-v2 result first.
+#
+# Fast-path (2026-08-08): a short allowlist of personal shell dotfiles
+# directly under $HOME, when $HOME is not itself a git work tree, skips the
+# heavy multi-model verify-task-orchestrator and instead takes a timestamped
+# backup + lets the edit through immediately. hooks/verify-task-dotfile-fastpath-check.sh
+# (PostToolUse) then syntax-checks the result and auto-restores the backup on
+# failure. Anything inside a git repo (including this repo) still requires
+# the full gate below.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -12,6 +20,7 @@ INPUT="$(cat)"
 SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
 AGENT_ID="$(printf '%s' "$INPUT" | jq -r '.agent_id // empty' 2>/dev/null)"
+FILE_PATH="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
 
 # Claude may report a temporary-directory path through a symlink (for example
 # /tmp vs /private/tmp on macOS), while the host orchestrator records the
@@ -25,6 +34,21 @@ fi
 # Claude Code runs session hooks inside subagents as well.  Without this
 # bypass, verify-task-v2's own temporary Write operations deadlock the gate.
 [ -n "$AGENT_ID" ] && exit 0
+
+# --- Fast-path: personal shell dotfiles, outside any git repo -------------
+DOTFILE_FASTPATH_RE='^'"${HOME}"'/\.(zshenv|zshrc|zprofile|bashrc|bash_profile)$'
+if [ -n "$FILE_PATH" ] && [[ "$FILE_PATH" =~ $DOTFILE_FASTPATH_RE ]]; then
+  if ! git -C "$HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    BACKUP_DIR="$HOME/.claude/hooks-state/dotfile-fastpath-backups"
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    if [ -f "$FILE_PATH" ]; then
+      cp -p "$FILE_PATH" "$BACKUP_DIR/$(basename "$FILE_PATH").$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+    fi
+    exit 0
+  fi
+fi
+# ---------------------------------------------------------------------------
+
 if [ -z "$SESSION_ID" ] || [ -z "$CWD" ]; then
   jq -n ' {
     hookSpecificOutput: {

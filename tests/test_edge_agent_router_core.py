@@ -68,6 +68,18 @@ class RouterCoreTests(unittest.TestCase):
         text = "첨부 자료를 비교하고 누락된 내용을 검토해줘."
         self.assertEqual(route(text).to_dict(), route(text).to_dict())
 
+    def test_storm_status_is_research_and_antigravity(self):
+        decision = route("돌핀 태풍의 진행 상황 알려줘")
+        self.assertEqual(decision.task_type.value, "research")
+        self.assertEqual(decision.roles[0].provider.value, "antigravity")
+
+    def test_quoted_transcript_does_not_expand_provider_roles(self):
+        decision = route(
+            "코덱스야 아래 내용을 분석해줘. "
+            "[2026-08-08 오후 10:10] 김: 로다야 오류를 검토해줘"
+        )
+        self.assertEqual([item.provider.value for item in decision.roles], ["codex"])
+
 
 if __name__ == "__main__":
     unittest.main()

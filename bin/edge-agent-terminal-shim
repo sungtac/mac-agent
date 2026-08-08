@@ -4,6 +4,8 @@ set -euo pipefail
 ROLE="${EDGE_AGENT_SHIM_ROLE:-$(basename "$0")}"
 ROOT="${EDGE_AGENT_ROOT:-$HOME/mac-agent}"
 PYTHON="${EDGE_AGENT_PYTHON:-/opt/homebrew/bin/python3}"
+CHANNEL_RUNTIME="$ROOT/bin/edge_agent_channel_runtime.py"
+SANDBOX="$ROOT/bin/edge-agent-provider-sandbox.sh"
 REAL=""
 case "$ROLE" in
   claude) REAL="${CLAUDE_REAL_BIN:-$HOME/.local/bin/claude}" ;;
@@ -48,6 +50,7 @@ CONTEXT=""
 if [ -n "$SESSION_ID" ]; then
   CONTEXT="$("$PYTHON" "$ROOT/bin/edge_agent_session_bridge.py" context "$SESSION_ID")"
 fi
+CONTEXT="$("$PYTHON" "$CHANNEL_RUNTIME" render --provider "$ROLE" --channel terminal --workdir "$PWD" --session-context "$CONTEXT")"
 
 set +e
 case "$ROLE" in
@@ -62,17 +65,31 @@ case "$ROLE" in
         "$REAL" "$@"
         ;;
       *)
-        "$REAL" "$@" --append-system-prompt "$CONTEXT"
+        "$SANDBOX" "$REAL" "$@" --append-system-prompt "$CONTEXT"
         ;;
     esac
     RC=$?
     ;;
-  codex)
-    "$REAL" "$@" "$CONTEXT"
+codex)
+    codex_pass_through=0
+    for codex_arg in "$@"; do
+      case "$codex_arg" in
+        --) break ;;
+        login|logout|mcp|mcp-server|app-server|plugin|remote-control|app|completion|update|help|--help|-h|--version|-V)
+          codex_pass_through=1
+          break
+          ;;
+      esac
+    done
+    if [ "$codex_pass_through" -eq 1 ]; then
+      "$SANDBOX" "$REAL" "$@"
+    else
+      "$SANDBOX" "$REAL" "$@" "$CONTEXT"
+    fi
     RC=$?
     ;;
-  agy)
-    "$REAL" "$@" --prompt-interactive "$CONTEXT"
+agy)
+    "$SANDBOX" "$REAL" "$@" --prompt-interactive "$CONTEXT"
     RC=$?
     ;;
   *)

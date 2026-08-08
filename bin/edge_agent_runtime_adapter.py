@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Mapping
 
-from edge_agent_context_budget import ContextBudget, bound_text, budget_for
+from edge_agent_context_budget import ContextBudget, bound_text, budget_for, compress_sections
 from edge_agent_efficiency_events import EfficiencyEvent, EfficiencyStore
 from edge_agent_execution_profile import ExecutionKind, ExecutionProfile, Provider, choose_profile, provider_args
 from edge_agent_minimality import MinimalityMode, MinimalityReview, review_for
@@ -114,16 +114,14 @@ class RuntimeEfficiencyAdapter:
         )
 
         if self.mode == EfficiencyMode.ENFORCE:
-            bounded_prompt = bound_text(original, budget.max_context_chars)
-            remaining = max(0, budget.max_context_chars - len(bounded_prompt))
-            bounded_context = bound_text(context, remaining) if context and remaining else ""
-            remaining -= len(bounded_context)
-            skill_block = bound_text(skills.context, remaining) if skills.context and remaining else ""
-            sections = [part for part in (bounded_context, skill_block, f"[사용자 요청]\n{bounded_prompt}") if part]
-            # Section labels and separators consume budget too. The final
-            # bound is required after composition; keep the tail so the
-            # request itself survives if the envelope is exactly full.
-            rendered = bound_text("\n\n".join(sections), budget.max_context_chars, tail=True)
+            rendered = compress_sections(
+                (
+                    ("context", context, 2),
+                    ("skills", skills.context, 1),
+                    ("사용자 요청", original, 5),
+                ),
+                budget.max_context_chars,
+            )
         else:
             rendered = original
 

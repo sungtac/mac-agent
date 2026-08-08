@@ -147,6 +147,11 @@ Team OS와의 충돌을 막고, 나노 작업·락·전역 상태·provider 실�
 - 현재 저장소의 기존 파일럿 worktree는 새 매니페스트가 없고 병합 가능한 변경도
   없어 자동 병합하지 않았다. Telegram·Discord·launchd에는 아직 연결하지 않았다.
 
+2026-08-03 정합성 보정: 위 historical 구현 설명은 당시 상태를 보존한다. 현재
+`ParallelPipeline`의 `automatic_merge=True` 경로는 `approval_ref`와
+`approval_checker`가 모두 유효하게 승인해야 하며, 그렇지 않으면 provider 시작
+전에 `ParallelApprovalRequired`로 차단한다.
+
 ## 15. 남은 작업 진행 결과 (2026-07-31)
 
 - **동시성 계약 검증 완료:** `test_non_overlapping_tasks_execute_concurrently_when_explicitly_enabled`로

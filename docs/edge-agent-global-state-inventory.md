@@ -33,7 +33,7 @@
 | `~/.claude/hooks-state/session-cost-gate-nag/` | 비용 게이트 Stop hook | 세션별 marker | 비용 게이트 판정과 혼동하지 않도록 분리 |
 | `~/.claude/hooks-state/usage-routing-nag/` | 라우팅 점검 hook | 세션별 marker | 라우팅 감사용, provider 상태 원장이 아님 |
 | `~/.claude/discord-bot/pending/` | 퇴역 Discord 재시도 workflow | 재시도 작업 JSON | 1개 보존 중; 삭제·이동하지 않고 수동 보존 검토 |
-| `~/.claude/nano-gate-events.jsonl` | nano event store | 전역 이벤트 원장 | 현재 파일 부재 확인; 생성 시 원자 append·idempotency 필요 |
+| `~/.claude/nano-gate-events.jsonl` | nano event store | 전역 이벤트 원장 | 현재 파일은 존재하지만 0바이트; 첫 기록 시 원자 append·idempotency 필요 |
 | `~/.claude/verify-task-v2-history.jsonl` | verify-task-v2 workflow | 검증 이력 | worktree별 분리 또는 append lock 필요 |
 | `~/.claude/provider-usage-snapshots.jsonl` | usage snapshot helper | provider 잔여량 관측 이력 | provider 호출과 분리된 로컬 관측 원장 |
 

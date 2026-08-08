@@ -24,6 +24,36 @@ def load(name: str, filename: str, **env):
 
 
 class PeerCoordinationTests(unittest.TestCase):
+    def test_roda_hardens_launchd_logs_before_token_checks(self):
+        source = (BIN / "roda-gemma-bot.py").read_text(encoding="utf-8")
+        main_offset = source.index("def main()")
+        self.assertLess(source.index("_harden_log_permissions()", main_offset), source.index("TOKEN_FILE.is_file", main_offset))
+
+    def test_roda_can_render_unresolved_health_incidents(self):
+        token_root = tempfile.TemporaryDirectory()
+        token = Path(token_root.name) / "telegram.token"
+        token.write_text("123456:test-token", encoding="utf-8")
+        token.chmod(0o600)
+        try:
+            roda = load(
+                "incident_query_roda",
+                "roda-gemma-bot.py",
+                RODA_GEMMA_TOKEN_FILE=str(token),
+            )
+            with tempfile.TemporaryDirectory() as directory:
+                state = Path(directory) / "health.json"
+                state.write_text(
+                    '{"incidents":{"inc-1":{"incident_id":"inc-1","role":"codex","code":"no_response","status":"open","task_id":"task-1","last_seen_at":2},"inc-2":{"incident_id":"inc-2","role":"claude","code":"execution_error","status":"resolved","last_seen_at":1}}}',
+                    encoding="utf-8",
+                )
+                rendered = roda._render_unresolved_incidents(state)
+            self.assertTrue(roda._is_unresolved_incident_query("지금까지 해결되지 않은 모든 오류를 알려줘"))
+            self.assertIn("미해결 장애는 1건", rendered)
+            self.assertIn("task=task-1", rendered)
+            self.assertNotIn("execution_error", rendered)
+        finally:
+            token_root.cleanup()
+
     def test_current_status_query_does_not_follow_expired_topic_anchor(self):
         from edge_agent_context_envelope import ContextEnvelopeStore
 
@@ -97,9 +127,9 @@ class PeerCoordinationTests(unittest.TestCase):
             roles = bot._wake_roles(text)
             self.assertEqual(bot._message_route(text, roles), "coordination")
             self.assertEqual(roda._strip_group_mention(text), "안티랑 왜 안해?")
-            # Plain group messages are room-wide; direct addresses remain
-            # exclusive and are handled by the shared ingress contract.
-            self.assertEqual(roda._strip_group_mention("canary"), "canary")
+            # Ordinary group messages belong to Codex, the canonical intake
+            # role; Roda only receives explicit/broadcast addresses.
+            self.assertIsNone(roda._strip_group_mention("canary"))
             self.assertIsNone(roda._strip_group_mention("/status@edgeai_stk_bot"))
             self.assertEqual(roda._strip_group_mention("/status@sukja_hwpx_helper_bot"), "/status")
             self.assertEqual(bot._message_route("로다야 코덱스 오류 안잡고 머해?"), "external")

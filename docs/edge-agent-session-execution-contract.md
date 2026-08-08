@@ -24,5 +24,6 @@
 - lease 획득 실패 시 provider를 실행하지 않는다.
 - task 또는 base commit이 다르면 worktree를 만들지 않는다.
 - provider 실패는 세션을 성공으로 바꾸지 않는다.
-- 자동 병합은 기본값이 아니며, 별도 opt-in이 필요하다.
+- 자동 병합은 기본값이 아니며, 사용 시 별도 opt-in과 승인 reference·검증기가
+  모두 필요하다. 승인 검증 실패는 provider 시작 전 fail-closed 한다.
 - 운영 Telegram·Discord·launchd에는 아직 연결하지 않는다.

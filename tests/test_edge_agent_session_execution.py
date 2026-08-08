@@ -110,6 +110,8 @@ class SessionParallelRunnerTests(unittest.TestCase):
             owner="terminal",
             parallel_enabled=True,
             automatic_merge=True,
+            approval_ref="approval-task-merge",
+            approval_checker=lambda ref, _spec: ref == "approval-task-merge",
         )
         self.assertEqual(result.pipeline.integration.status, "merged")
         self.assertEqual(result.session.status, SessionStatus.SUCCEEDED)

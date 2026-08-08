@@ -36,6 +36,26 @@ class AntigravityIdentityTests(unittest.TestCase):
         self.assertIn("[영구 아이덴티티 및 톤앤매너 규칙]", runtime_prompt)
         self.assertIn("Antigravity (안티)", runtime_prompt)
 
+    def test_shared_team_contract_is_injected(self):
+        runtime_prompt, _ = BOT_MODULE._runtime_prompt_parts("모두 자기 소개 부탁해")
+        self.assertIn("공통 Edge Agent Telegram 팀 계약", runtime_prompt)
+        self.assertIn("Claude", runtime_prompt)
+        self.assertIn("Codex", runtime_prompt)
+        self.assertIn("Roda", runtime_prompt)
+        self.assertIn("모두", runtime_prompt)
+
+    def test_headless_policy_blocks_unsandboxed_host_diagnostics(self):
+        runtime_prompt, _ = BOT_MODULE._runtime_prompt_parts("현재 다른 봇의 원인을 분석해줘")
+        self.assertIn("Antigravity 헤드리스 안전 실행 규칙", runtime_prompt)
+        self.assertIn("launchctl", runtime_prompt)
+        self.assertIn("unsandboxed", runtime_prompt)
+
+    def test_headless_permission_denial_is_classified(self):
+        self.assertTrue(BOT_MODULE._headless_permission_denied(
+            "jetski: no output produced — a tool required the unsandboxed permission that headless mode cannot prompt for"
+        ))
+        self.assertFalse(BOT_MODULE._headless_permission_denied("ordinary provider error"))
+
     def test_native_session_state_is_private_and_round_trips(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "claude-session.json"
@@ -78,7 +98,7 @@ class AntigravityIdentityTests(unittest.TestCase):
             return SimpleNamespace(effective_message=message, effective_chat=chat)
 
         with patch.object(BOT_MODULE, "ROLE", "claude"):
-            self.assertEqual(BOT_MODULE.addressed_text(update("안녕하세요")), "안녕하세요")
+            self.assertIsNone(BOT_MODULE.addressed_text(update("안녕하세요")))
             self.assertEqual(BOT_MODULE.addressed_text(update("각자 자기소개 해줘")), "각자 자기소개 해줘")
             self.assertIsNone(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")))
             self.assertIsNone(BOT_MODULE.addressed_text(update("로다야 안녕")))
@@ -87,7 +107,7 @@ class AntigravityIdentityTests(unittest.TestCase):
             self.assertEqual(BOT_MODULE.addressed_text(update("코덱스야 확인해줘")), "코덱스야 확인해줘")
             self.assertEqual(BOT_MODULE.addressed_text(update("각자 버그를 수정해줘")), "각자 버그를 수정해줘")
         with patch.object(BOT_MODULE, "ROLE", "antigravity"):
-            self.assertEqual(BOT_MODULE.addressed_text(update("안녕하세요")), "안녕하세요")
+            self.assertIsNone(BOT_MODULE.addressed_text(update("안녕하세요")))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ import edge_agent_parallel_executor as executor_module  # noqa: E402
 from edge_agent_parallel_integrator import ParallelIntegrator  # noqa: E402
 from edge_agent_parallel_audit import audit  # noqa: E402
 from edge_agent_parallel_pipeline import ParallelPipeline  # noqa: E402
+from edge_agent_parallel_pipeline import ParallelApprovalRequired  # noqa: E402
 from edge_agent_parallel_locks import FileReservation, ReservationConflict, reservation_is_stale  # noqa: E402
 from edge_agent_parallel_worktree import (  # noqa: E402
     ParallelTaskSpec,
@@ -39,7 +40,8 @@ class ParallelPipelineContractTests(unittest.TestCase):
         self._git("config", "user.name", "Edge Agent Test")
         (self.root / "a.txt").write_text("a\n", encoding="utf-8")
         (self.root / "b.txt").write_text("b\n", encoding="utf-8")
-        self._git("add", "a.txt", "b.txt")
+        (self.root / "c.txt").write_text("c\n", encoding="utf-8")
+        self._git("add", "a.txt", "b.txt", "c.txt")
         self._git("commit", "-qm", "baseline")
         self.base = self._git("rev-parse", "HEAD")
         self.state = Path(self.temp.name) / "state"
@@ -185,6 +187,29 @@ class ParallelPipelineContractTests(unittest.TestCase):
         self.assertEqual({result.changed_files for result in results}, {("a.txt",), ("b.txt",)})
         self.assertEqual({event["task_id"] for event in events}, {"parallel-a", "parallel-b"})
 
+    def test_three_non_overlapping_fake_providers_can_join_concurrently(self):
+        specs = (
+            self._spec("parallel-three-a", "a.txt"),
+            self._spec("parallel-three-b", "b.txt"),
+            self._spec("parallel-three-c", "c.txt"),
+        )
+        for spec in specs:
+            self.manager.create(spec)
+        rendezvous = Barrier(3)
+
+        def provider(worktree: Path, spec: ParallelTaskSpec) -> ProviderOutcome:
+            rendezvous.wait(timeout=5)
+            target = worktree / spec.declared_files[0]
+            target.write_text(f"{spec.task_id}\n", encoding="utf-8")
+            return ProviderOutcome(ok=True, verification={"provider": "fake-three-way"})
+
+        executor = ParallelExecutor(self.manager, parallel_enabled=True)
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(executor.execute, spec, provider) for spec in specs]
+            results = [future.result(timeout=10) for future in futures]
+        self.assertEqual([result.status for result in results], ["succeeded"] * 3)
+        self.assertEqual({result.changed_files for result in results}, {("a.txt",), ("b.txt",), ("c.txt",)})
+
     def test_read_only_audit_accepts_registered_worktree(self):
         spec = self._spec("audited", "a.txt")
         manifest = self.manager.create(spec)
@@ -246,6 +271,8 @@ class ParallelPipelineContractTests(unittest.TestCase):
             self.manager,
             parallel_enabled=True,
             automatic_merge=True,
+            approval_ref="approval-automatic",
+            approval_checker=lambda ref, _spec: ref == "approval-automatic",
         ).run(spec, provider)
         self.assertEqual(outcome.execution.status, "succeeded")
         self.assertIsNotNone(outcome.integration)
@@ -266,6 +293,8 @@ class ParallelPipelineContractTests(unittest.TestCase):
             self.manager,
             parallel_enabled=True,
             automatic_merge=True,
+            approval_ref="approval-dirty-target",
+            approval_checker=lambda ref, _spec: ref == "approval-dirty-target",
         ).run(spec, provider)
         self.assertEqual(outcome.execution.status, "succeeded")
         self.assertEqual(outcome.integration.status, "integration_blocked")
@@ -273,6 +302,19 @@ class ParallelPipelineContractTests(unittest.TestCase):
         self.assertEqual((self.root / "b.txt").read_text(), "user-change\n")
         self.assertEqual((self.root / "a.txt").read_text(), "a\n")
         self.assertTrue(Path(outcome.execution.worktree_path).exists())
+
+    def test_automatic_merge_requires_approval_before_provider_starts(self):
+        spec = self._spec("approval-required", "a.txt")
+        self.manager.create(spec)
+        started = []
+
+        def provider(_worktree: Path, _spec: ParallelTaskSpec) -> ProviderOutcome:
+            started.append(True)
+            return ProviderOutcome(ok=True)
+
+        with self.assertRaises(ParallelApprovalRequired):
+            ParallelPipeline(self.manager, parallel_enabled=True, automatic_merge=True).run(spec, provider)
+        self.assertEqual(started, [])
 
 
 if __name__ == "__main__":

@@ -121,14 +121,16 @@ lock은 canonical repository 기준이어야 한다. 경로 해시만으로 병�
 ## 10. 단계적 도입 순서
 
 1. manifest·conflict reservation·global writer 계약과 token-free 테스트 구현
-2. fake provider 두 개로 병렬 worktree pilot 수행
+2. fake provider 세 개로 병렬 worktree contract pilot 수행
 3. merge·rollback·orphan recovery를 별도 테스트
 4. 실제 provider 한 개의 worktree 실행을 직렬 mode로 검증
 5. 성공 표본과 운영 승인 후에만 제한된 병렬 pilot 검토
 
 token-free fake provider 기준의 실행·자동 merge 계약은 구현되어 있다. 운영에서
 자동 merge를 사용하려면 `ParallelPipeline(..., parallel_enabled=True,
-automatic_merge=True)`를 명시적으로 선택해야 한다. 이 모드에서도 대상 checkout이
-dirty하거나 provider 결과가 실패·범위 초과·diff 오류·충돌이면 병합하지 않고
-worktree와 상태를 보존한다. 기존 Telegram·Discord 라우팅과 launchd에는 아직
-연결하지 않는다.
+automatic_merge=True, approval_ref=..., approval_checker=...)`를 명시적으로
+선택해야 하며, 승인 reference 또는 검증기가 없거나 검증에 실패하면 provider
+시작 전에 `ParallelApprovalRequired`로 fail-closed 한다. 이 모드에서도 대상
+checkout이 dirty하거나 provider 결과가 실패·범위 초과·diff 오류·충돌이면
+병합하지 않고 worktree와 상태를 보존한다. 기존 Telegram·Discord 라우팅과
+launchd에는 아직 연결하지 않는다.

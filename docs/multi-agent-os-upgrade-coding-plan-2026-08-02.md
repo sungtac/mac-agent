@@ -23,7 +23,7 @@
 | peer conversation/delegation | barrier와 결과 envelope만 있고 dispatch/inbox/DAG가 없음 | `edge_agent_message_bus.py`, DeliberationStore bus 연결 | provider worker가 claim한 메시지로 후속 턴을 실행하는 dispatcher |
 | Telegram/terminal parity | adapter와 직접 bot에 실행 경로가 분리됨 | bus와 state 계약을 공통 모듈로 유지 | `CanonicalInput/OutputEnvelope` 단일 core로 추가 수렴 |
 | resilience/lifecycle | in-flight 복구 및 worktree 수거 기준이 약함 | durable bus journal, lease expiry, cancel cascade, 외부 metadata | SQLite/WAL 또는 동등한 event journal, crash E2E, dirty archive GC |
-| identity/provenance | 현재 HMAC key id는 무결성은 제공하지만 agent별 비대칭 identity는 아님 | 기존 HMAC 경계를 bus에서도 강제 | Ed25519 agent identity와 scoped capability token |
+| identity/provenance | 현재 HMAC key id는 무결성은 제공하지만 agent별 비대칭 identity는 아님 | HMAC compatibility와 opt-in Ed25519 identity, scoped capability token | 운영 키 발급·회전 정책을 별도 승인 |
 | token/budget | 문자열 bound와 사후 사용량 집계 중심 | bus round/message/task budget 강제 | 모델별 tokenizer, session cost circuit breaker |
 | observability/docs | 분산 인과관계가 파일 snapshot으로 흩어짐 | bus event journal과 task lineage | trace/span 전파와 문서 정합성 검사 |
 
@@ -48,20 +48,22 @@
 - [x] 기존 in-tree metadata fallback 유지
 - [x] dirty terminal worktree audit archive 후 reclaim command (`--archive-dirty` 명시 필요)
 - [x] durable dispatch checkpoints and recoverable checkpoint query
-- [ ] crash/restart checkpoint replay E2E with process termination
+- [x] crash/restart checkpoint replay E2E with process termination (`test_sigkill_recovery_reclaims_expired_lease_and_checkpoint`)
 
 ### P0-C — canonical parity
 
-- [ ] terminal과 Telegram이 동일한 `CanonicalInputEnvelope`를 사용
-- [ ] provider 실행/approval/control-plane을 하나의 core service로 수렴
-- [ ] 동일 입력에 대한 routing, authorization, artifact parity fixture
+- [x] terminal과 Telegram이 동일한 `CanonicalInputEnvelope`를 사용 (`orchestrator/schemas/envelope.py`, canonical adapter)
+- [x] provider 실행/approval/control-plane을 하나의 core service로 수렴 (core가 admission·provider usage boundary·output·control-plane/approval port를 소유하고 adapter는 transport만 담당)
+- [x] 동일 입력에 대한 routing, authorization, artifact parity fixture (`tests/test_envelope.py`)
 
 ### P1/P2
 
-- [ ] per-agent Ed25519 identity 및 scoped capability token
-- [ ] exact tokenizer/context compression/cost circuit breaker
-- [ ] distributed trace/span propagation
-- [ ] living architecture validation 및 역사적 모순 문서 정리
+- [x] opt-in per-agent Ed25519 identity와 AgentMessage 검증 (`edge_agent_ed25519_identity.py`; HMAC은 compatibility 기본값)
+- [x] context compression (priority-preserving opt-in runtime compression; model tokenizer exact count and budget circuit breaker in `state/usage.py`)
+- [x] distributed trace/span propagation (`edge_agent_trace.py`, signed peer message and bus event journal)
+- [x] 현재 구현과 운영 문서의 핵심 경로 정합성 검증 (전체 Python 회귀·canonical canary·control-plane recovery 0건)
+- [x] 역사적 모순 문서 정리 (`edge-agent-parallel-worktree-contract.md`의 자동 병합 조건 정정)
+- [ ] 운영 Ed25519 키 발급·회전 정책 승인 (`edge-agent-ed25519-key-lifecycle.md` 검토 필요)
 
 ## 완료 기준
 

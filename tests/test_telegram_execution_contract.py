@@ -20,6 +20,7 @@ from telegram.error import TelegramError
 ROOT = Path(__file__).resolve().parents[1]
 BIN = ROOT / "bin"
 sys.path.insert(0, str(BIN))
+from edge_agent_delegation import DelegationStore, delegation_id_for  # noqa: E402
 from edge_agent_telegram_delivery import create_delivery, load_delivery  # noqa: E402
 _ENV_KEYS = ("TELEGRAM_AGENT_ROLE", "TELEGRAM_AGENT_CHAT_ID", "TELEGRAM_AGENT_TOKEN_FILE")
 _ENV_SNAPSHOT = {key: os.environ.get(key) for key in _ENV_KEYS}
@@ -27,13 +28,15 @@ _TEST_TOKEN_ROOT = tempfile.TemporaryDirectory()
 _TEST_TOKEN_FILE = Path(_TEST_TOKEN_ROOT.name) / "claude.token"
 _TEST_TOKEN_FILE.write_text("123456:unit-test-token", encoding="utf-8")
 _TEST_TOKEN_FILE.chmod(0o600)
+_BOT_RUNTIME_HOME_ROOT = tempfile.TemporaryDirectory()
 os.environ["TELEGRAM_AGENT_ROLE"] = "claude"
 os.environ["TELEGRAM_AGENT_CHAT_ID"] = "-1003952617795"
 os.environ["TELEGRAM_AGENT_TOKEN_FILE"] = str(_TEST_TOKEN_FILE)
 SPEC = importlib.util.spec_from_file_location("telegram_agent_bot_execution_contract", BIN / "telegram-agent-bot.py")
 BOT = importlib.util.module_from_spec(SPEC)
 assert SPEC and SPEC.loader
-SPEC.loader.exec_module(BOT)
+with patch.object(Path, "home", return_value=Path(_BOT_RUNTIME_HOME_ROOT.name)):
+    SPEC.loader.exec_module(BOT)
 for _key, _value in _ENV_SNAPSHOT.items():
     if _value is None:
         os.environ.pop(_key, None)
@@ -81,6 +84,10 @@ def make_update(sent: FakeSent):
 
 
 class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_delegated_review_turn_limit_is_bounded(self):
+        self.assertGreaterEqual(BOT.CLAUDE_DELEGATED_REVIEW_MAX_TURNS, 2)
+        self.assertLessEqual(BOT.CLAUDE_DELEGATED_REVIEW_MAX_TURNS, 8)
+
     def setUp(self):
         self.delivery_root = tempfile.TemporaryDirectory()
 
@@ -168,6 +175,13 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('"--permission-mode", "acceptEdits"', source)
         self.assertIn('"--sandbox", "--mode", "accept-edits"', source)
 
+    def test_delegation_delivery_uses_defined_reply_chunker(self):
+        source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")
+        self.assertNotIn("for part in _split_message(answer)", source)
+        self.assertIn("for part in _reply_chunks(answer)", source)
+        chunks = BOT._reply_chunks("x" * (BOT.CHUNK_SIZE + 1))
+        self.assertEqual([len(chunk) for chunk in chunks], [BOT.CHUNK_SIZE, 1])
+
     def test_claude_session_limit_is_probed_with_a_fresh_nonpersistent_session(self):
         self.assertTrue(BOT._is_claude_session_local_failure("", "You've hit your session limit · resets 7pm"))
         self.assertFalse(BOT._is_claude_session_local_failure("", "account authentication failed"))
@@ -198,11 +212,82 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaisesRegex(RuntimeError, "다른 작업"):
                     await BOT._create_task_worktree("task-1")
 
+    async def test_antigravity_delegation_delivers_and_completes(self):
+        class FakeBot:
+            def __init__(self):
+                self.messages = []
+
+            async def send_message(self, **kwargs):
+                self.messages.append(kwargs)
+                return SimpleNamespace(message_id=len(self.messages))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = DelegationStore(directory)
+            delegation_id = delegation_id_for(root_task_id="telegram-test", target_role="antigravity")
+            payload = store.create(
+                delegation_id,
+                root_task_id="telegram-test",
+                source_role="codex",
+                target_role="antigravity",
+                chat_id="-100",
+                reply_to_message_id=7,
+                request="돌핀 태풍의 진행 상황 알려줘",
+                reason="공개 자료 조사",
+                acceptance_criteria="출처와 조회 시각 포함",
+            )
+            fake_bot = FakeBot()
+            application = SimpleNamespace(bot=fake_bot)
+            with patch.object(BOT, "DelegationStore", return_value=store), \
+                    patch.object(BOT, "ROLE", "antigravity"), \
+                    patch.object(BOT, "run_provider", new=AsyncMock(return_value="관측된 검색 결과")), \
+                    patch.object(BOT, "write_task_state"):
+                await BOT._process_delegation(application, payload)
+
+            result = store.snapshot(delegation_id)
+            self.assertEqual(result["status"], "completed")
+            self.assertEqual(result["response"], "관측된 검색 결과")
+            self.assertEqual(len(fake_bot.messages), 2)
+
     async def test_claude_coding_delegation_uses_independent_verification_loop(self):
         with patch.object(BOT, "codex_verify_and_revise", new=AsyncMock(return_value="verified")) as verify:
             result = await BOT.claude_delegates_to_codex("수정해줘", object(), chat_id="chat-1")
         verify.assert_awaited_once()
         self.assertIn("독립 검증한 결과", result)
+
+    async def test_verification_loop_calls_codex_explicitly_and_isolates_claude_review(self):
+        class ReplyMessage:
+            def __init__(self):
+                self.replies = []
+
+            async def reply_text(self, text):
+                self.replies.append(text)
+
+        message = ReplyMessage()
+        with tempfile.TemporaryDirectory() as directory:
+            task_root = Path(directory)
+            task_workspace = task_root / "task-1"
+            task_workspace.mkdir()
+            (task_workspace / ".edge-agent-task.json").write_text(json.dumps({
+                "schema": "edge_agent_worktree.v1",
+                "task_id": "task-1",
+                "role": "claude",
+            }), encoding="utf-8")
+            with patch.object(BOT, "ACTIVE_TASK_WORKSPACE", task_workspace), \
+                    patch.object(BOT, "CODEX_TASK_WORKTREE_ROOT", task_root), \
+                    patch.object(BOT, "run_provider_as", new=AsyncMock(return_value="codex changed the workspace")) as codex, \
+                    patch.object(BOT, "_run_cli", new=AsyncMock(side_effect=["RESULT: PASS", "RESULT: PASS"])) as reviewers, \
+                    patch.object(BOT, "CODEX_VERIFY_MAX_ROUNDS", 1), \
+                    patch.object(BOT, "CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS", 60), \
+                    patch.object(BOT, "CODEX_VERIFY_CALL_TIMEOUT_SECONDS", 30):
+                result = await BOT.codex_verify_and_revise("코드를 고쳐줘", message, chat_id="chat-1")
+
+        self.assertIn("검증 통과", result)
+        codex.assert_awaited_once()
+        self.assertEqual(codex.await_args.args[0], "codex")
+        self.assertEqual(reviewers.await_count, 2)
+        claude_kwargs = reviewers.await_args_list[0].kwargs
+        self.assertTrue(claude_kwargs["fresh_session"])
+        self.assertEqual(claude_kwargs["workspace_override"], str(task_workspace))
 
     async def test_delivery_failure_remains_handoff_ready(self):
         updates = []

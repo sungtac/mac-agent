@@ -32,8 +32,8 @@ from telegram.constants import ChatType, MessageEntityType
 from telegram.error import Conflict, NetworkError, RetryAfter, TelegramError
 from telegram.ext import Application, ContextTypes, MessageHandler, filters
 
+from agent_profile import render_agent_profile  # compatibility export; identity rendering is centralized below
 from edge_agent_locks import canonical_repository_root
-from edge_agent_capability_preflight import render_prompt
 from edge_agent_claim_store import ClaimStore, ClaimStoreError
 from edge_agent_plan_gate import clear_pending, is_approval, load_pending, save_pending
 from edge_agent_reflection import read_worktree_metadata, update_worktree_metadata, write_reflection, write_worktree_metadata
@@ -54,7 +54,13 @@ from edge_agent_context_envelope import (
     ContextPreparation,
     native_session_path,
 )
-from edge_agent_skill_connector import build_skill_context
+from edge_agent_channel_runtime import build_shared_context, render_identity
+from edge_agent_delegation import (
+    DelegationStore,
+    is_online_search_request,
+    public_search_capability_available,
+    public_search_unavailable_message,
+)
 from edge_agent_state import write_task_state
 from edge_agent_coordination import wait_for_peer_results
 from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_cancel_request
@@ -63,6 +69,7 @@ from edge_agent_deliberation import (
     configured_barrier_timeout_seconds,
     roles_for_request,
     session_id_for_telegram,
+    should_publish_user_result,
 )
 from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
 from weather_adapter import fetch_weather, is_weather_request
@@ -72,7 +79,6 @@ from edge_agent_router_core import route as deterministic_route
 from edge_agent_router_contract import RouterInput
 from edge_agent_secure_paths import ensure_private_directory, open_lock, read_text, reject_symlink_components
 from edge_agent_task_identity import child_task_id, cross_bot_message_key, root_task_id
-from agent_profile import render_agent_profile
 
 
 HOME = Path.home()
@@ -132,6 +138,15 @@ if not ALLOWED_CHAT_ID:
 REQUIRE_FULL_GROUP_INTAKE = os.environ.get("EDGE_AGENT_REQUIRE_FULL_GROUP_INTAKE", "1").strip().casefold() not in {"0", "false", "no", "off"}
 TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_TIMEOUT_SECONDS", "1800"))
 STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
+CLAUDE_NATIVE_MAX_TURNS = max(1, min(32, int(os.environ.get("TELEGRAM_AGENT_CLAUDE_NATIVE_MAX_TURNS", "8"))))
+CLAUDE_DELEGATED_REVIEW_MAX_TURNS = max(
+    2,
+    min(8, int(os.environ.get("TELEGRAM_AGENT_CLAUDE_DELEGATED_REVIEW_MAX_TURNS", "8"))),
+)
+CLAUDE_NATIVE_MAX_PROMPT_CHARS = max(
+    12000,
+    min(240000, int(os.environ.get("TELEGRAM_AGENT_CLAUDE_NATIVE_MAX_PROMPT_CHARS", "80000"))),
+)
 # Claude/Antigravity verify calls only have to read a diff and render a
 # verdict — not author code — so they get their own, much shorter timeout
 # than a full codex authoring run. Round-7 independent review (Codex +
@@ -139,7 +154,10 @@ STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
 # ~3h worst-case _BUSY_LOCK hold across 2 rounds; both agents independently
 # recommended cutting verify-call time specifically rather than the
 # authoring timeout (codex genuinely may need the full budget to code).
-CODEX_VERIFY_CALL_TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_CALL_TIMEOUT_SECONDS", "600"))
+CODEX_VERIFY_CALL_TIMEOUT_SECONDS = max(
+    30,
+    min(1800, int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_CALL_TIMEOUT_SECONDS", "600"))),
+)
 WORKTREE_LOCK_RETRIES = max(0, int(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRIES", "7")))
 WORKTREE_LOCK_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_RETRY_SECONDS", "1")))
 WORKTREE_LOCK_MAX_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_WORKTREE_LOCK_MAX_RETRY_SECONDS", "8")))
@@ -675,25 +693,89 @@ def _load_native_session_id(role: str, chat_id: str | int | None = None, workspa
     path = _native_session_path(role, chat_id)
     try:
         payload = json.loads(read_text(path))
+        if not isinstance(payload, dict):
+            return None
         value = str(payload.get("session_id", "")).strip()
         uuid.UUID(value)
+        selected_workspace = workspace or _provider_workspace(role)
+        if not _workspace_resume_valid(selected_workspace):
+            return None
+        if str(payload.get("provider")) != role:
+            return None
+        stored_workspace = str(payload.get("workspace", "")).strip()
+        if stored_workspace and stored_workspace != str(selected_workspace.resolve()):
+            return None
+        stored_identity = str(payload.get("workspace_identity", "")).strip()
+        if stored_identity and stored_identity != _workspace_identity(selected_workspace):
+            return None
         if chat_id is not None:
-            selected_workspace = workspace or _provider_workspace(role)
-            if not _workspace_resume_valid(selected_workspace):
-                return None
-            expected_workspace = str(selected_workspace.resolve())
             if str(payload.get("chat_id")) != str(chat_id):
-                return None
-            if str(payload.get("provider")) != role or str(payload.get("workspace")) != expected_workspace:
-                return None
-            if str(payload.get("workspace_identity")) != _workspace_identity(selected_workspace):
                 return None
         return value
     except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
         return None
 
 
-def _persist_native_session_id(role: str, session_id: str, chat_id: str | int | None = None, workspace: Path | None = None) -> None:
+def _load_native_session_record(
+    role: str,
+    chat_id: str | int | None = None,
+    workspace: Path | None = None,
+) -> dict[str, object] | None:
+    """Load the bounded native-session ledger used for Claude rotation."""
+    path = _native_session_path(role, chat_id)
+    try:
+        payload = json.loads(read_text(path))
+        if not isinstance(payload, dict):
+            return None
+        value = str(payload.get("session_id", "")).strip()
+        uuid.UUID(value)
+        selected_workspace = workspace or _provider_workspace(role)
+        if not _workspace_resume_valid(selected_workspace):
+            return None
+        if str(payload.get("provider")) != role:
+            return None
+        stored_workspace = str(payload.get("workspace", "")).strip()
+        if stored_workspace and stored_workspace != str(selected_workspace.resolve()):
+            return None
+        stored_identity = str(payload.get("workspace_identity", "")).strip()
+        if stored_identity and stored_identity != _workspace_identity(selected_workspace):
+            return None
+        if chat_id is not None:
+            if str(payload.get("chat_id")) != str(chat_id):
+                return None
+        return payload if isinstance(payload, dict) else None
+    except (FileNotFoundError, OSError, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _native_session_budget_exceeded(record: dict[str, object] | None, next_prompt_chars: int) -> bool:
+    """Fail closed when an old/unknown Claude session has no bounded ledger."""
+    if not record:
+        return False
+    try:
+        turns = int(record["turn_count"])
+        prompt_chars = int(record["prompt_chars"])
+    except (KeyError, TypeError, ValueError):
+        # Older session files cannot prove their context size. Rotate once so
+        # an already-large native session is not resumed indefinitely.
+        return True
+    return (
+        turns < 0
+        or prompt_chars < 0
+        or turns >= CLAUDE_NATIVE_MAX_TURNS
+        or prompt_chars + max(0, next_prompt_chars) > CLAUDE_NATIVE_MAX_PROMPT_CHARS
+    )
+
+
+def _persist_native_session_id(
+    role: str,
+    session_id: str,
+    chat_id: str | int | None = None,
+    workspace: Path | None = None,
+    *,
+    turn_count: int = 0,
+    prompt_chars: int = 0,
+) -> None:
     path = _native_session_path(role, chat_id)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -706,6 +788,8 @@ def _persist_native_session_id(role: str, session_id: str, chat_id: str | int | 
                     "schema": "edge_agent.telegram_native_session.v1",
                     "provider": role,
                     "session_id": session_id,
+                    "turn_count": max(0, int(turn_count)),
+                    "prompt_chars": max(0, int(prompt_chars)),
                     **({"chat_id": str(chat_id), "workspace": str((workspace or _provider_workspace(role)).resolve()), "workspace_identity": _workspace_identity(workspace or _provider_workspace(role))} if chat_id is not None else {}),
                 },
                 stream,
@@ -740,35 +824,46 @@ def _bounded_cli_diagnostic(stdout: str, stderr: str, limit: int = 1600) -> str:
 
 def _load_identity_and_tone(role: str) -> str:
     try:
-        return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{render_agent_profile(role)}\n\n"
+        return f"{render_identity(role)}\n\n"
     except (OSError, UnicodeError, ValueError, KeyError, TypeError) as exc:
         log(f"공통 agent profile 로드 실패(구형 fallback 없음): {type(exc).__name__}")
         raise RuntimeError("canonical agent profile을 불러오지 못했습니다") from exc
 
 
-def _runtime_prompt_parts(prompt: str) -> tuple[str, dict[str, str | int]]:
-    skill_context = build_skill_context(prompt)
-    skill_block = f"\n{skill_context}\n" if skill_context else ""
-    capability_block = f"\n{render_prompt(_provider_workspace(ROLE))}\n"
+def _headless_permission_denied(text: str) -> bool:
+    normalized = (text or "").casefold()
+    return (
+        "unsandboxed" in normalized
+        and ("headless" in normalized or "soft-den" in normalized or "permission" in normalized)
+    )
+
+
+def _runtime_prompt_parts(
+    prompt: str,
+    *,
+    role: str | None = None,
+    workspace: Path | None = None,
+) -> tuple[str, dict[str, str | int]]:
+    selected_role = role or ROLE
+    selected_workspace = workspace or _provider_workspace(selected_role)
     session_block = ""
     if ACTIVE_LOGICAL_SESSION_ID:
         try:
             session_block = f"\n{bounded_context(ACTIVE_LOGICAL_SESSION_ID)}\n"
         except (FileNotFoundError, ValueError) as exc:
             log(f"공유 세션 컨텍스트 로드 실패(계속 진행): {exc}")
-    identity_block = _load_identity_and_tone(ROLE)
-    context = (
-        f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
-        "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라.\n\n"
-        f"{identity_block}"
-        f"{capability_block}"
-        f"{skill_block}"
-        f"{session_block}"
+    context = build_shared_context(
+        prompt,
+        provider=selected_role,
+        workspace=selected_workspace,
+        session_context=session_block,
+        headless=True,
+        channel="telegram",
     )
     if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
         prepared = _EFFICIENCY_ADAPTER.prepare(
             prompt,
-            provider=ROLE,
+            provider=selected_role,
             context=context,
             # Existing portable skill connector remains the source of skill
             # text for this bot; the new policy controls only bounded input.
@@ -1235,16 +1330,35 @@ def _workspace_lock_path(resolved_path: str) -> Path:
     return _WORKSPACE_LOCK_DIR / f"{digest}.lock"
 
 
+def _validated_workspace_override(value: str) -> Path:
+    """Accept only the canonical Codex workspace or an owned task worktree."""
+    candidate = reject_symlink_components(Path(value).expanduser()).resolve()
+    if candidate == CODEX_WORKSPACE:
+        if not candidate.is_dir():
+            raise RuntimeError("허용된 Codex 작업공간이 존재하지 않습니다.")
+        return candidate
+    if candidate.parent != CODEX_TASK_WORKTREE_ROOT or not candidate.is_dir():
+        raise RuntimeError("위임 리뷰 작업공간이 허용된 Codex 작업공간과 일치하지 않습니다.")
+    metadata, _ = read_worktree_metadata(candidate)
+    if metadata.get("schema") != "edge_agent_worktree.v1" or not str(metadata.get("task_id") or "").strip():
+        raise RuntimeError("위임 리뷰 작업공간의 소유권 메타데이터가 유효하지 않습니다.")
+    if str(metadata.get("role") or "") not in {"claude", "codex"}:
+        raise RuntimeError("위임 리뷰 작업공간의 소유 역할이 허용되지 않습니다.")
+    return candidate
+
+
 @contextlib.asynccontextmanager
-async def acquire_workspace_lock(resolved_path: str, on_wait=None):
+async def acquire_workspace_lock(resolved_path: str, on_wait=None, *, wait_seconds: int | None = None):
+    wait_budget = float(WORKSPACE_LOCK_WAIT_SECONDS if wait_seconds is None else max(0, wait_seconds))
     try:
-        async with acquire_repo_lock(
-            resolved_path,
-            wait_seconds=WORKSPACE_LOCK_WAIT_SECONDS,
-            on_wait=on_wait,
-        ):
-            yield
-    except RepoLockBusy as exc:
+        async with asyncio.timeout(max(0.1, wait_budget)):
+            async with acquire_repo_lock(
+                resolved_path,
+                wait_seconds=max(1, int(wait_budget)),
+                on_wait=on_wait,
+            ):
+                yield
+    except (RepoLockBusy, TimeoutError) as exc:
         raise WorkspaceLockBusy(resolved_path) from exc
 
 
@@ -1258,19 +1372,29 @@ async def _run_cli(
     context_prompt: str | None = None,
     provider_text: str | None = None,
     chat_id: str | int | None = None,
+    fresh_session: bool = False,
+    workspace_override: str | None = None,
 ) -> str:
     timeout_seconds = timeout_seconds if timeout_seconds is not None else TIMEOUT_SECONDS
+    call_deadline = time.monotonic() + max(1, timeout_seconds)
     cli_path = ROLES[role]["binary"]
     if not cli_path.exists():
         raise RuntimeError(f"provider executable is missing: {cli_path}")
 
     provider_workspace = _provider_workspace(role)
+    if workspace_override:
+        provider_workspace = _validated_workspace_override(workspace_override)
     effective_prompt = provider_text if provider_text is not None else prompt
     if context_prompt:
         effective_prompt = f"{context_prompt}\n\n[provider request]\n{effective_prompt}"
-    runtime_prompt, runtime_options = _runtime_prompt_parts(effective_prompt)
+    runtime_prompt, runtime_options = _runtime_prompt_parts(
+        effective_prompt,
+        role=role,
+        workspace=provider_workspace,
+    )
     native_session_id: str | None = None
     native_session_is_new = False
+    native_session_record: dict[str, object] | None = None
 
     if role == "claude":
         # "--" isolates `prompt` as a pure positional argument. Without it, a
@@ -1279,21 +1403,44 @@ async def _run_cli(
         args = [
             str(cli_path), "-p",
         ]
-        native_session_id = _load_native_session_id(role, chat_id=chat_id, workspace=provider_workspace)
+        if not fresh_session:
+            native_session_record = _load_native_session_record(role, chat_id=chat_id, workspace=provider_workspace)
+        native_session_id = None if fresh_session else (str(native_session_record["session_id"]) if native_session_record else None)
+        if (
+            role == "claude"
+            and native_session_id
+            and not fresh_session
+            and _native_session_budget_exceeded(native_session_record, len(runtime_prompt))
+        ):
+            log(
+                "claude native session rotation: bounded ledger exceeded or was unavailable "
+                f"(max_turns={CLAUDE_NATIVE_MAX_TURNS}, max_prompt_chars={CLAUDE_NATIVE_MAX_PROMPT_CHARS})"
+            )
+            native_session_id = None
+            native_session_record = None
         native_session_is_new = native_session_id is None
         native_session_id = native_session_id or str(uuid.uuid4())
         args.extend(["--session-id" if native_session_is_new else "--resume", native_session_id])
+        if fresh_session:
+            # A delegated review is a bounded one-pass inspection.  Do not
+            # resume the room's long Claude conversation or spend turns on
+            # exploratory follow-ups. File-backed reviews still need enough
+            # turns to open the bounded snapshot and write the report.
+            args.extend(["--max-turns", str(CLAUDE_DELEGATED_REVIEW_MAX_TURNS)])
         if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
             if runtime_options.get("model") not in (None, "default"):
                 args.extend(["--model", str(runtime_options["model"])])
-            if runtime_options.get("max_turns") is not None:
+            if not fresh_session and runtime_options.get("max_turns") is not None:
                 args.extend(["--max-turns", str(runtime_options["max_turns"])])
+        # Claude is a verifier in the canonical workflow. Keep its normal
+        # permission state for ordinary work, while delegated verification is
+        # explicitly plan-only. The provider sandbox remains an independent
+        # path-boundary defence.
+        if fresh_session:
+            args.extend(["--permission-mode", "plan", "--output-format", "text"])
+        else:
+            args.extend(["--permission-mode", "acceptEdits", "--output-format", "text"])
         args.extend([
-            # Claude is a verifier in the canonical workflow.  Keep its
-            # non-interactive session in the normal permission state rather
-            # than bypassing every permission check.  The provider sandbox
-            # remains an independent path-boundary defence.
-            "--permission-mode", "acceptEdits", "--output-format", "text",
             "--append-system-prompt",
             f"너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라. 공통 운영 계약은 {RUNTIME_CONTRACT}에 있다.",
             "--", runtime_prompt,
@@ -1332,7 +1479,7 @@ async def _run_cli(
         # terminal boundary, while the wrapper protects Team OS paths.
         args = [str(cli_path), "--sandbox", "--mode", "accept-edits", "--print", runtime_prompt]
 
-    if role != "codex":
+    if role != "codex" and not workspace_override:
         provider_workspace = _provider_workspace(role)
 
     # The wrapper applies the protected Team OS path policy to the provider
@@ -1341,8 +1488,16 @@ async def _run_cli(
     args = [str(PROVIDER_SANDBOX), *provider_args]
 
     try:
-        async with acquire_workspace_lock(str(provider_workspace), on_wait=on_wait):
+        remaining_for_lock = max(1, int(call_deadline - time.monotonic()))
+        async with acquire_workspace_lock(
+            str(provider_workspace),
+            on_wait=on_wait,
+            wait_seconds=min(WORKSPACE_LOCK_WAIT_SECONDS, remaining_for_lock),
+        ):
             async def execute(command_args: list[str]) -> tuple[int, bytes, bytes]:
+                remaining = call_deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(f"{role} 호출 전체 시간 상한에 도달했습니다.")
                 proc = await asyncio.create_subprocess_exec(
                     *command_args,
                     cwd=str(provider_workspace),
@@ -1359,10 +1514,10 @@ async def _run_cli(
                 except ProcessLookupError:
                     pgid = proc.pid
                 try:
-                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=remaining)
                 except asyncio.TimeoutError:
                     await _terminate_process_group(proc, pgid)
-                    raise RuntimeError(f"{role} 실행 시간이 제한 시간({timeout_seconds}초)을 초과했습니다.")
+                    raise RuntimeError(f"{role} 실행 전체 시간이 제한 시간({timeout_seconds}초)을 초과했습니다.")
                 except BaseException:
                     # Covers asyncio.CancelledError (task cancellation — e.g.
                     # app shutdown mid-request; CancelledError is a
@@ -1376,7 +1531,7 @@ async def _run_cli(
             returncode, stdout, stderr = await execute(args)
             output = stdout.decode(errors="replace").strip()
             error = stderr.decode(errors="replace").strip()
-            native_session_persist = True
+            native_session_persist = not fresh_session
             if role == "claude" and returncode != 0 and _is_claude_session_local_failure(output, error):
                 # A resumable native session can be exhausted independently
                 # of the account. Probe a fresh, non-persistent session once
@@ -1429,15 +1584,42 @@ async def _run_cli(
             output = candidates[-1].strip()
 
     if not output:
+        if role == "antigravity" and _headless_permission_denied(error):
+            log("antigravity headless permission denied; refusing to request an unsandboxed allow-rule")
+            raise RuntimeError(
+                "Antigravity 헤드리스 도구 권한이 거부되어 응답을 만들지 못했습니다. "
+                "unsandboxed 권한을 자동으로 허용하지 않고, 도구 없는 증거 분석으로 재시도해야 합니다."
+            )
         detail = error or "CLI가 종료됐지만 stdout에 최종 응답을 쓰지 않았습니다."
         log(f"{role} empty response: {detail[-1600:]}")
         raise RuntimeError(f"{role}가 빈 응답을 반환했습니다: {detail[-500:]}")
     if role == "claude" and native_session_id:
         if native_session_is_new and native_session_persist:
             try:
-                _persist_native_session_id(role, native_session_id, chat_id=chat_id, workspace=provider_workspace)
+                _persist_native_session_id(
+                    role,
+                    native_session_id,
+                    chat_id=chat_id,
+                    workspace=provider_workspace,
+                    turn_count=1,
+                    prompt_chars=len(runtime_prompt),
+                )
             except OSError as exc:
                 log(f"Claude 네이티브 세션 ID 저장 실패(응답은 유지): {type(exc).__name__}")
+        elif native_session_persist:
+            try:
+                previous_turns = int((native_session_record or {}).get("turn_count", 0))
+                previous_prompt_chars = int((native_session_record or {}).get("prompt_chars", 0))
+                _persist_native_session_id(
+                    role,
+                    native_session_id,
+                    chat_id=chat_id,
+                    workspace=provider_workspace,
+                    turn_count=previous_turns + 1,
+                    prompt_chars=previous_prompt_chars + len(runtime_prompt),
+                )
+            except (OSError, TypeError, ValueError):
+                log("Claude 네이티브 세션 사용량 ledger 저장 실패(응답은 유지)")
         if ACTIVE_LOGICAL_SESSION_ID and native_session_persist:
             try:
                 bind_native_session(ACTIVE_LOGICAL_SESSION_ID, provider=role, native_session_id=native_session_id)
@@ -1446,8 +1628,162 @@ async def _run_cli(
     return output
 
 
-async def run_provider(prompt: str, on_wait=None, *, context_prompt: str | None = None, provider_text: str | None = None, chat_id: str | int | None = None) -> str:
-    return await _run_cli(ROLE, prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=provider_text, chat_id=chat_id)
+async def run_provider(prompt: str, on_wait=None, *, context_prompt: str | None = None, provider_text: str | None = None, chat_id: str | int | None = None, fresh_session: bool = False, workspace_override: str | None = None) -> str:
+    return await _run_cli(ROLE, prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=provider_text, chat_id=chat_id, fresh_session=fresh_session, workspace_override=workspace_override)
+
+
+async def run_provider_as(
+    provider_role: str,
+    prompt: str,
+    on_wait=None,
+    *,
+    timeout_seconds: int | None = None,
+    context_prompt: str | None = None,
+    provider_text: str | None = None,
+    chat_id: str | int | None = None,
+    fresh_session: bool = False,
+    workspace_override: str | None = None,
+) -> str:
+    """Run a bounded provider explicitly instead of silently using ROLE."""
+    if provider_role not in ROLES:
+        raise ValueError(f"지원하지 않는 provider role: {provider_role}")
+    return await _run_cli(
+        provider_role,
+        prompt,
+        on_wait=on_wait,
+        timeout_seconds=timeout_seconds,
+        context_prompt=context_prompt,
+        provider_text=provider_text,
+        chat_id=chat_id,
+        fresh_session=fresh_session,
+        workspace_override=workspace_override,
+    )
+
+
+async def _process_delegation(application: Application, delegation: dict[str, object]) -> None:
+    """Execute one Codex assignment as the actual target provider."""
+    store = DelegationStore()
+    delegation_id = str(delegation.get("delegation_id") or "")
+    request = str(delegation.get("request") or "")
+    chat_id = str(delegation.get("chat_id") or "")
+    reply_id = str(delegation.get("reply_to_message_id") or "").strip()
+    try:
+        reply_to = int(reply_id) if reply_id else None
+    except ValueError:
+        reply_to = None
+    try:
+        await application.bot.send_message(
+            chat_id=chat_id,
+            text=f"🧭 {ROLE_LABELS[ROLE]}가 코덱스의 위임을 받았습니다. 직접 확인 후 답변하겠습니다.",
+            reply_to_message_id=reply_to,
+        )
+    except TelegramError as exc:
+        log(f"위임 접수 안내 전송 실패(실행은 계속): {type(exc).__name__}")
+    prompt = (
+        "[Codex 위임 작업]\n"
+        f"위임 이유: {delegation.get('reason', '')}\n"
+        f"검수 기준: {delegation.get('acceptance_criteria', '')}\n\n"
+        "원본 요청을 직접 수행하되, 확인하지 않은 실행·변경·테스트를 완료했다고 말하지 마라. "
+        "이 작업은 하위 위임이므로 다른 에이전트에게 다시 넘기지 말고, 실제 관찰 결과와 남은 불확실성만 보고하라.\n\n"
+        f"[원본 요청]\n{request[:1000]}"
+    )
+    review_files = tuple(str(item) for item in (delegation.get("review_files") or ()) if str(item).strip())
+    if review_files:
+        prompt = (
+            "[파일 범위 제한]\n"
+            f"검토 기준 작업공간: {delegation.get('review_root') or '지정되지 않음'}\n"
+            "아래 파일과 그 파일에 대한 git diff만 읽어라. 목록 밖 파일을 탐색하거나 전체 저장소를 검색하지 마라.\n"
+            + "\n".join(f"- {path}" for path in review_files)
+            + "\n\n코드 변경은 하지 마라. 보고서는 최대 8개 항목, 각 항목은 심각도·파일·근거·수정 제안 한 줄로 작성하고, 마지막에 PASS/FAIL/NEEDS_SCOPE 중 하나를 표시하라.\n\n"
+            + prompt
+        )
+    async with _BUSY_LOCK:
+        try:
+            write_task_state(
+                role=ROLE,
+                chat_id=chat_id,
+                text=request,
+                status="started",
+                task_id=delegation_id,
+                root_task_id=str(delegation.get("root_task_id") or ""),
+                delegation_id=delegation_id,
+            )
+        except (OSError, ValueError, TypeError):
+            pass
+        try:
+            answer = await run_provider(
+                request,
+                provider_text=prompt,
+                chat_id=chat_id,
+                fresh_session=bool(review_files),
+                workspace_override=str(delegation.get("review_root") or "") if review_files else None,
+            )
+            sent = True
+            try:
+                for part in _reply_chunks(answer):
+                    await application.bot.send_message(
+                        chat_id=chat_id,
+                        text=part,
+                        reply_to_message_id=reply_to,
+                    )
+            except TelegramError as exc:
+                sent = False
+                log(f"위임 결과 전송 실패: {type(exc).__name__}")
+            store.complete(
+                delegation_id,
+                status="completed" if sent else "delivery_pending",
+                response=answer,
+                delivery_status="delivered" if sent else "pending",
+            )
+            try:
+                write_task_state(
+                    role=ROLE,
+                    chat_id=chat_id,
+                    text=request,
+                    status="completed" if sent else "delivery_pending",
+                    task_id=delegation_id,
+                    response_tail=answer[-1000:],
+                    delegation_id=delegation_id,
+                )
+            except (OSError, ValueError, TypeError):
+                pass
+        except Exception as exc:
+            log(f"위임 작업 실패 role={ROLE}: {type(exc).__name__}")
+            try:
+                store.complete(delegation_id, status="failed", error=f"{type(exc).__name__}: {exc}")
+            except (OSError, ValueError, TypeError):
+                pass
+            try:
+                await application.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ {ROLE_LABELS[ROLE]} 위임 작업 실패: {type(exc).__name__}",
+                    reply_to_message_id=reply_to,
+                )
+            except TelegramError:
+                pass
+
+
+async def _delegation_worker(application: Application) -> None:
+    """Consume Codex assignments without feeding bot messages back into ingress."""
+    if ROLE not in {"claude", "antigravity"}:
+        return
+    store = DelegationStore()
+    while True:
+        try:
+            delegation = await asyncio.to_thread(
+                store.claim_for_role,
+                ROLE,
+                owner=f"telegram-{ROLE}",
+            )
+            if delegation is not None:
+                await _process_delegation(application, delegation)
+            else:
+                await asyncio.sleep(1.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log(f"위임 큐 소비 오류(폴링 유지): {type(exc).__name__}")
+            await asyncio.sleep(2.0)
 
 
 async def generate_coding_plan(prompt: str, on_wait=None, *, context_prompt: str | None = None, chat_id: str | int | None = None) -> str:
@@ -1477,24 +1813,17 @@ async def generate_coding_plan(prompt: str, on_wait=None, *, context_prompt: str
 # only gets to act on that feedback, never overrule it. If both haven't
 # agreed to PASS by the last round, the loop stops and hands the transcript
 # to the human in the chat rather than declaring success on codex's say-so.
-# Clamped to [1, 2]: the user explicitly decided on a 2-round cap (2026-07-31
-# Telegram design discussion), so the env var can tune it down for testing
-# but can't silently raise it past what was agreed, and a misconfigured 0
-# can't collapse the loop to zero iterations (which would leave codex_report
-# as the raw original prompt when the escalation message is built).
-CODEX_VERIFY_MAX_ROUNDS = max(1, min(2, int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_MAX_ROUNDS", "2"))))
+# Clamped to [1, 2]. Simple coding requests use one round by default; complex
+# work can explicitly opt into the second round with the environment setting.
+CODEX_VERIFY_MAX_ROUNDS = max(1, min(2, int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_MAX_ROUNDS", "1"))))
 
 # Overall governor on top of the per-round-max above: even with the shorter
 # verify-call timeout, a round can still legitimately run close to its worst
-# case (codex authoring up to TIMEOUT_SECONDS + two verify calls up to
-# CODEX_VERIFY_CALL_TIMEOUT_SECONDS each). Checked only *between* rounds —
-# never aborts a round already in flight — so round 1 always gets to
-# complete once for any request; this only decides whether round 2 is
-# worth starting given how much of the budget round 1 already spent. Round-7
-# independent review (Codex, 2026-07-31) asked for exactly this: a total-loop
-# cap so _BUSY_LOCK can't be held for the full multi-round worst case.
-CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS = int(
-    os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS", "3600")
+# case. Each individual provider call is now clipped to the remaining total
+# budget, so a second round cannot silently extend the total beyond this cap.
+CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS = max(
+    60,
+    min(7200, int(os.environ.get("TELEGRAM_AGENT_CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS", "3600"))),
 )
 
 # Deliberately a coarse, low-cost keyword heuristic rather than an LLM call —
@@ -1532,7 +1861,46 @@ def _require_deliberation_round(session_id: str, round_number: int, *, timeout_s
     store.wait_for_round(session_id, round_number, timeout_seconds=timeout_seconds)
     state = store.round_state(session_id, round_number)
     if state != "ready":
-        raise RuntimeError(f"deliberation round {round_number} barrier {state}")
+        payload = store.snapshot(session_id) or {}
+        expected_roles = tuple(payload.get("expected_roles") or ())
+        round_results = (payload.get("rounds") or {}).get(str(int(round_number))) or {}
+        missing_roles = tuple(
+            role for role in expected_roles if str(round_results.get(role)) != "completed"
+        )
+        missing_text = ", ".join(missing_roles) or "알 수 없음"
+        raise RuntimeError(
+            f"deliberation round {round_number} barrier {state}; "
+            f"미완료 역할: {missing_text}"
+        )
+
+
+def _deliberation_round_progress(session_id: str, round_number: int) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    """Return expected, completed, missing, and failed roles for one round."""
+    payload = DeliberationStore().snapshot(session_id) or {}
+    expected = tuple(str(role) for role in (payload.get("expected_roles") or ()))
+    entries = (payload.get("rounds") or {}).get(str(int(round_number))) or {}
+    completed = tuple(role for role in expected if str(entries.get(role)) == "completed")
+    failed = tuple(role for role in expected if str(entries.get(role)) == "failed")
+    missing = tuple(role for role in expected if role not in completed and role not in failed)
+    return expected, completed, missing, failed
+
+
+def _deliberation_barrier_timeout_message(session_id: str, round_number: int, error: Exception) -> str:
+    """Describe an incomplete barrier without presenting it as a final answer."""
+    expected, completed, missing, failed = _deliberation_round_progress(session_id, round_number)
+    expected_text = ", ".join(expected) or "확인하지 못함"
+    completed_text = ", ".join(completed) or "없음"
+    missing_text = ", ".join(missing) or "없음"
+    failed_text = ", ".join(failed) or "없음"
+    return (
+        f"⚠️ {round_number}차 논의 barrier가 완료되지 않아 coordinator 통합을 보류합니다.\n"
+        f"참여 역할: {expected_text}\n"
+        f"확인된 {round_number}차 결과: {completed_text}\n"
+        f"아직 결과가 없는 역할: {missing_text}\n"
+        f"실패로 기록된 역할: {failed_text}\n"
+        "확인되지 않은 역할을 완료한 것으로 처리하지 않았습니다. "
+        f"(barrier 오류: {type(error).__name__})"
+    )
 
 
 _VERDICT_MARKER = re.compile(r"RESULT:\s*(PASS|FAIL)", re.IGNORECASE)
@@ -1555,14 +1923,14 @@ def _provider_unavailable(text: str) -> bool:
     return bool(_UNAVAILABLE_MARKER.search(text or ""))
 
 
-def _static_verify(workspace: Path) -> str:
+def _static_verify(workspace: Path, *, timeout_seconds: int = 30) -> str:
     """Minimal non-provider fallback; never claims semantic correctness."""
     try:
         result = subprocess.run(
             ["/usr/bin/git", "-C", str(workspace), "diff", "--check"],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=max(1, timeout_seconds),
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -1607,8 +1975,12 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *
     last_agy_verdict = ""
     loop_started = time.monotonic()
 
+    def remaining_seconds() -> int:
+        return max(0, int(CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS - (time.monotonic() - loop_started)))
+
     for round_num in range(1, CODEX_VERIFY_MAX_ROUNDS + 1):
-        if round_num > 1 and time.monotonic() - loop_started >= CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS:
+        remaining = remaining_seconds()
+        if remaining <= 0:
             log(
                 f"codex_verify_and_revise 총 시간 상한({CODEX_VERIFY_TOTAL_TIMEOUT_SECONDS}초) 초과, "
                 f"라운드{round_num} 생략하고 조기 종료"
@@ -1624,27 +1996,56 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *
                 "위 검증 피드백을 반영해서 코드를 직접 수정하라. 무엇을 어떻게 "
                 "고쳤는지 요약해서 보고하라."
             )
-        codex_report = await run_provider(write_prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=write_prompt, chat_id=chat_id)
+        codex_report = await run_provider_as(
+            "codex",
+            write_prompt,
+            on_wait=on_wait,
+            timeout_seconds=min(TIMEOUT_SECONDS, remaining),
+            context_prompt=context_prompt,
+            provider_text=write_prompt,
+            chat_id=chat_id,
+        )
         try:
             await message.reply_text(f"🔧 라운드{round_num}: 코덱스 작업 완료\n{codex_report[:1200]}")
         except TelegramError as exc:
             log(f"라운드 진행상황 전송 실패(계속 진행): {exc}")
 
+        verification_workspace = _provider_workspace("codex")
         verify_prompt = _build_verify_prompt(original_prompt, codex_report)
         claude_available = True
         try:
+            remaining = remaining_seconds()
+            if remaining <= 0:
+                raise RuntimeError("검증 전체 시간 상한에 도달했습니다")
             claude_verdict = await _run_cli(
-                "claude", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS,
-                context_prompt=context_prompt, provider_text=verify_prompt, chat_id=chat_id,
+                "claude",
+                verify_prompt,
+                on_wait=on_wait,
+                timeout_seconds=min(CODEX_VERIFY_CALL_TIMEOUT_SECONDS, remaining),
+                context_prompt=context_prompt,
+                provider_text=verify_prompt,
+                chat_id=chat_id,
+                fresh_session=True,
+                workspace_override=str(verification_workspace),
             )
         except Exception as exc:
             claude_available = False
             claude_verdict = f"RESULT: UNAVAILABLE\n(클로드 검증을 사용할 수 없음: {exc})"
         antigravity_available = True
         try:
+            remaining = remaining_seconds()
+            if remaining <= 0:
+                raise RuntimeError("검증 전체 시간 상한에 도달했습니다")
             agy_verdict = await _run_cli(
-                "antigravity", verify_prompt, on_wait=on_wait, timeout_seconds=CODEX_VERIFY_CALL_TIMEOUT_SECONDS,
-                context_prompt=context_prompt, provider_text=verify_prompt, chat_id=chat_id,
+                "antigravity",
+                verify_prompt,
+                on_wait=on_wait,
+                timeout_seconds=min(CODEX_VERIFY_CALL_TIMEOUT_SECONDS, remaining),
+                context_prompt=context_prompt,
+                provider_text=verify_prompt,
+                chat_id=chat_id,
+                fresh_session=True,
+                workspace_override=str(verification_workspace),
             )
         except Exception as exc:
             antigravity_available = False
@@ -1665,7 +2066,12 @@ async def codex_verify_and_revise(original_prompt: str, message, on_wait=None, *
         if (_parse_verdict(claude_verdict) and not antigravity_available) or (
             _parse_verdict(agy_verdict) and not claude_available
         ):
-            static_result = _static_verify(_provider_workspace("codex"))
+            static_remaining = remaining_seconds()
+            static_result = (
+                _static_verify(verification_workspace, timeout_seconds=min(30, static_remaining))
+                if static_remaining > 0
+                else "정적 검증 생략: 검증 전체 시간 상한에 도달했습니다"
+            )
             return (
                 f"⚠️ 부분 검증만 완료되었습니다 (라운드{round_num}).\n"
                 "한 provider를 사용할 수 없어 독립 검증 합의는 성립하지 않았습니다.\n\n"
@@ -1795,6 +2201,8 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    deliberation_incomplete = False
+    deliberation_fallback = False
     # Username mismatch is checked once, hard, in _post_init (process exits
     # before ever reaching here if it's wrong) — no need to re-check per
     # message.
@@ -1915,6 +2323,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 pass
         return
 
+    if is_online_search_request(text) and not public_search_capability_available():
+        # Do not let a provider turn a missing web capability into invented
+        # links or claims.  A verified search adapter must be enabled before
+        # any Telegram provider is allowed to answer a live-search request.
+        try:
+            await message.reply_text(public_search_unavailable_message())
+        except TelegramError as exc:
+            log(f"웹 검색 capability 부재 안내 전송 실패: {type(exc).__name__}")
+        return
+
     if _BUSY_LOCK.locked():
         try:
             await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]}가 이미 다른 작업을 처리 중이에요. 끝나면 답할게요.")
@@ -1934,7 +2352,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await _handle_delivery_retry(message, context)
             return
         started = time.monotonic()
-        log(f"처리 시작 chat={message.chat_id} user={user_id} text={text[:80]!r}")
         task_id = write_task_state(
             role=ROLE,
             chat_id=message.chat_id,
@@ -1946,6 +2363,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
             auth_source=_auth_source(ROLE),
         )
+        log(f"처리 시작 task={task_id} chat={message.chat_id} user={user_id} text={text[:80]!r}")
         try:
             _CONTROL_PLANE.start_task(message.chat_id, task_id, roles=tuple(roles_for_request(text)))
         except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
@@ -1973,7 +2391,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         # an explicit peer request. Wait for the bounded result packet and
         # send only the final integrated response. Worker progress remains
         # visible so the user can see which peer is executing.
-        if not coordination_request:
+        if not coordination_request and deliberation_session_id is None:
             try:
                 progress = await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]} 처리 중...")
             except TelegramError as exc:
@@ -1988,6 +2406,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
             except TelegramError:
                 pass
+
+        async def _codex_deliberation_fallback(stage: int, error: Exception) -> str:
+            evidence = DeliberationStore().render(deliberation_session_id or "", consumer_role="codex")
+            return await run_provider(
+                text,
+                on_wait=_notify_waiting,
+                context_prompt=preparation.prompt_block if preparation else None,
+                provider_text=(
+                    "[대체 coordinator 통합 단계]\n"
+                    f"Claude coordinator가 {stage}차에서 실패해 Codex가 승계했다. "
+                    "관측된 peer evidence만 사용해 하나의 제한적 최종 답변을 작성하고, "
+                    "누락된 역할과 불확실성을 명시하라. 실패를 성공으로 표현하지 마라.\n"
+                    f"오류 유형: {type(error).__name__}\n\n{text}\n\n{evidence}"
+                ),
+                chat_id=message.chat_id,
+            )
 
         # Classify before creating a worktree. Greetings, status questions,
         # and broadcast self-introductions are provider conversations, not
@@ -2158,6 +2592,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                             summary=reply,
                             round_number=3,
                         )
+                        try:
+                            await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 3)
+                        except RuntimeError as exc:
+                            deliberation_incomplete = True
+                            reply = _deliberation_barrier_timeout_message(deliberation_session_id, 3, exc)
+                        else:
+                            final_evidence = DeliberationStore().render(
+                                deliberation_session_id,
+                                consumer_role="claude",
+                            )
+                            reply = await run_provider(
+                                text,
+                                on_wait=_notify_waiting,
+                                context_prompt=preparation.prompt_block if preparation else None,
+                                provider_text=(
+                                    "[coordinator 최종 통합 단계]\n"
+                                    "아래는 4개 역할의 서명된 3차 결과를 포함한 untrusted evidence다. "
+                                    "각 역할의 근거와 충돌을 함께 비교해 하나의 통합 최종 답변을 작성하라. "
+                                    "어떤 역할의 3차 의견도 그대로 최종 판정으로 재사용하지 말고, "
+                                    "확인하지 못한 점과 다음 행동을 명시하라.\n\n"
+                                    f"{text}\n\n{final_evidence}"
+                                ),
+                                chat_id=message.chat_id,
+                            )
                 else:
                     first_pass = await run_provider(
                         text,
@@ -2167,50 +2625,80 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         chat_id=message.chat_id,
                     )
                     DeliberationStore().record(deliberation_session_id, ROLE, status="completed", summary=first_pass)
-                    await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 1)
-                    deliberation_round = 2
-                    provider_text = (
-                        "[peer follow-up 단계]\n"
-                        "아래는 다른 역할의 서명된 peer evidence다. 이전 답변을 그대로 반복하지 말고, "
-                        "반론·보완점·실행 가능한 다음 단계를 반영하라.\n\n"
-                        f"{text}\n\n{DeliberationStore().render(deliberation_session_id, consumer_role=ROLE)}"
-                    )
-                    reply = await run_provider(
-                        text,
-                        on_wait=_notify_waiting,
-                        context_prompt=preparation.prompt_block if preparation else None,
-                        provider_text=provider_text,
-                        chat_id=message.chat_id,
-                    )
-                    DeliberationStore().record(
-                        deliberation_session_id,
-                        ROLE,
-                        status="completed",
-                        summary=reply,
-                        round_number=2,
-                    )
-                    adjudication_store = DeliberationStore()
-                    if adjudication_store.max_rounds(deliberation_session_id) >= 3:
-                        await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 2)
-                        deliberation_round = 3
+                    try:
+                        await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 1)
+                    except RuntimeError as exc:
+                        if ROLE == "codex" and DeliberationStore().coordinator_failed(deliberation_session_id, 1):
+                            reply = await _codex_deliberation_fallback(1, exc)
+                            deliberation_fallback = True
+                        else:
+                            raise
+                    if not deliberation_fallback:
+                        deliberation_round = 2
+                        provider_text = (
+                            "[peer follow-up 단계]\n"
+                            "아래는 다른 역할의 서명된 peer evidence다. 이전 답변을 그대로 반복하지 말고, "
+                            "반론·보완점·실행 가능한 다음 단계를 반영하라.\n\n"
+                            f"{text}\n\n{DeliberationStore().render(deliberation_session_id, consumer_role=ROLE)}"
+                        )
                         reply = await run_provider(
                             text,
                             on_wait=_notify_waiting,
                             context_prompt=preparation.prompt_block if preparation else None,
-                            provider_text=(
-                                "[최종 adjudication 단계]\n"
-                                "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
-                                f"{text}\n\n{adjudication_store.render(deliberation_session_id, consumer_role=ROLE)}"
-                            ),
+                            provider_text=provider_text,
                             chat_id=message.chat_id,
                         )
-                        adjudication_store.record(
+                        DeliberationStore().record(
                             deliberation_session_id,
                             ROLE,
                             status="completed",
                             summary=reply,
-                            round_number=3,
+                            round_number=2,
                         )
+                        adjudication_store = DeliberationStore()
+                        if adjudication_store.max_rounds(deliberation_session_id) >= 3:
+                            try:
+                                await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 2)
+                            except RuntimeError as exc:
+                                if ROLE == "codex" and adjudication_store.coordinator_failed(deliberation_session_id, 2):
+                                    reply = await _codex_deliberation_fallback(2, exc)
+                                    deliberation_fallback = True
+                                else:
+                                    raise
+                            if not deliberation_fallback:
+                                deliberation_round = 3
+                                reply = await run_provider(
+                                    text,
+                                    on_wait=_notify_waiting,
+                                    context_prompt=preparation.prompt_block if preparation else None,
+                                    provider_text=(
+                                        "[최종 adjudication 단계]\n"
+                                        "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                                        f"{text}\n\n{adjudication_store.render(deliberation_session_id, consumer_role=ROLE)}"
+                                    ),
+                                    chat_id=message.chat_id,
+                                )
+                                adjudication_store.record(
+                                    deliberation_session_id,
+                                    ROLE,
+                                    status="completed",
+                                    summary=reply,
+                                    round_number=3,
+                                )
+                                if ROLE == "codex":
+                                    try:
+                                        await asyncio.to_thread(_require_deliberation_round, deliberation_session_id, 3)
+                                    except RuntimeError as exc:
+                                        if adjudication_store.coordinator_failed(deliberation_session_id, 3):
+                                            reply = await _codex_deliberation_fallback(3, exc)
+                                            deliberation_fallback = True
+                                        else:
+                                            raise
+                                if not deliberation_fallback:
+                                    reply = (
+                                        f"🔧 {ROLE_LABELS.get(ROLE, ROLE)} 3차 의견을 기록했습니다. "
+                                        "최종 판정은 진행자가 통합해 안내합니다."
+                                    )
             else:
                 provider_text = text
                 if coordination_request:
@@ -2226,7 +2714,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     chat_id=message.chat_id,
                 )
         except Exception as exc:
-            log(f"처리 실패 chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
+            log(f"처리 실패 task={task_id} chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")
             if deliberation_session_id:
                 try:
                     DeliberationStore().record(
@@ -2278,10 +2766,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 log(f"오류 알림 전송도 실패: {send_exc}")
             return
 
+        execution_status = "waiting" if deliberation_incomplete else "passed"
         _record_telegram_efficiency(
             task_id=task_id,
             prompt=text,
-            status="passed",
+            status=execution_status,
             output=reply,
             started=started,
             workspace=ACTIVE_TASK_WORKSPACE,
@@ -2289,14 +2778,55 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         if ACTIVE_LOGICAL_SESSION_ID:
             update_session(
                 ACTIVE_LOGICAL_SESSION_ID,
-                status="handoff_ready",
+                status="waiting" if deliberation_incomplete else "handoff_ready",
                 summary=reply[:8000],
-                next_action="Telegram 최종 응답 전송 완료 대기",
+                next_action=(
+                    "누락된 deliberation 역할 결과를 확인한 뒤 coordinator 통합을 재시도"
+                    if deliberation_incomplete
+                    else "Telegram 최종 응답 전송 완료 대기"
+                ),
                 workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
                 worktree=str(ACTIVE_TASK_WORKSPACE or ""),
-                verification={"telegram_delivery_pending": True, "response_chars": len(reply)},
+                verification={
+                    "telegram_delivery_pending": True,
+                    "response_chars": len(reply),
+                    "deliberation_incomplete": deliberation_incomplete,
+                },
                 event_type="provider_succeeded_delivery_pending",
             )
+
+        if not deliberation_fallback and not should_publish_user_result(ROLE, deliberation_session_id):
+            # Peer opinions are durable signed evidence for the coordinator,
+            # not separate user-facing conclusions.  Finishing here prevents
+            # four near-duplicate Telegram answers for one meeting request.
+            _complete_ingress_claim()
+            write_task_state(
+                role=ROLE,
+                chat_id=message.chat_id,
+                text=text,
+                status="completed",
+                task_id=task_id,
+                response_preview=reply[:1000],
+                deliberation_session_id=deliberation_session_id or "",
+            )
+            try:
+                _CONTROL_PLANE.mark_task(message.chat_id, task_id, "completed", summary=reply)
+            except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
+                log(f"control-plane peer completion 기록 실패: {type(exc).__name__}")
+            if ACTIVE_LOGICAL_SESSION_ID:
+                update_session(
+                    ACTIVE_LOGICAL_SESSION_ID,
+                    status="succeeded",
+                    summary=reply[:8000],
+                    next_action="coordinator 통합 결과 대기",
+                    verification={"telegram_delivery_pending": False, "internal_peer_result": True},
+                    event_type="deliberation_peer_result_recorded",
+                )
+            _update_task_worktree_status("succeeded")
+            ACTIVE_TASK_WORKSPACE = None
+            ACTIVE_LOGICAL_SESSION_ID = None
+            log(f"처리 완료 task={task_id} chat={message.chat_id} duration={time.monotonic() - started:.1f}s internal_peer_result=true")
+            return
 
         delivery = None
         delivery_finalized = False
@@ -2345,42 +2875,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             mark_delivery_succeeded(delivery["delivery_id"])
             delivery_finalized = True
             _complete_ingress_claim()
+            final_state = "waiting" if deliberation_incomplete else "completed"
+            session_state = "waiting" if deliberation_incomplete else "succeeded"
             write_task_state(
                 role=ROLE,
                 chat_id=message.chat_id,
                 text=text,
-                status="completed",
+                status=final_state,
                 task_id=task_id,
                 response_preview=reply[:1000],
                 delivery_id=delivery["delivery_id"],
                 deliberation_session_id=deliberation_session_id or "",
             )
             try:
-                _CONTROL_PLANE.mark_task(message.chat_id, task_id, "completed", summary=reply)
+                _CONTROL_PLANE.mark_task(
+                    message.chat_id,
+                    task_id,
+                    "running" if deliberation_incomplete else "completed",
+                    summary=reply,
+                )
             except (ControlPlaneError, OSError, ValueError, TypeError) as exc:
                 log(f"control-plane task completion 기록 실패: {type(exc).__name__}")
             write_reflection(
                 task_id=task_id,
                 role=ROLE,
                 workspace=str(ACTIVE_TASK_WORKSPACE or (CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE)),
-                status="completed",
+                status=final_state,
                 response_preview=reply,
             )
             if ACTIVE_LOGICAL_SESSION_ID:
                 update_session(
                     ACTIVE_LOGICAL_SESSION_ID,
-                    status="succeeded",
+                    status=session_state,
                     summary=reply[:8000],
                     next_action="사용자 후속 요청 대기",
                     workspace=str(CODEX_WORKSPACE if ROLE == "codex" else WORKSPACE),
                     worktree=str(ACTIVE_TASK_WORKSPACE or ""),
-                    verification={"telegram_delivery_pending": False, "response_chars": len(reply)},
+                    verification={
+                        "telegram_delivery_pending": False,
+                        "response_chars": len(reply),
+                        "deliberation_incomplete": deliberation_incomplete,
+                    },
                     event_type="telegram_delivery_succeeded",
                 )
-            _update_task_worktree_status("succeeded")
+            _update_task_worktree_status(session_state)
             ACTIVE_TASK_WORKSPACE = None
             ACTIVE_LOGICAL_SESSION_ID = None
-            log(f"처리 완료 chat={message.chat_id} duration={time.monotonic() - started:.1f}s truncated={truncated}")
+            log(f"처리 완료 task={task_id} chat={message.chat_id} duration={time.monotonic() - started:.1f}s truncated={truncated}")
         except (TelegramError, DeliveryStoreError, EgressQueueError, OSError, ValueError, TypeError) as exc:
             if delivery_finalized:
                 # Telegram delivery is already durable and complete. A later
@@ -2471,12 +3012,39 @@ async def _post_init(application: Application) -> None:
             os._exit(1)
         log(f"그룹 수신 권한 확인 실패: {type(exc).__name__}")
     _clear_conflict_cooldown()
+    if ROLE in {"claude", "antigravity"}:
+        global _DELEGATION_TASK
+        # post_init runs before PTB marks the Application as running. Using
+        # Application.create_task here produces a Python 3.14 warning and can
+        # leave the worker pending during a drain/restart. Own the task at
+        # process level and cancel it from post_shutdown instead.
+        _DELEGATION_TASK = asyncio.get_running_loop().create_task(
+            _delegation_worker(application),
+            name=f"edge-agent-delegation-{ROLE}",
+        )
+        log(f"Codex 위임 큐 소비자 시작 role={ROLE}")
+
+
+async def _post_shutdown(application: Application) -> None:
+    """Drain and cancel the delegation worker before the event loop closes."""
+    del application
+    global _DELEGATION_TASK
+    task = _DELEGATION_TASK
+    _DELEGATION_TASK = None
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 _SINGLETON_LOCK_DIR = Path.home() / ".claude" / "hooks-state" / "telegram-bridge-locks"
 _singleton_lock_fd: int | None = None  # kept open (module-global, never closed) for the process's lifetime
 _EGRESS_QUEUE = SharedEgressQueue()
 _CONTROL_PLANE = ControlPlaneStore()
+_DELEGATION_TASK: asyncio.Task | None = None
 
 
 def _acquire_singleton_lock() -> None:
@@ -2542,6 +3110,7 @@ def main() -> None:
         .token(TOKEN)
         .concurrent_updates(True)
         .post_init(_post_init)
+        .post_shutdown(_post_shutdown)
         .build()
     )
     application.add_handler(MessageHandler(filters.ALL, handle_message))

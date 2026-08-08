@@ -58,6 +58,8 @@ class SessionParallelRunner:
         owner: str,
         parallel_enabled: bool = False,
         automatic_merge: bool = False,
+        approval_ref: str = "",
+        approval_checker: Callable[[str, ParallelTaskSpec], bool] | None = None,
         require_diff: bool = True,
     ) -> SessionExecutionResult:
         if not parallel_enabled:
@@ -84,6 +86,8 @@ class SessionParallelRunner:
                     parallel_enabled=True,
                     automatic_merge=automatic_merge,
                     cleanup_after_merge=automatic_merge,
+                    approval_ref=approval_ref,
+                    approval_checker=approval_checker,
                 ).run(spec, provider, require_diff=require_diff)
             except Exception as exc:
                 persisted.status = SessionStatus.FAILED

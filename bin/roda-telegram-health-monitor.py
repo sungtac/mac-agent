@@ -44,7 +44,7 @@ USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SEC
 # docs/roda-parallel-recovery-improvement-plan.md P2.
 PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SECONDS", str(24 * 60 * 60)))
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
-STATE_SCHEMA_VERSION = 3
+STATE_SCHEMA_VERSION = 4
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
@@ -209,6 +209,20 @@ START_RE = re.compile(r"처리 시작")
 # "처리 실패". The provider exit line is terminal evidence too; otherwise a
 # failed CLI can remain pending until the no-response timeout.
 DONE_RE = re.compile(r"처리 완료|처리 실패|exit=\d+|empty response")
+TASK_ID_RE = re.compile(r"\btask=(?P<task>[A-Za-z0-9._:-]{1,180})\b")
+
+
+def _line_task_id(line: str) -> str:
+    match = TASK_ID_RE.search(line or "")
+    return match.group("task") if match else ""
+
+
+def _harden_log_permissions() -> None:
+    for descriptor in (1, 2):
+        try:
+            os.fchmod(descriptor, 0o600)
+        except OSError:
+            pass
 
 
 def _default_state() -> dict:
@@ -223,6 +237,7 @@ def _default_state() -> dict:
         "recovery_watch": {},
         "usage_watch": {},
         "pending_merges": {},
+        "incidents": {},
         "main_dirty_alerted_at": 0,
         "metrics": {
             "classified": {},
@@ -249,9 +264,37 @@ def _migrate_state(payload: object) -> dict:
         if key not in state:
             state[key] = value.copy() if isinstance(value, dict) else value
     state["schema_version"] = STATE_SCHEMA_VERSION
-    for key in ("offsets", "pending", "alerted", "repair_results", "recovery_watch", "usage_watch", "pending_merges"):
+    for key in ("offsets", "pending", "alerted", "repair_results", "recovery_watch", "usage_watch", "pending_merges", "incidents"):
         if not isinstance(state.get(key), dict):
             state[key] = {}
+    # v3 stored pending starts as a FIFO list per role.  Keep those entries
+    # visible as legacy incidents, but all new observations are keyed by the
+    # task ID emitted by the provider bridge so an unrelated DONE cannot pop
+    # an older request.
+    for role, pending in list(state["pending"].items()):
+        if isinstance(pending, list):
+            migrated: dict[str, float] = {}
+            for index, value in enumerate(pending):
+                try:
+                    started = float(value)
+                except (TypeError, ValueError):
+                    continue
+                migrated[f"legacy-{role}-{index}-{int(started)}"] = started
+            state["pending"][role] = migrated
+        elif not isinstance(pending, dict):
+            state["pending"][role] = {}
+    # Legacy FIFO starts cannot be correlated to a real task. Keeping them
+    # open lets unrelated modern completions poison no_response forever.
+    # Preserve their incident history as superseded, but remove them from the
+    # active pending set.
+    for role, pending in state["pending"].items():
+        for pending_id in [item for item in pending if str(item).startswith("legacy-")]:
+            pending.pop(pending_id, None)
+            for incident in state.get("incidents", {}).values():
+                if incident.get("role") == role and incident.get("task_id") == pending_id and incident.get("status") in {"open", "reopened"}:
+                    incident["status"] = "superseded"
+                    incident["resolved_at"] = time.time()
+                    incident["resolution"] = "uncorrelated legacy FIFO entry retired during v4 reconciliation"
     if not isinstance(state.get("delivery_retry"), list):
         state["delivery_retry"] = []
     for fingerprint, usage in list(state.get("usage_watch", {}).items()):
@@ -792,16 +835,29 @@ def _send_alert(text: str) -> None:
                 raise RuntimeError(f"Roda alert send failed: HTTP {response.status}")
 
 
-def _run_codex_repair_impl(event: dict, state: dict) -> str:
+def _repair_preflight_blocker(event: dict) -> str | None:
+    """Return a reason when no repair execution can start.
+
+    This check is intentionally side-effect free so the notifier can avoid
+    claiming that recovery started when policy or capability already makes
+    execution impossible.
+    """
     if not CODEX_DIAGNOSIS_ENABLED:
         return "Codex 자동 진단이 비활성화되어 있습니다."
     if not CODEX_BIN.is_file() or not (SOURCE_REPO / ".git").exists():
         return "Codex 진단을 실행할 수 없습니다(provider 또는 기준 저장소 없음)."
-    fingerprint = str(event["fingerprint"])
     if not AUTO_REPAIR_ENABLED:
         return "자동 복구가 비활성화되어 있습니다."
     if not _repair_approval_granted(event):
         return "자동 복구 승인 없음: fingerprint별 운영자 승인이 필요합니다."
+    return None
+
+
+def _run_codex_repair_impl(event: dict, state: dict) -> str:
+    blocker = _repair_preflight_blocker(event)
+    if blocker is not None:
+        return blocker
+    fingerprint = str(event["fingerprint"])
     worktree = REPAIR_ROOT / fingerprint
     if not worktree.exists():
         REPAIR_ROOT.mkdir(parents=True, exist_ok=True)
@@ -913,10 +969,28 @@ def _merge_repair_commit_and_restart(*, role: str, code: str, repair_commit: str
             source_head = head_result.stdout.strip()
             merge = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--no-ff", repair_commit, "-m", f"merge: automated Telegram health repair {fingerprint}"], capture_output=True, text=True, check=False)
             if merge.returncode != 0:
-                current_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"], capture_output=True, text=True, check=False).stdout.strip()
                 merge_head = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "-q", "--verify", "MERGE_HEAD"], capture_output=True, text=True, check=False).stdout.strip()
-                if current_head == source_head and merge_head == repair_commit:
-                    subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--abort"], capture_output=True, text=True, check=False)
+                if merge_head:
+                    aborted = subprocess.run(["/usr/bin/git", "-C", str(SOURCE_REPO), "merge", "--abort"], capture_output=True, text=True, check=False)
+                    if aborted.returncode != 0:
+                        return (
+                            "CRITICAL: 자동 병합 실패 후 merge --abort도 실패했습니다. "
+                            f"main을 수동 점검해야 합니다: {aborted.stderr[-500:]}"
+                        )
+                post_status = subprocess.run(
+                    ["/usr/bin/git", "-C", str(SOURCE_REPO), "status", "--porcelain"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+                post_head = subprocess.run(
+                    ["/usr/bin/git", "-C", str(SOURCE_REPO), "rev-parse", "HEAD"],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+                if post_status.returncode != 0 or post_status.stdout.splitlines() or post_head != source_head:
+                    return "CRITICAL: 자동 병합 실패 후 main이 원래 clean HEAD로 복구됐는지 확인하지 못했습니다."
                 return f"Codex 수정은 생성됐지만 main 병합에 실패했습니다: {merge.stderr[-500:]}"
     except Exception as exc:
         return f"Codex 수정은 생성됐지만 통합 락을 획득하지 못했습니다: {type(exc).__name__}"
@@ -1084,7 +1158,12 @@ def _repair_succeeded(diagnosis: str) -> bool:
 
 def _format_repair_result(event: dict, diagnosis: str) -> str:
     succeeded = _repair_succeeded(diagnosis)
-    status = "성공" if succeeded else "미완료/실패"
+    not_started = any(marker in diagnosis for marker in (
+        "비활성화되어 있습니다",
+        "승인 없음",
+        "실행할 수 없습니다",
+    ))
+    status = "성공" if succeeded else ("미실행" if not_started else "미완료/실패")
     message = (
         f"[Codex 자동복구 결과]\n"
         f"대상: {event['role']}\n"
@@ -1097,6 +1176,8 @@ def _format_repair_result(event: dict, diagnosis: str) -> str:
             f"\n\n@{BOT_USERNAMES.get(event['role'], event['role'])} "
             "Codex가 수정한 내용을 확인하고 이전 문제를 다시 처리하세요."
         )
+    elif not_started:
+        message += "\n\n자동 수정은 시작되지 않았으며 문제 봇에 재처리를 지시하지 않습니다."
     else:
         message += "\n\n자동 수정이 완료되지 않았으므로 문제 봇에 재처리를 지시하지 않습니다."
     return message
@@ -1205,6 +1286,39 @@ def _record_metric(state: dict, code: str, current: float) -> None:
     metrics["last_event_at"] = datetime.fromtimestamp(current, timezone.utc).isoformat()
 
 
+def _upsert_incident(state: dict, event: dict, current: float) -> None:
+    if event.get("kind") in {"recovery_result", "usage_recovery"}:
+        return
+    fingerprint = str(event.get("fingerprint") or "")
+    if not fingerprint:
+        return
+    incidents = state.setdefault("incidents", {})
+    incident = incidents.setdefault(fingerprint, {
+        "incident_id": fingerprint,
+        "first_seen_at": current,
+        "status": "open",
+    })
+    incident.update({
+        "role": str(event.get("role") or "unknown"),
+        "code": str(event.get("code") or "unknown"),
+        "task_id": str(event.get("task_id") or incident.get("task_id") or ""),
+        "detail": _safe_detail(str(event.get("detail") or ""))[:1000],
+        "last_seen_at": current,
+    })
+    if incident.get("status") == "resolved":
+        incident["status"] = "reopened"
+
+
+def _resolve_task_incidents(state: dict, role: str, task_id: str, current: float) -> None:
+    if not task_id:
+        return
+    for incident in state.setdefault("incidents", {}).values():
+        if incident.get("role") == role and incident.get("task_id") == task_id and incident.get("status") in {"open", "reopened"}:
+            incident["status"] = "resolved"
+            incident["resolved_at"] = current
+            incident["resolution"] = "matching terminal task event observed"
+
+
 def _record_diagnostic_observation(state: dict, line: str, role: str, code: str | None) -> None:
     if not line or re.search(r"\btext\s*=", line, re.I) or not UNKNOWN_SIGNAL_RE.search(line):
         return
@@ -1258,12 +1372,25 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                 state["offsets"][role] = handle.tell()
         except FileNotFoundError:
             lines = []
-        for raw in lines:
+        for line_index, raw in enumerate(lines):
             line = raw.strip()
+            task_id = _line_task_id(line)
+            role_pending = state["pending"].setdefault(role, {})
             if START_RE.search(line):
-                state["pending"].setdefault(role, []).append(current)
-            if DONE_RE.search(line) and state["pending"].get(role):
-                state["pending"][role].pop(0)
+                pending_id = task_id or f"legacy-{role}-{int(current)}-{line_index}"
+                role_pending[pending_id] = current
+            if DONE_RE.search(line):
+                if task_id:
+                    role_pending.pop(task_id, None)
+                    _resolve_task_incidents(state, role, task_id, current)
+                else:
+                    # Compatibility for logs written before task correlation:
+                    # an unkeyed terminal line may close only an unkeyed start.
+                    # It must never consume a modern task or a different ID.
+                    legacy_ids = [item for item in role_pending if item.startswith("legacy-")]
+                    if legacy_ids:
+                        oldest = min(legacy_ids, key=lambda item: float(role_pending[item]))
+                        role_pending.pop(oldest, None)
             code = classify_line(line, role=role)
             _record_diagnostic_observation(state, line, role, code)
             if code:
@@ -1335,11 +1462,13 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     state["alerted"][fingerprint] = current
         else:
             state["service_down_since"].pop(role, None)
-        pending = state["pending"].get(role, [])
-        if pending and current - pending[0] >= NO_RESPONSE_SECONDS:
-            fingerprint = _fingerprint(role, "no_response", str(int(pending[0])))
+        pending = state["pending"].get(role, {})
+        for pending_id, started_at in sorted(pending.items(), key=lambda item: float(item[1])):
+            if current - float(started_at) < NO_RESPONSE_SECONDS:
+                continue
+            fingerprint = _fingerprint(role, "no_response", pending_id)
             if fingerprint not in state["alerted"]:
-                alerts.append({"role": role, "code": "no_response", "fingerprint": fingerprint, "message": f"[Roda 감지] {role} 봇이 요청을 시작했지만 {NO_RESPONSE_SECONDS}초 내 완료·오류 기록이 없습니다. 확인이 필요합니다.", "detail": f"no completion/error event for {NO_RESPONSE_SECONDS}s"})
+                alerts.append({"role": role, "code": "no_response", "fingerprint": fingerprint, "task_id": pending_id, "message": f"[Roda 감지] {role} 봇이 요청을 시작했지만 {NO_RESPONSE_SECONDS}초 내 완료·오류 기록이 없습니다. 확인이 필요합니다.", "detail": f"task={pending_id}; no completion/error event for {NO_RESPONSE_SECONDS}s"})
                 state["alerted"][fingerprint] = current
     for recovery_fingerprint, recovery in state["recovery_watch"].items():
         if recovery.get("status") in {"awaiting_reprocess", "reprocess_started"} and current >= float(recovery["deadline"]):
@@ -1357,6 +1486,14 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                 "recovery_fingerprint": recovery_fingerprint,
             })
             recovery["notified"] = True
+            if status == "completed_success":
+                incident = state.setdefault("incidents", {}).get(recovery_fingerprint)
+                if incident:
+                    incident["status"] = "resolved"
+                    incident["resolved_at"] = current
+                    incident["resolution"] = "post-repair request completed successfully"
+    for event in alerts:
+        _upsert_incident(state, event, current)
     state["initialized"] = True
     return alerts
 
@@ -1391,13 +1528,15 @@ def _process_cycle(state: dict) -> None:
                 continue
             diagnosis = state["repair_results"].get(fingerprint)
             if diagnosis is None:
-                try:
-                    _send_alert(
-                        f"{event['message']}\n세부: {event['detail']}\n\n"
-                        "[Codex 자동복구 시작]\n원인 분석과 안전 검증을 진행합니다."
-                    )
-                except Exception as exc:
-                    print(f"Roda detection alert delivery failed: {type(exc).__name__}: {exc}")
+                blocker = _repair_preflight_blocker(event)
+                if blocker is None:
+                    try:
+                        _send_alert(
+                            f"{event['message']}\n세부: {event['detail']}\n\n"
+                            "[Codex 자동복구 시작]\n원인 분석과 안전 검증을 진행합니다."
+                        )
+                    except Exception as exc:
+                        print(f"Roda detection alert delivery failed: {type(exc).__name__}: {exc}")
             if diagnosis is None:
                 diagnosis = _run_codex_repair(event, state)
                 state["repair_results"][fingerprint] = diagnosis
@@ -1418,6 +1557,7 @@ def _process_cycle(state: dict) -> None:
 
 
 def main() -> int:
+    _harden_log_permissions()
     state = _load_state()
     if "--once" in sys.argv[1:]:
         try:

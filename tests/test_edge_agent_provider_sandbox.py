@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import fcntl
+import os
 import subprocess
 import tempfile
 import unittest
@@ -9,12 +10,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 WRAPPER = ROOT / "bin" / "edge-agent-provider-sandbox.sh"
 PROTECTED_ROOT = Path.home() / ".edge-agent" / "protected-canary"
+TEST_LOCK_ROOT = Path(os.environ.get("EDGE_AGENT_TEST_LOCK_ROOT", str(PROTECTED_ROOT.parent))).expanduser()
 PROTECTED_TARGET = PROTECTED_ROOT / ".edge-agent-canary-probe"
 
 
 class ProviderSandboxCanaryTests(unittest.TestCase):
     def setUp(self):
-        lock_path = Path.home() / ".edge-agent" / "protected-canary.lock"
+        lock_path = TEST_LOCK_ROOT / "protected-canary.lock"
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         self._fixture_lock = lock_path.open("a+")
         fcntl.flock(self._fixture_lock.fileno(), fcntl.LOCK_EX)
@@ -132,8 +134,10 @@ class ProviderSandboxCanaryTests(unittest.TestCase):
             fake_codex = Path(temp_dir) / "codex"
             fake_codex.write_text("#!/bin/sh\nexit 0\n")
             fake_codex.chmod(0o755)
+            retired = Path.home() / ".openclaw" / "nonexistent"
+            relative_retired = os.path.relpath(retired, ROOT)
             result = subprocess.run(
-                [str(WRAPPER), str(fake_codex), "-C", "../.openclaw/nonexistent"],
+                [str(WRAPPER), str(fake_codex), "-C", relative_retired],
                 cwd=ROOT,
                 capture_output=True,
                 text=True,

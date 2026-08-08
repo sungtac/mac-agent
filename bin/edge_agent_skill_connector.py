@@ -12,10 +12,15 @@ def select_skill_ids(prompt: str) -> list[str]:
     return list(select_capability_skill_ids(prompt))
 
 
-def build_skill_context(prompt: str, *, max_chars: int = 6000) -> str:
+def build_skill_context(
+    prompt: str,
+    *,
+    max_chars: int = 6000,
+    include_peer: bool = True,
+) -> str:
     # Keep a small budget for peer state on normal prompts. Very tight
     # contexts stay skill-only so required contracts are not displaced.
-    peer_budget = 1200 if max_chars >= 2400 else 0
+    peer_budget = 1200 if include_peer and max_chars >= 2400 else 0
     context = resolve(prompt, max_chars=max_chars - peer_budget).context
     if peer_budget == 0:
         return context[:max_chars]

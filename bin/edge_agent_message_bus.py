@@ -28,6 +28,18 @@ from edge_agent_agent_message import (
     verify_message,
 )
 from edge_agent_secure_paths import ensure_private_directory, open_lock
+from edge_agent_governance import (
+    GovernanceError,
+    GovernancePolicy,
+    admit_message,
+    apply_message_admission,
+    initial_governance,
+    record_actual_usage,
+    retry_allowed,
+    semantic_message_key,
+)
+from edge_agent_trace import event_trace
+from edge_agent_capability_token import CapabilityError, CapabilityToken, verify_capability
 
 
 SCHEMA = "edge_agent.message_bus.v1"
@@ -35,6 +47,15 @@ TASK_SCHEMA = "edge_agent.task_graph.v1"
 MAX_MESSAGES_PER_SESSION = 2000
 MAX_TASKS_PER_SESSION = 256
 DEFAULT_LEASE_SECONDS = 90.0
+
+
+def _active_task_count_for_payload(payload: Mapping[str, Any]) -> int:
+    terminal = {"completed", "failed", "cancelled"}
+    return sum(
+        1
+        for item in (payload.get("tasks") or {}).values()
+        if isinstance(item, Mapping) and item.get("status") not in terminal
+    )
 
 
 def _safe(value: object, name: str) -> str:
@@ -73,13 +94,14 @@ class MessageBusError(ValueError):
 class MessageBus:
     """Cross-process durable inboxes with leases, acknowledgements and a DAG."""
 
-    def __init__(self, root: str | os.PathLike[str] | None = None):
+    def __init__(self, root: str | os.PathLike[str] | None = None, *, policy: GovernancePolicy | None = None):
         configured = root or os.environ.get(
             "EDGE_AGENT_MESSAGE_BUS_ROOT",
             str(Path.home() / ".edge-agent" / "state" / "message-bus"),
         )
         self.root = Path(configured).expanduser()
         ensure_private_directory(self.root)
+        self.policy = policy or GovernancePolicy.from_env()
 
     def _path(self, session_id: str) -> Path:
         return self.root / f"{_safe(session_id, 'session_id')}.json"
@@ -112,19 +134,22 @@ class MessageBus:
                 pass
 
     @staticmethod
-    def _empty(session_id: str, request: str = "", max_rounds: int = 3) -> dict[str, Any]:
+    def _empty(session_id: str, request: str = "", max_rounds: int = 3, *, policy: GovernancePolicy | None = None) -> dict[str, Any]:
+        selected_policy = policy or GovernancePolicy()
+        created = _now()
         return {
             "schema": SCHEMA,
             "session_id": session_id,
             "request": str(request)[:4000],
             "status": "active",
-            "max_rounds": max(1, min(8, int(max_rounds))),
+            "max_rounds": max(1, min(selected_policy.max_rounds, int(max_rounds))),
             "messages": [],
             "tasks": {},
             "checkpoints": {},
             "events": [],
-            "created_epoch": _now(),
-            "updated_epoch": _now(),
+            "created_epoch": created,
+            "updated_epoch": created,
+            "governance": initial_governance(selected_policy, now=created),
         }
 
     def create_session(self, session_id: str, request: str = "", *, max_rounds: int = 3) -> dict[str, Any]:
@@ -135,7 +160,7 @@ class MessageBus:
             current = self._read(session_id)
             if current is not None:
                 return current
-            payload = self._empty(session_id, request, max_rounds)
+            payload = self._empty(session_id, request, max_rounds, policy=self.policy)
             self._write(session_id, payload)
             return payload
         finally:
@@ -143,12 +168,18 @@ class MessageBus:
             os.close(fd)
 
     def _load_or_create(self, session_id: str, request: str = "") -> dict[str, Any]:
-        return self._read(session_id) or self._empty(session_id, request)
+        return self._read(session_id) or self._empty(session_id, request, policy=self.policy)
 
     @staticmethod
     def _event(payload: dict[str, Any], kind: str, **fields: Any) -> None:
         events = list(payload.get("events") or [])
-        events.append({"kind": kind, "epoch": _now(), **fields})
+        session_id = str(payload.get("session_id") or "event-session")
+        events.append({
+            "kind": kind,
+            "epoch": _now(),
+            "trace": event_trace(session_id, str(fields.get("task_id") or "event")).to_dict(),
+            **fields,
+        })
         payload["events"] = events[-4000:]
         payload["updated_epoch"] = _now()
 
@@ -170,11 +201,24 @@ class MessageBus:
         *,
         verification_key: object | None = None,
         request: str = "",
+        capability: CapabilityToken | Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Verify and enqueue a message exactly once for all recipients."""
         try:
-            verify_message(message, self._verification_key(verification_key))
-        except (AgentMessageError, OSError, ValueError) as exc:
+            key = self._verification_key(verification_key)
+            verify_message(message, key)
+            if message.requires_user_report:
+                if capability is None:
+                    raise CapabilityError("user-report message requires capability")
+                verify_capability(
+                    capability,
+                    key,
+                    required_action="message.publish",
+                    subject=message.from_role,
+                    audience="message-bus",
+                    task_id=message.task_id,
+                )
+        except (AgentMessageError, CapabilityError, OSError, ValueError) as exc:
             raise MessageBusError(f"message rejected: {exc}") from exc
         session_id = _safe(message.session_id, "session_id")
         fd = self._lock()
@@ -187,14 +231,32 @@ class MessageBus:
                 raise MessageBusError("message round exceeds session budget")
             messages = list(payload.get("messages") or [])
             message_id = _message_id(message)
+            semantic_key = semantic_message_key(
+                session_id=message.session_id,
+                task_id=message.task_id,
+                from_role=message.from_role,
+                purpose=message.purpose,
+                round_number=message.round,
+                summary=message.summary,
+            )
             for item in messages:
-                if item.get("message_id") == message_id or item.get("deduplication_key") == deduplication_key(message):
+                if (
+                    item.get("message_id") == message_id
+                    or item.get("deduplication_key") == deduplication_key(message)
+                    or item.get("semantic_key") == semantic_key
+                ):
                     return dict(item)
-            if len(messages) >= MAX_MESSAGES_PER_SESSION:
+            try:
+                admission = admit_message(payload, message, policy=self.policy)
+            except GovernanceError as exc:
+                raise MessageBusError(str(exc)) from exc
+            if len(messages) >= min(MAX_MESSAGES_PER_SESSION, self.policy.max_messages):
                 raise MessageBusError("session message budget exhausted")
             item = {
                 "message_id": message_id,
                 "deduplication_key": deduplication_key(message),
+                "semantic_key": semantic_key,
+                "estimated_tokens": int(admission["estimated_tokens"]),
                 "message": message.to_dict(),
                 "status": "queued",
                 "lease_owner": "",
@@ -205,6 +267,7 @@ class MessageBus:
                 },
                 "created_epoch": _now(),
             }
+            apply_message_admission(payload, message, admission, policy=self.policy)
             messages.append(item)
             payload["messages"] = messages
             tasks = dict(payload.get("tasks") or {})
@@ -218,6 +281,8 @@ class MessageBus:
                     "purpose": message.purpose,
                     "status": "waiting",
                     "depends_on": [],
+                    "depth": 0,
+                    "deadline_epoch": _now() + self.policy.max_task_seconds,
                     "created_epoch": _now(),
                     "updated_epoch": _now(),
                 },
@@ -254,6 +319,18 @@ class MessageBus:
                 changed = False
                 for item in current.get("messages") or []:
                     message = _message_from_dict(item.get("message") or {})
+                    task = (current.get("tasks") or {}).get(message.task_id) or {}
+                    if float(task.get("deadline_epoch") or 0.0) and float(task.get("deadline_epoch")) <= now:
+                        for expired_delivery in (item.setdefault("deliveries", {}).values()):
+                            if expired_delivery.get("status") in {"queued", "leased"}:
+                                expired_delivery["status"] = "failed"
+                                expired_delivery["last_error"] = "task deadline exceeded"
+                                expired_delivery["lease_owner"] = ""
+                                expired_delivery["lease_until"] = 0.0
+                        item["status"] = "failed"
+                        self._event(current, "task_deadline_exceeded", task_id=message.task_id, message_id=item.get("message_id"))
+                        changed = True
+                        continue
                     targets = set(message.to)
                     delivery = (item.setdefault("deliveries", {}).setdefault(
                         role, {"status": item.get("status", "queued"), "lease_owner": item.get("lease_owner", ""), "lease_until": item.get("lease_until", 0.0)}
@@ -342,7 +419,7 @@ class MessageBus:
                 attempts = int(delivery.get("attempts", 0)) + 1
                 delivery["attempts"] = attempts
                 delivery["last_error"] = str(error)[:500]
-                delivery["status"] = "queued" if requeue and attempts < 3 else "failed"
+                delivery["status"] = "queued" if requeue and retry_allowed(attempts, self.policy) else "failed"
                 delivery["lease_owner"] = ""
                 delivery["lease_until"] = 0.0
                 self._event(payload, "message_released", message_id=message_id, owner=owner, requeue=delivery["status"] == "queued")
@@ -384,6 +461,39 @@ class MessageBus:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def record_usage(self, session_id: str, message_id: str, *, actual_tokens: int) -> dict[str, Any]:
+        """Persist provider usage and fail closed if the hard budget is exceeded."""
+        session_id = _safe(session_id, "session_id")
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                raise MessageBusError("usage session does not exist")
+            item = next((entry for entry in payload.get("messages") or [] if entry.get("message_id") == message_id), None)
+            if item is None:
+                raise MessageBusError("usage message does not exist")
+            message = _message_from_dict(item.get("message") or {})
+            try:
+                record_actual_usage(
+                    payload,
+                    task_id=message.task_id,
+                    estimated_tokens=int(item.get("estimated_tokens", 0)),
+                    actual_tokens=int(actual_tokens),
+                    policy=self.policy,
+                )
+            except GovernanceError as exc:
+                raise MessageBusError(str(exc)) from exc
+            usage = dict(payload.get("usage") or {})
+            usage[message_id] = {"task_id": message.task_id, "actual_tokens": max(0, int(actual_tokens)), "updated_epoch": _now()}
+            payload["usage"] = usage
+            self._event(payload, "usage_recorded", message_id=message_id, task_id=message.task_id, actual_tokens=max(0, int(actual_tokens)))
+            self._write(session_id, payload)
+            return dict(usage[message_id])
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def recoverable(self, session_id: str) -> list[dict[str, Any]]:
         """Return non-terminal task checkpoints suitable for a restarted worker."""
         payload = self._read(_safe(session_id, "session_id")) or {}
@@ -408,8 +518,10 @@ class MessageBus:
             tasks = dict(payload.get("tasks") or {})
             if task_id in tasks:
                 return dict(tasks[task_id])
-            if len(tasks) >= MAX_TASKS_PER_SESSION:
+            if len(tasks) >= min(MAX_TASKS_PER_SESSION, self.policy.max_tasks):
                 raise MessageBusError("session task budget exhausted")
+            if task_id not in tasks and _active_task_count_for_payload(payload) >= self.policy.max_active_tasks:
+                raise MessageBusError("active task concurrency budget exhausted")
             if parent_task_id:
                 _safe(parent_task_id, "parent_task_id")
                 if parent_task_id not in tasks:
@@ -424,10 +536,14 @@ class MessageBus:
                 "purpose": _safe(purpose, "purpose"),
                 "status": "ready" if not dependencies else "blocked",
                 "depends_on": list(dependencies),
+                "depth": int(tasks.get(parent_task_id, {}).get("depth", -1)) + 1 if parent_task_id else 0,
+                "deadline_epoch": _now() + self.policy.max_task_seconds,
                 "created_epoch": _now(),
                 "updated_epoch": _now(),
             }
             tasks[task_id] = task
+            if task["depth"] > self.policy.max_subagent_depth:
+                raise MessageBusError("task depth budget exhausted")
             payload["tasks"] = tasks
             self._event(payload, "task_spawned", task_id=task_id, parent_task_id=parent_task_id, owner=owner)
             self._write(session_id, payload)
@@ -447,6 +563,17 @@ class MessageBus:
             if payload is None or task_id not in (payload.get("tasks") or {}):
                 raise MessageBusError("task does not exist")
             task = payload["tasks"][task_id]
+            if (
+                status not in {"failed", "cancelled"}
+                and float(task.get("deadline_epoch") or 0.0)
+                and float(task.get("deadline_epoch")) <= _now()
+            ):
+                task["status"] = "failed"
+                task["summary"] = "task deadline exceeded"
+                task["updated_epoch"] = _now()
+                self._event(payload, "task_deadline_exceeded", task_id=task_id)
+                self._write(str(payload["session_id"]), payload)
+                raise MessageBusError("task deadline exceeded")
             task["status"] = status
             task["summary"] = str(summary)[:1600]
             task["updated_epoch"] = _now()

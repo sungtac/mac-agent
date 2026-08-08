@@ -193,6 +193,39 @@ class ContextEnvelopeContinuityTests(unittest.TestCase):
             path.write_text(__import__("json").dumps(payload), encoding="utf-8")
             self.assertIsNone(self.bot._load_native_session_id("claude", chat_id="chat-1", workspace=workspace))
 
+    def test_native_session_budget_rotates_before_resume(self):
+        workspace = Path(self.tempdir.name) / "workspace"
+        workspace.mkdir()
+        session_id = "12345678-1234-5678-1234-567812345678"
+        with patch.dict(os.environ, {"TELEGRAM_AGENT_NATIVE_SESSION_FILE": str(Path(self.tempdir.name) / "native.json")}):
+            self.bot._persist_native_session_id(
+                "claude",
+                session_id,
+                chat_id="chat-budget",
+                workspace=workspace,
+                turn_count=self.bot.CLAUDE_NATIVE_MAX_TURNS,
+                prompt_chars=0,
+            )
+            record = self.bot._load_native_session_record("claude", chat_id="chat-budget", workspace=workspace)
+            self.assertTrue(self.bot._native_session_budget_exceeded(record, 1))
+
+    def test_malformed_native_session_payload_is_ignored(self):
+        workspace = Path(self.tempdir.name) / "workspace"
+        workspace.mkdir()
+        session_file = Path(self.tempdir.name) / "native.json"
+        with patch.dict(os.environ, {"TELEGRAM_AGENT_NATIVE_SESSION_FILE": str(session_file)}):
+            session_file.write_text("[]", encoding="utf-8")
+            self.assertIsNone(self.bot._load_native_session_record("claude", chat_id="chat-bad", workspace=workspace))
+
+    def test_runtime_prompt_can_render_a_different_provider_identity(self):
+        runtime_prompt, _ = self.bot._runtime_prompt_parts(
+            "코드 리뷰",
+            role="codex",
+            workspace=self.bot.CODEX_WORKSPACE,
+        )
+        self.assertIn("Codex", runtime_prompt)
+        self.assertNotIn("Antigravity (안티)", runtime_prompt)
+
 
 class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -249,6 +282,13 @@ class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         for prompt in captured:
             self.assertIn("https://example.com", prompt)
             self.assertIn("sanitized anchor", prompt)
+
+    def test_shared_team_contract_is_loaded_by_direct_and_roda_bridges(self):
+        direct_prompt, _ = self.bot._runtime_prompt_parts("모두 자기 소개 부탁해")
+        self.assertIn("공통 Edge Agent Telegram 팀 계약", direct_prompt)
+        self.assertIn("Roda", direct_prompt)
+        self.assertIn("공통 Edge Agent Telegram 팀 계약", self.roda.TEAM_CONTRACT)
+        self.assertIn("Edge Agent Telegram 팀의 Roda 구성원", self.roda.SYSTEM_PROMPT)
 
     async def test_ambiguous_context_blocks_provider(self):
         self.store.prepare(channel="telegram", provider="claude", chat_id="-1003952617795", message_id=1, reply_to_message_id=None, text="https://example.com/a", now="2026-08-01T08:44:00+00:00")

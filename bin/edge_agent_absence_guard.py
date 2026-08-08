@@ -28,12 +28,12 @@ SOURCE_NAME_RE = re.compile(
 ABSENCE_CLAIM_RE = re.compile(
     r"(?:"
     r"(?:token|api\s*key|secret|credential|인증|자격|토큰|키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
-    r".{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
+    r"[^\n\\]{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
     r"|"
     r"(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
-    r".{0,80}(?:token|api\s*key|secret|credential|인증|자격|토큰|키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
+    r"[^\n\\]{0,80}(?:token|api\s*key|secret|credential|인증|자격|토큰|키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
     r")",
-    re.IGNORECASE | re.DOTALL,
+    re.IGNORECASE,
 )
 
 

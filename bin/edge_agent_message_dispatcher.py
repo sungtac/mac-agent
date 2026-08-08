@@ -19,6 +19,7 @@ from edge_agent_message_bus import MessageBus, MessageBusError, message_from_dic
 class DispatchOutcome:
     summary: str = ""
     child_messages: tuple[AgentMessage, ...] = ()
+    usage_tokens: int = 0
 
 
 Handler = Callable[[AgentMessage], DispatchOutcome | str | None]
@@ -54,6 +55,11 @@ class MessageDispatcher:
                     normalized = DispatchOutcome(summary=outcome)
                 else:
                     normalized = outcome
+                self.bus.record_usage(
+                    message.session_id,
+                    message_id,
+                    actual_tokens=max(0, int(normalized.usage_tokens)),
+                )
                 for child in normalized.child_messages:
                     self.bus.publish(child)
                 self.bus.checkpoint(

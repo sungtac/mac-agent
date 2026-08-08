@@ -9,8 +9,7 @@ WORKDIR="${3:-$PWD}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)"
 SANDBOX="$ROOT/bin/edge-agent-provider-sandbox.sh"
-CAPABILITY_RESOLVER="$ROOT/bin/edge_agent_capability_registry.py"
-CAPABILITY_PREFLIGHT="$ROOT/bin/edge_agent_capability_preflight.py"
+CHANNEL_RUNTIME="$ROOT/bin/edge_agent_channel_runtime.py"
 SESSION_BRIDGE="$ROOT/bin/edge_agent_session_bridge.py"
 
 [ -f "$PROMPT_FILE" ] || { echo "prompt file not found: $PROMPT_FILE" >&2; exit 66; }
@@ -25,27 +24,33 @@ if [ -z "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_STARTED=1
 fi
 
-REQUEST_PROMPT="$(cat "$PROMPT_FILE")"
-CAPABILITY_PREFLIGHT_CONTEXT="$(python3 "$CAPABILITY_PREFLIGHT" --workdir "$WORKDIR" --format prompt 2>/dev/null || printf '%s' '[Capability-first preflight unavailable: treat capabilities as unknown and verify before declaring unavailable.]')"
-SKILL_CONTEXT="$(python3 "$CAPABILITY_RESOLVER" --prompt "$REQUEST_PROMPT")"
-PROMPT="$CAPABILITY_PREFLIGHT_CONTEXT"
-if [ -n "$SKILL_CONTEXT" ]; then
-  PROMPT="$PROMPT
-
-$SKILL_CONTEXT"
-fi
+SESSION_CONTEXT=""
 if [ -n "${EDGE_AGENT_LOGICAL_SESSION_ID:-}" ]; then
   SESSION_CONTEXT="$(python3 "$SESSION_BRIDGE" context "$EDGE_AGENT_LOGICAL_SESSION_ID")"
-  if [ -n "$SESSION_CONTEXT" ]; then
-    PROMPT="$PROMPT
+fi
+PROMPT="$(python3 "$CHANNEL_RUNTIME" render --provider "$PROVIDER" --channel terminal --workdir "$WORKDIR" --request-file "$PROMPT_FILE" --session-context "$SESSION_CONTEXT")"
 
-$SESSION_CONTEXT"
+# Canary path: route terminal provider work through the canonical engine's
+# bounded dispatcher.  It is deliberately opt-in until terminal handoff and
+# recovery tests pass in the host environment.  The normal path below remains
+# unchanged, preserving rollback by unsetting one flag.
+if [[ "${EDGE_AGENT_TERMINAL_CORE_DISPATCH:-0}" == "1" || "${EDGE_AGENT_TERMINAL_CORE_DISPATCH:-0}" == "true" ]]; then
+  RUNNER="$ROOT/bin/edge-agent-terminal-core-runner.py"
+  if [ -f "$RUNNER" ]; then
+    PYTHON="${EDGE_AGENT_PYTHON:-/opt/homebrew/bin/python3}"
+    RENDERED_PROMPT="$(mktemp "${TMPDIR:-/tmp}/edge-agent-terminal-prompt.XXXXXX")"
+    trap 'rm -f "$RENDERED_PROMPT"' EXIT
+    printf '%s\n' "$PROMPT" > "$RENDERED_PROMPT"
+    set +e
+    "$PYTHON" "$RUNNER" "$PROVIDER" "$RENDERED_PROMPT" "$WORKDIR"
+    RC=$?
+    set -e
+    if [ "$SESSION_STARTED" -eq 1 ]; then
+      python3 "$SESSION_BRIDGE" finish "$EDGE_AGENT_LOGICAL_SESSION_ID" "$([ "$RC" -eq 0 ] && echo succeeded || echo failed)" || true
+    fi
+    exit "$RC"
   fi
 fi
-PROMPT="$PROMPT
-
-[터미널 작업 요청]
-$REQUEST_PROMPT"
 
 case "$PROVIDER" in
   claude)

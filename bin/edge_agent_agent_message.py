@@ -16,6 +16,8 @@ from typing import Any, Mapping, Sequence
 
 import fcntl
 
+from edge_agent_trace import TraceContext
+
 SCHEMA = "edge_agent.agent_message.v1"
 TRUST_DOMAIN = "telegram-internal"
 AGENT_ROLES = frozenset({"claude", "codex", "antigravity", "roda"})
@@ -75,6 +77,9 @@ class AgentMessage:
     trust_domain: str = TRUST_DOMAIN
     key_id: str = ""
     signature: str = ""
+    trace_id: str = ""
+    span_id: str = ""
+    parent_span_id: str = ""
     requires_user_report: bool = False
     schema: str = SCHEMA
 
@@ -103,6 +108,26 @@ class AgentMessage:
             raise AgentMessageError("untrusted message domain")
         object.__setattr__(self, "key_id", _id("key_id", self.key_id))
         object.__setattr__(self, "source_event_id", _id("source_event_id", self.source_event_id))
+        if self.trace_id and self.span_id:
+            trace = TraceContext(
+                trace_id=self.trace_id,
+                span_id=self.span_id,
+                parent_span_id=self.parent_span_id,
+            )
+        else:
+            trace = TraceContext.for_message(
+                session_id=self.session_id,
+                task_id=self.task_id,
+                source_event_id=self.source_event_id,
+                from_role=self.from_role,
+                purpose=self.purpose,
+                round_number=self.round,
+                trace_id=self.trace_id,
+                parent_span_id=self.parent_span_id,
+            )
+        object.__setattr__(self, "trace_id", trace.trace_id)
+        object.__setattr__(self, "span_id", trace.span_id)
+        object.__setattr__(self, "parent_span_id", trace.parent_span_id)
         if self.schema != SCHEMA:
             raise AgentMessageError("unsupported agent message schema")
 
@@ -122,6 +147,10 @@ class AgentMessage:
 
 
 def sign_message(message: AgentMessage, signing_key: str | bytes | Mapping[str, str | bytes]) -> AgentMessage:
+    if hasattr(signing_key, "sign") and hasattr(signing_key, "key_id"):
+        if message.key_id != signing_key.key_id:
+            message = replace(message, key_id=signing_key.key_id, signature="")
+        return replace(message, signature=signing_key.sign(message.canonical_bytes()))
     signature = hmac.new(_key(signing_key, message.key_id), message.canonical_bytes(), hashlib.sha256).hexdigest()
     return replace(message, signature=signature)
 
@@ -133,14 +162,21 @@ def verify_message(message: AgentMessage, signing_key: str | bytes | Mapping[str
         raise AgentMessageError("agent message key id mismatch")
     if not message.signature:
         raise AgentMessageError("unsigned agent message")
+    if hasattr(signing_key, "verify") and hasattr(signing_key, "key_id"):
+        if message.key_id != signing_key.key_id:
+            raise AgentMessageError("agent identity key id mismatch")
+        try:
+            return bool(signing_key.verify(message.canonical_bytes(), message.signature))
+        except Exception as exc:
+            raise AgentMessageError("agent identity verification failed") from exc
     expected = hmac.new(_key(signing_key, message.key_id), message.canonical_bytes(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(message.signature, expected):
         raise AgentMessageError("agent message signature mismatch")
     return True
 
 
-def build_message(*, session_id: str, task_id: str, from_role: str, to: Sequence[str], purpose: str, summary: str, source_event_id: str, key_id: str, signing_key: str | bytes | Mapping[str, str | bytes], evidence_refs: Sequence[str] = (), hop: int = 0, round: int = 1, requires_user_report: bool = False) -> AgentMessage:
-    message = AgentMessage(session_id=session_id, task_id=task_id, from_role=from_role, to=tuple(to), purpose=purpose, summary=summary, evidence_refs=tuple(evidence_refs), hop=hop, round=round, source_event_id=source_event_id, key_id=key_id, requires_user_report=requires_user_report)
+def build_message(*, session_id: str, task_id: str, from_role: str, to: Sequence[str], purpose: str, summary: str, source_event_id: str, key_id: str, signing_key: str | bytes | Mapping[str, str | bytes], evidence_refs: Sequence[str] = (), hop: int = 0, round: int = 1, trace_id: str = "", parent_span_id: str = "", requires_user_report: bool = False) -> AgentMessage:
+    message = AgentMessage(session_id=session_id, task_id=task_id, from_role=from_role, to=tuple(to), purpose=purpose, summary=summary, evidence_refs=tuple(evidence_refs), hop=hop, round=round, source_event_id=source_event_id, key_id=key_id, trace_id=trace_id, parent_span_id=parent_span_id, requires_user_report=requires_user_report)
     return sign_message(message, signing_key)
 
 
@@ -154,7 +190,15 @@ def next_hop(message: AgentMessage, *, recipient: str, signing_key: str | bytes 
         raise AgentMessageError("unknown recipient role")
     if message.hop >= MAX_HOP:
         raise AgentMessageError("agent message hop limit reached")
-    forwarded = replace(message, from_role=recipient, to=(recipient,), hop=message.hop + 1, signature="")
+    forwarded = replace(
+        message,
+        from_role=recipient,
+        to=(recipient,),
+        hop=message.hop + 1,
+        parent_span_id=message.span_id,
+        span_id="",
+        signature="",
+    )
     return sign_message(forwarded, signing_key)
 
 

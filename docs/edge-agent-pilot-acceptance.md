@@ -12,6 +12,8 @@
 - 파일럿 전용 clean worktree 준비: `/tmp/edge-agent-pilot-pNnY1i/worktree`
 - 병렬 worktree 읽기 전용 감사 결과: finding 0건
 - 자동 병합 기본값 비활성 확인
+- 자동 병합은 승인 reference와 승인 검증기가 모두 없으면 provider 시작 전 fail-closed
+- 비용 없는 fake provider 3개 동시 실행·join 계약 테스트 통과
 - 세션 lease·ContextStore·결과 DTO·worktree 연결 테스트 통과
 
 ## 기존 실제 provider 증거
@@ -35,8 +37,8 @@
 
 - 실제 Telegram·Discord·launchd 런타임에 새 세션 계층을 연결하지 않았다.
 - 실제 provider 재호출은 사용량과 세션 한도를 소모한다.
-- nano 임계값 분석 조건(이벤트 20건·위험 입력 10건·사용량 입력 10건)을
-  아직 충족하지 않았다.
+- nano 원장은 존재하지만 0바이트이며, 임계값 분석 조건(이벤트 20건·위험 입력
+  10건·사용량 입력 10건)을 아직 충족하지 않았다.
 - 병렬 실행과 자동 병합은 명시적 운영 승인 전까지 비활성 상태다.
 - 현재 작업 트리에 다른 기능 통합 변경이 존재하므로, 운영 연결 전 기준 commit과
   대상 파일 범위를 다시 확정해야 한다.
@@ -96,6 +98,10 @@ usage 조회가 실패해도 알려진 저사용량 차단은 유지된다. 정�
 - `bin/edge_agent_parallel_audit.py --repo /Users/edge_ai/mac-agent --json` 실행
 - manifest/worktree 불일치·고아·예약 만료 finding: 0건
 - 실제 병렬 Provider와 자동 merge는 계속 비활성 상태로 유지했다.
+- 코드 경로에는 `ParallelApprovalRequired` 게이트를 추가해 승인 없는 자동 병합을
+  provider 시작 전에 차단한다. 운영 기본값은 계속 비활성이다.
+- Ed25519 운영 발급·회전 절차는 별도 runbook으로 정리했지만, live key 발급과
+  기본 HMAC 경계 변경은 승인 전까지 수행하지 않는다.
 
 ## 2026-08-02 차단→개선 강제 검증
 

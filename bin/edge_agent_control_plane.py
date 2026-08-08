@@ -278,6 +278,51 @@ class ControlPlaneStore:
                 result.append(payload)
         return result
 
+    def reconcile_terminal_sessions(self, session_root: str | os.PathLike[str]) -> int:
+        """Close control tasks whose canonical session snapshot is terminal.
+
+        A provider can die after updating its durable session but before the
+        control-plane completion callback.  Reconciliation is intentionally
+        one-way: it only copies terminal status, never creates approval,
+        resumes work, or cancels a running session.
+        """
+        snapshots = Path(session_root).expanduser().resolve() / "snapshots"
+        reconciled = 0
+        status_map = {"succeeded": "completed", "failed": "failed", "cancelled": "cancelled"}
+        for path in sorted(self.root.glob("chat-*.json")):
+            descriptor = open_lock(path.with_suffix(".lock"))
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                payload = self._read(path)
+                changed = False
+                for task_id, task in payload["tasks"].items():
+                    if task.get("status") in TERMINAL_TASK_STATES:
+                        continue
+                    if not task_id or any(char in str(task_id) for char in "/\\\x00"):
+                        continue
+                    snapshot_path = snapshots / f"session-{task_id}.json"
+                    try:
+                        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                    except (FileNotFoundError, OSError, UnicodeError, json.JSONDecodeError):
+                        continue
+                    target = status_map.get(str(snapshot.get("status")))
+                    if target is None:
+                        continue
+                    task["status"] = target
+                    task["summary"] = "reconciled from canonical session terminal state"
+                    task["finished_epoch"] = time.time()
+                    self._event(payload, "task_reconciled", task_id=task_id, status=target)
+                    reconciled += 1
+                    changed = True
+                if changed:
+                    active = [item for item in payload["tasks"].values() if item.get("status") not in TERMINAL_TASK_STATES]
+                    payload["status"] = "running" if active else "completed"
+                    self._write(path, payload)
+            finally:
+                fcntl.flock(descriptor, fcntl.LOCK_UN)
+                os.close(descriptor)
+        return reconciled
+
 
 __all__ = [
     "ControlPlaneError",

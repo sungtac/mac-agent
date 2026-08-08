@@ -8,6 +8,7 @@ from dataclasses import replace
 from typing import Iterable
 
 from edge_agent_plan_gate import is_approval
+from edge_agent_ingress import routing_projection
 from edge_agent_router_contract import (
     ExecutionMode,
     RiskLevel,
@@ -43,7 +44,10 @@ _TASK_PATTERNS: tuple[tuple[TaskType, tuple[str, ...]], ...] = (
     (TaskType.REVIEW, ("검토", "리뷰", "감사", "검증", "점검")),
     (TaskType.IMPROVEMENT, ("개선", "보완", "부족한", "향상")),
     (TaskType.WRITING, ("작성", "써줘", "문장", "고쳐줘", "자연스럽게")),
-    (TaskType.RESEARCH, ("조사", "리서치", "시장", "공고", "찾아", "출처")),
+    (TaskType.RESEARCH, (
+        "조사", "리서치", "시장", "공고", "찾아", "출처",
+        "태풍", "허리케인", "사이클론", "열대저기압", "현재 위치", "진행 상황", "진행상황", "경로", "예보",
+    )),
     (TaskType.EXPLANATION, ("무슨 뜻", "설명", "알려줘", "의미")),
 )
 
@@ -204,12 +208,13 @@ def route(request: RouterInput | str, *, attachment_count: int | None = None) ->
     if isinstance(request, str):
         request = RouterInput(request, attachment_count=attachment_count or 0)
     text = normalize_text(request.text)
-    task_type = _task_type(text)
-    explicit = tuple(request.explicit_provider for _ in [0]) if request.explicit_provider else mentioned_providers(text)
-    explicit_roles = _provider_role_pairs(text)
-    mode = _execution_mode(text, task_type, request.attachment_count, explicit_roles)
-    claude_forbidden = _claude_forbidden(text)
-    risk = _risk_level(text, task_type)
+    directive = routing_projection(request.text) or text
+    task_type = _task_type(directive)
+    explicit = tuple(request.explicit_provider for _ in [0]) if request.explicit_provider else mentioned_providers(directive)
+    explicit_roles = _provider_role_pairs(directive)
+    mode = _execution_mode(directive, task_type, request.attachment_count, explicit_roles)
+    claude_forbidden = _claude_forbidden(directive)
+    risk = _risk_level(directive, task_type)
     roles = explicit_roles or _default_roles(task_type, mode, explicit)
     if explicit and not explicit_roles:
         roles = _default_roles(task_type, mode, explicit[:1])
@@ -223,7 +228,7 @@ def route(request: RouterInput | str, *, attachment_count: int | None = None) ->
             roles = (RoleAssignment(fallback_role, fallback_provider),)
     claude_required = (
         not claude_forbidden
-        and any(word.casefold() in text.casefold() for word in _SENSITIVE_REVIEW_WORDS)
+        and any(word.casefold() in directive.casefold() for word in _SENSITIVE_REVIEW_WORDS)
     )
     if claude_required and all(item.provider != Provider.CLAUDE for item in roles) and mode != ExecutionMode.SINGLE:
         roles = roles + (RoleAssignment(RouterRole.REVIEWER, Provider.CLAUDE),)
@@ -242,7 +247,7 @@ def route(request: RouterInput | str, *, attachment_count: int | None = None) ->
         reasons.append("attachments")
     if claude_forbidden:
         reasons.append("claude_forbidden")
-    if is_approval(text):
+    if is_approval(directive):
         reasons.append("approval_message")
     return RouterDecision(
         task_type=task_type,
@@ -252,7 +257,7 @@ def route(request: RouterInput | str, *, attachment_count: int | None = None) ->
         claude_required=claude_required,
         claude_forbidden=claude_forbidden,
         requires_approval=risk in {RiskLevel.MEDIUM, RiskLevel.HIGH},
-        requires_worktree=task_type == TaskType.CODING or any(word in text.casefold() for word in _MUTATION_WORDS),
+        requires_worktree=task_type == TaskType.CODING or any(word in directive.casefold() for word in _MUTATION_WORDS),
         reason_codes=tuple(reasons),
         normalized_text=text,
     )

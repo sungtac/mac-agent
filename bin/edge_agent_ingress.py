@@ -14,7 +14,10 @@ import unicodedata
 
 
 AGENT_ROLES = ("claude", "codex", "antigravity", "roda")
-DEFAULT_ROLE = "claude"
+# Codex is the canonical Telegram intake and deputy/coordinator. Claude stays
+# the lead reviewer and integrator, but does not receive ordinary room traffic
+# unless explicitly addressed or assigned a bounded review.
+DEFAULT_ROLE = "codex"
 USERNAMES = {
     "claude": "edgeai_stk_bot",
     "codex": "edgeai_macmini_bot",
@@ -42,6 +45,10 @@ DELIBERATION_MARKERS = (
 _PARTICLES = ("에게", "한테", "야", "아", "씨", "님", "랑", "과", "와", "도", "만", "가", "는", "를", "을", "은", "이")
 _VOCATIVE_PARTICLES = ("야", "아", "씨", "님", "에게", "한테")
 UNMATCHED = "__unmatched__"
+_TRANSCRIPT_TIMESTAMP = re.compile(
+    r"(?:^|\s)\[\d{4}-\d{2}-\d{2}\s+[^\]\n]{1,80}\]"
+)
+_FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
 
 
 @dataclass(frozen=True)
@@ -58,10 +65,10 @@ class IngressDecision:
         if self.route == "broadcast":
             return True
         if self.route == "default":
-            # A human group utterance is addressed to the room.  The caller
-            # may still pass an explicit role for compatibility, but a plain
-            # message must not silently become a Claude-only default.
-            return role in AGENT_ROLES
+            # A plain room utterance belongs to the operational intake role.
+            # Fan-out is explicit through GROUP_ADDRESS_WORDS; otherwise every
+            # provider would repeat the same answer or capability failure.
+            return role == default_role
         return False
 
 
@@ -80,6 +87,25 @@ def _strip_particle(token: str) -> str:
 
 def _alias_role(token: str) -> str | None:
     return ALIASES.get(_strip_particle(_strip_punctuation(token)).casefold())
+
+
+def routing_projection(text: str) -> str:
+    """Return only the current user's routing directive.
+
+    Telegram exports and pasted chat histories contain old vocatives such as
+    ``로다야``.  Those words are evidence supplied to the current request,
+    not fresh addresses.  Keep the full text for the provider prompt, but
+    exclude fenced/blockquote evidence and cut at the first exported
+    timestamp when deciding which process may answer.
+    """
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n")
+    normalized = _FENCED_BLOCK.sub(" ", normalized)
+    lines = [line for line in normalized.splitlines() if not line.lstrip().startswith(">")]
+    candidate = "\n".join(lines)
+    timestamp = _TRANSCRIPT_TIMESTAMP.search(candidate)
+    if timestamp:
+        candidate = candidate[: timestamp.start()]
+    return " ".join(candidate.split()).strip()
 
 
 def _wake_targets(text: str) -> set[str]:
@@ -166,16 +192,40 @@ def _strip_addresses(text: str) -> str:
     return " ".join(cleaned.split()).strip()
 
 
+def _has_codex_delegation_object(text: str, targets: set[str]) -> bool:
+    """Detect a non-Codex role used as the object of a Codex handoff.
+
+    ``코덱스야 클로드에게 맡겨줘`` addresses Codex and names Claude as the
+    delegated recipient.  Treating ``클로드에게`` as a second wake word makes
+    Claude answer the raw request as well, before Codex can create a durable
+    delegation.  Coordinated addresses such as ``클로드와 안티야`` do not use
+    this object form and remain multi-target requests.
+    """
+    if "codex" not in targets:
+        return False
+    for raw_token in text.strip().split():
+        token = _strip_punctuation(raw_token)
+        for particle in ("에게", "한테"):
+            if not token.endswith(particle) or token == particle:
+                continue
+            if _alias_role(token[: -len(particle)]) not in {None, "codex"}:
+                return True
+    return False
+
+
 def classify(text: str, *, default_role: str = DEFAULT_ROLE) -> IngressDecision:
     normalized = " ".join(str(text or "").split()).strip()
     if not normalized:
         return IngressDecision("blocked", frozenset(), "")
-    targets = _mention_targets(normalized) | _wake_targets(normalized)
+    directive = routing_projection(text)
+    targets = _mention_targets(directive) | _wake_targets(directive)
     if UNMATCHED in targets:
         return IngressDecision("blocked", frozenset(targets), _strip_addresses(normalized))
+    if _has_codex_delegation_object(normalized, targets):
+        targets = {"codex"}
     if targets:
         return IngressDecision("targeted", frozenset(targets), _strip_addresses(normalized))
-    if any(word in normalized for word in GROUP_ADDRESS_WORDS):
+    if any(word in directive for word in GROUP_ADDRESS_WORDS):
         return IngressDecision("broadcast", frozenset(AGENT_ROLES), _strip_addresses(normalized))
     return IngressDecision("default", frozenset(), _strip_addresses(normalized))
 

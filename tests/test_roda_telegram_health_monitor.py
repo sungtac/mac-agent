@@ -171,6 +171,23 @@ class RodaHealthMonitorTests(unittest.TestCase):
             self.assertIn("metrics", state)
         health.STATE_FILE = original
 
+    def test_legacy_fifo_pending_is_retired_without_hiding_incident_history(self):
+        state = {
+            "schema_version": 3,
+            "pending": {"codex": [100]},
+            "incidents": {
+                "old": {
+                    "incident_id": "old",
+                    "role": "codex",
+                    "task_id": "legacy-codex-0-100",
+                    "status": "open",
+                }
+            },
+        }
+        health._migrate_state(state)
+        self.assertEqual(state["pending"]["codex"], {})
+        self.assertEqual(state["incidents"]["old"]["status"], "superseded")
+
     def test_unknown_and_parse_failure_metrics_are_recorded(self):
         with tempfile.TemporaryDirectory() as td:
             log = Path(td) / "x.log"
@@ -245,6 +262,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 "STATE_FILE": health.STATE_FILE,
                 "_service_running": health._service_running,
                 "_run_codex_repair": health._run_codex_repair,
+                "_repair_preflight_blocker": health._repair_preflight_blocker,
                 "_send_alert": health._send_alert,
             }
             alerts = []
@@ -253,6 +271,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
             health.STATE_FILE = state_file
             health._service_running = lambda label: True
             health._run_codex_repair = lambda event, state: repairs.append(event["code"]) or "Codex 자동 수정·main 병합·x 서비스 재기동 완료."
+            health._repair_preflight_blocker = lambda event: None
             health._send_alert = alerts.append
             try:
                 state = {"initialized": False, "offsets": {}, "pending": {}, "alerted": {}, "delivery_retry": [], "repair_results": {}, "recovery_watch": {}}
@@ -373,6 +392,67 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIn("@edgeai_stk_bot", succeeded)
         self.assertIn("다시 처리하세요", succeeded)
 
+    def test_disabled_repair_is_reported_as_not_started(self):
+        event = {"role": "claude", "code": "execution_error"}
+        message = health._format_repair_result(event, "자동 복구가 비활성화되어 있습니다.")
+        self.assertIn("상태: 미실행", message)
+        self.assertIn("시작되지 않았", message)
+        self.assertNotIn("상태: 미완료/실패", message)
+
+    def test_task_correlated_done_cannot_consume_another_pending_request(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "codex.log"
+            log.write_text("baseline\n", encoding="utf-8")
+            original_targets = health.TARGETS
+            original_running = health._service_running
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            health._service_running = lambda label: True
+            try:
+                state = health._default_state()
+                health.poll_once(state, now=0)
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 시작 task=task-a chat=x\n")
+                    handle.write("처리 시작 task=task-b chat=x\n")
+                    handle.write("처리 완료 task=task-b chat=x\n")
+                health.poll_once(state, now=1)
+                self.assertEqual(set(state["pending"]["codex"]), {"task-a"})
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 완료 task=task-c chat=x\n")
+                health.poll_once(state, now=2)
+                self.assertEqual(set(state["pending"]["codex"]), {"task-a"})
+                alerts = health.poll_once(state, now=health.NO_RESPONSE_SECONDS + 2)
+                no_response = [item for item in alerts if item.get("code") == "no_response"]
+                self.assertEqual([item["task_id"] for item in no_response], ["task-a"])
+                self.assertEqual(state["incidents"][no_response[0]["fingerprint"]]["status"], "open")
+                with log.open("a", encoding="utf-8") as handle:
+                    handle.write("처리 완료 task=task-a chat=x\n")
+                health.poll_once(state, now=health.NO_RESPONSE_SECONDS + 3)
+                self.assertEqual(state["incidents"][no_response[0]["fingerprint"]]["status"], "resolved")
+            finally:
+                health.TARGETS = original_targets
+                health._service_running = original_running
+
+    def test_process_cycle_does_not_announce_start_when_preflight_blocks(self):
+        event = {
+            "role": "claude",
+            "code": "execution_error",
+            "fingerprint": "blocked-test",
+            "message": "[Roda 감지] 실행 오류",
+            "detail": "exit=1",
+        }
+        state = {"repair_results": {}, "recovery_watch": {}, "pending_merges": {}, "delivery_retry": []}
+        alerts = []
+        with mock.patch.object(health, "_retry_pending_merges"), \
+                mock.patch.object(health, "poll_once", return_value=[event]), \
+                mock.patch.object(health, "_save_state"), \
+                mock.patch.object(health, "_send_alert", side_effect=alerts.append), \
+                mock.patch.object(health, "_repair_preflight_blocker", return_value="자동 복구가 비활성화되어 있습니다."), \
+                mock.patch.object(health, "_run_codex_repair", return_value="자동 복구가 비활성화되어 있습니다."):
+            health._process_cycle(state)
+        self.assertEqual(len(alerts), 1)
+        self.assertNotIn("자동복구 시작", alerts[0])
+        self.assertIn("상태: 미실행", alerts[0])
+
     def test_drops_legacy_polling_stopped_retry_without_dropping_real_failures(self):
         original = health.TARGETS
         health.TARGETS = {}
@@ -446,6 +526,31 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIn("integration_lock(SOURCE_REPO)", source)
         self.assertIn('"merge", "--no-ff"', source)
         self.assertIn('"merge", "--abort"', source)
+
+    def test_merge_abort_failure_is_reported_as_critical_and_never_restarts(self):
+        commands = []
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            if command[-2:] == ["status", "--porcelain"]:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            if command[-2:] == ["rev-parse", "HEAD"]:
+                return mock.Mock(returncode=0, stdout="base-head\n", stderr="")
+            if "--no-ff" in command:
+                return mock.Mock(returncode=1, stdout="", stderr="conflict")
+            if command[-3:] == ["-q", "--verify", "MERGE_HEAD"]:
+                return mock.Mock(returncode=0, stdout="repair-head\n", stderr="")
+            if command[-2:] == ["merge", "--abort"]:
+                return mock.Mock(returncode=1, stdout="", stderr="abort failed")
+            raise AssertionError(command)
+
+        with mock.patch.object(health.subprocess, "run", side_effect=run), \
+                mock.patch.object(health, "integration_lock", None):
+            result = health._merge_repair_commit_and_restart(
+                role="codex", code="execution_error", repair_commit="repair-head", fingerprint="f",
+            )
+        self.assertIn("CRITICAL", result)
+        self.assertFalse(any(str(health.RESTART_HELPER) in command for command in commands))
 
     def test_retryable_merge_failure_queues_repair_commit_once_with_creation_time(self):
         event = {

@@ -29,8 +29,11 @@ class SkillMigrationContractTests(unittest.TestCase):
 
     def test_roda_loads_common_skill_context(self):
         source = (ROOT / "bin/roda-gemma-bot.py").read_text(encoding="utf-8")
-        self.assertIn("from edge_agent_skill_connector import build_skill_context", source)
-        self.assertIn("build_skill_context(prompt", source)
+        runtime = (ROOT / "bin/edge_agent_channel_runtime.py").read_text(encoding="utf-8")
+        self.assertIn("from edge_agent_channel_runtime import build_shared_context", source)
+        self.assertIn("build_shared_context(", source)
+        self.assertIn("from edge_agent_skill_connector import build_skill_context", runtime)
+        self.assertIn("build_skill_context(request", runtime)
 
     def test_quota_resume_declared_modules_exist_and_are_preview_only(self):
         quota_root = ROOT / "skills/quota_resume"

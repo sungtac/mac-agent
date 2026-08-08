@@ -106,9 +106,9 @@ class ProviderPilotTests(unittest.TestCase):
         completed = subprocess.CompletedProcess([], 0, stdout="PROCEED (coach unavailable — gate skipped, not enforced)\n", stderr="")
         with patch.object(module.subprocess, "run", return_value=completed):
             ok, detail = module._usage_gate("codex")
-        self.assertFalse(ok)
-        self.assertIn("not confirm", detail)
-        ok, detail = module._usage_gate("codex", allow_unmetered=True)
+            self.assertFalse(ok)
+            self.assertIn("not confirm", detail)
+            ok, detail = module._usage_gate("codex", allow_unmetered=True)
         self.assertTrue(ok)
         self.assertIn("explicit", detail)
 

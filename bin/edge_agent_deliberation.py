@@ -19,6 +19,7 @@ from edge_agent_ingress import classify as classify_ingress
 
 
 EXPECTED_ROLES = ("claude", "codex", "antigravity", "roda")
+COORDINATOR_ROLE = "claude"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "not_observed"})
 MAX_SUMMARY_CHARS = 1800
 MAX_TIMEOUT_SECONDS = 300.0
@@ -55,6 +56,11 @@ def roles_for_request(text: str) -> tuple[str, ...]:
     decision = classify_ingress(text)
     selected = tuple(role for role in EXPECTED_ROLES if decision.accepts(role))
     return selected or EXPECTED_ROLES
+
+
+def should_publish_user_result(role: str, session_id: str | None) -> bool:
+    """Only the coordinator publishes a deliberation result to Telegram."""
+    return not session_id or role == COORDINATOR_ROLE
 
 
 def _root() -> Path:
@@ -322,6 +328,11 @@ class DeliberationStore:
             return "ready"
         return "collecting"
 
+    def coordinator_failed(self, session_id: str, round_number: int) -> bool:
+        payload = self.snapshot(session_id) or {}
+        entries = (payload.get("rounds") or {}).get(str(int(round_number))) or {}
+        return str(entries.get(COORDINATOR_ROLE)) == "failed"
+
     def wait_for_round(self, session_id: str, round_number: int, *, timeout_seconds: float = 30.0, interval_seconds: float = 0.25) -> dict[str, Any] | None:
         deadline = time.monotonic() + min(MAX_TIMEOUT_SECONDS, max(0.0, timeout_seconds))
         while True:
@@ -388,4 +399,12 @@ class DeliberationStore:
         return "\n".join(lines)[:7200]
 
 
-__all__ = ["DeliberationStore", "EXPECTED_ROLES", "configured_max_rounds", "roles_for_request", "session_id_for_telegram"]
+__all__ = [
+    "COORDINATOR_ROLE",
+    "DeliberationStore",
+    "EXPECTED_ROLES",
+    "configured_max_rounds",
+    "roles_for_request",
+    "session_id_for_telegram",
+    "should_publish_user_result",
+]
