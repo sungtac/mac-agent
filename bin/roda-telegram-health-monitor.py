@@ -91,6 +91,13 @@ ERROR_PATTERNS = (
     ("empty_response", re.compile(r"빈 응답|empty response", re.I)),
     ("execution_error", re.compile(r"실행 오류|실행에 실패|처리 실패|exit=\d+", re.I)),
 )
+# A deliberation barrier failure is a request-level coordination outcome, not
+# proof that the role named in the log is unhealthy. The deputy coordinator
+# already consumes the durable peer results and publishes a bounded fallback.
+DELIBERATION_BARRIER_CONTROL_RE = re.compile(
+    r"\berror=deliberation round \d+ barrier (?:failed|collecting)\b",
+    re.I,
+)
 # Usage exhaustion is an operational state, not a code defect. Keep these
 # patterns provider-neutral because Claude, Codex and Antigravity expose
 # different wording for the same condition.
@@ -464,6 +471,8 @@ def classify_line(line: str, *, role: str | None = None) -> str | None:
         usage_candidate = USAGE_LIMIT_RE.search(line)
         rate_candidate = RATE_LIMIT_RE.search(line)
     if prompt_only:
+        return None
+    if DELIBERATION_BARRIER_CONTROL_RE.search(line):
         return None
     if AUTH_ERROR_RE.search(line):
         return "auth_error"

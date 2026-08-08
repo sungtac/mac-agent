@@ -45,6 +45,18 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNone(health.classify_line("[codex] run_polling 종료 — 프로세스 재시작을 위해 종료합니다."))
         self.assertNotIn("https://", health._safe_detail("error https://secret.example/x"))
 
+    def test_deliberation_barrier_failure_is_not_a_provider_execution_incident(self):
+        line = (
+            "[2026-08-08T15:58:39Z] [antigravity] 처리 실패 "
+            "task=task-1 duration=22.8s error=deliberation round 1 barrier failed; "
+            "미완료 역할: claude, codex, roda"
+        )
+        self.assertIsNone(health.classify_line(line, role="antigravity"))
+
+    def test_unrelated_processing_failure_remains_an_execution_incident(self):
+        line = "[antigravity] 처리 실패 task=task-2 error=provider subprocess crashed"
+        self.assertEqual(health.classify_line(line, role="antigravity"), "execution_error")
+
     def test_auth_diagnostics_share_one_persistent_fingerprint(self):
         first = health._fingerprint("claude", "auth_error", "claude exit=1: OAuth expired")
         second = health._fingerprint("claude", "auth_error", "처리 실패 task=abc 인증 만료")
