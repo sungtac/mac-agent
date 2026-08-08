@@ -137,7 +137,12 @@ CAPACITY_LIMIT_RE = re.compile(
     re.I,
 )
 SERVICE_OVERLOAD_RE = re.compile(r"overloaded_error|service\s+overloaded|server\s+overloaded|\b529\b", re.I)
-AUTH_ERROR_RE = re.compile(r"authentication_error|unauthorized|invalid api key|permission denied|\b401\b|\b403\b", re.I)
+AUTH_ERROR_RE = re.compile(
+    r"authentication_error|unauthorized|invalid api key|permission denied|"
+    r"failed to authenticate|oauth session expired|could not be refreshed|"
+    r"인증[^\n]{0,40}(?:만료|실패)|\b401\b|\b403\b",
+    re.I,
+)
 FAILURE_CONTEXT_RE = re.compile(r"error|fail|실패|오류|exit\s*=|status code|HTTP", re.I)
 EXPLICIT_RATE_LIMIT_RE = re.compile(
     r"rate[_ -]?limit(?:_error)|rate[_ -]?limit(?:s)?\s+(?:exceeded|reached)|"

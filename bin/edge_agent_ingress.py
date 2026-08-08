@@ -49,6 +49,14 @@ _TRANSCRIPT_TIMESTAMP = re.compile(
     r"(?:^|\s)\[\d{4}-\d{2}-\d{2}\s+[^\]\n]{1,80}\]"
 )
 _FENCED_BLOCK = re.compile(r"```.*?```", re.DOTALL)
+_GROUP_ADDRESS = re.compile(
+    r"(?<![0-9A-Za-z가-힣_])"
+    r"(?:각자|둘\s*다|다같이|같이|모두(?:\s*다)?|전부|얘들아)"
+    r"(?![0-9A-Za-z가-힣_])"
+)
+_DELIBERATION_ACTION = re.compile(
+    r"(?:회의|토론|논의)(?:를|을)?\s*(?:해|하자|시작|진행)"
+)
 
 
 @dataclass(frozen=True)
@@ -106,6 +114,17 @@ def routing_projection(text: str) -> str:
     if timestamp:
         candidate = candidate[: timestamp.start()]
     return " ".join(candidate.split()).strip()
+
+
+def is_group_address(text: str) -> bool:
+    """Return whether the current directive explicitly addresses the group.
+
+    Korean nouns often contain a group word as a prefix. For example,
+    "각자의 인격" describes each agent; it does not call every bot. Match
+    only a standalone address token so narrative questions stay with the
+    single default intake.
+    """
+    return bool(_GROUP_ADDRESS.search(routing_projection(text)))
 
 
 def _wake_targets(text: str) -> set[str]:
@@ -225,7 +244,7 @@ def classify(text: str, *, default_role: str = DEFAULT_ROLE) -> IngressDecision:
         targets = {"codex"}
     if targets:
         return IngressDecision("targeted", frozenset(targets), _strip_addresses(normalized))
-    if any(word in directive for word in GROUP_ADDRESS_WORDS):
+    if is_group_address(directive):
         return IngressDecision("broadcast", frozenset(AGENT_ROLES), _strip_addresses(normalized))
     return IngressDecision("default", frozenset(), _strip_addresses(normalized))
 
@@ -233,7 +252,9 @@ def classify(text: str, *, default_role: str = DEFAULT_ROLE) -> IngressDecision:
 def is_deliberation_request(text: str) -> bool:
     """Return whether a room message asks the agents to compare and integrate."""
     normalized = " ".join(str(text or "").split()).casefold()
-    return any(marker.casefold() in normalized for marker in DELIBERATION_MARKERS)
+    return any(marker.casefold() in normalized for marker in DELIBERATION_MARKERS) or bool(
+        _DELIBERATION_ACTION.search(normalized)
+    )
 
 
 def should_respond(text: str, role: str, *, default_role: str = DEFAULT_ROLE) -> bool:

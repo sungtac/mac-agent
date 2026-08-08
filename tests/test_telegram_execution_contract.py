@@ -84,6 +84,16 @@ def make_update(sent: FakeSent):
 
 
 class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
+    def test_provider_auth_failure_is_safe_and_actionable(self):
+        message = BOT._provider_failure_message(
+            "claude",
+            "Failed to authenticate: OAuth session expired and could not be refreshed",
+            "",
+        )
+        self.assertIn("OAuth 인증이 만료", message)
+        self.assertNotIn("로그를 확인", message)
+        self.assertIn("로그를 확인", BOT._provider_failure_message("antigravity", "", "exit 1"))
+
     def test_delegated_review_turn_limit_is_bounded(self):
         self.assertGreaterEqual(BOT.CLAUDE_DELEGATED_REVIEW_MAX_TURNS, 2)
         self.assertLessEqual(BOT.CLAUDE_DELEGATED_REVIEW_MAX_TURNS, 8)

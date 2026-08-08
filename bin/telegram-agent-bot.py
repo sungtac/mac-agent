@@ -69,9 +69,10 @@ from edge_agent_deliberation import (
     configured_barrier_timeout_seconds,
     roles_for_request,
     session_id_for_telegram,
+    should_publish_failure,
     should_publish_user_result,
 )
-from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
+from edge_agent_ingress import classify as classify_ingress, is_deliberation_request, is_group_address
 from weather_adapter import fetch_weather, is_weather_request
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
@@ -301,6 +302,16 @@ def log(message: str) -> None:
     print(f"[{timestamp}] [{ROLE}] {message}", file=sys.stderr, flush=True)
 
 
+def _provider_failure_message(role: str, output: str, error: str) -> str:
+    if role == "claude" and re.search(
+        r"failed to authenticate|oauth session expired|could not be refreshed",
+        f"{output}\n{error}",
+        re.IGNORECASE,
+    ):
+        return "Claude OAuth 인증이 만료되어 실행하지 못했습니다. 운영자 재로그인이 필요합니다."
+    return f"{role} 실행에 실패했습니다. 로그를 확인해 주세요."
+
+
 def _provider_workspace(role: str) -> Path:
     if ACTIVE_TASK_WORKSPACE is not None:
         return ACTIVE_TASK_WORKSPACE
@@ -308,8 +319,7 @@ def _provider_workspace(role: str) -> Path:
 
 
 def _is_group_address(text: str) -> bool:
-    normalized = " ".join(text.split())
-    return any(word in normalized for word in GROUP_ADDRESS_WORDS)
+    return is_group_address(text)
 
 
 def _has_address(text: str, words: tuple[str, ...]) -> bool:
@@ -1558,8 +1568,8 @@ async def _run_cli(
 
     if returncode != 0:
         snippet = _bounded_cli_diagnostic(output, error)
-        log(f"{role} exit={returncode}: {snippet}")
-        raise RuntimeError(f"{role} 실행에 실패했습니다. 로그를 확인해 주세요.")
+        log(f"{role} exit={returncode}: {' | '.join(snippet.splitlines())}")
+        raise RuntimeError(_provider_failure_message(role, output, error))
 
     # Codex --json emits JSONL events.  Prefer the final assistant message,
     # while retaining a plain-text fallback for CLI version differences.
@@ -2756,6 +2766,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             _update_task_worktree_status("failed")
             ACTIVE_TASK_WORKSPACE = None
             ACTIVE_LOGICAL_SESSION_ID = None
+            # A meeting failure is peer evidence for the deputy coordinator.
+            # Publishing it here would expose a noisy partial result before
+            # Codex can issue the single fallback verdict.
+            if not should_publish_failure(ROLE, deliberation_session_id):
+                log(
+                    f"회의 역할 실패를 내부 기록으로 유지 task={task_id} "
+                    f"role={ROLE} coordinator_fallback=codex"
+                )
+                return
             error_text = f"❌ {ROLE_LABELS[ROLE]} 실행 오류: {exc}"
             try:
                 if progress is not None:

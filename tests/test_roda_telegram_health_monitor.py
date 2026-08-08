@@ -26,6 +26,16 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(health.classify_line("[codex] 빈 응답"), "empty_response")
         self.assertEqual(health.classify_line("[claude] 처리 실패 error=https://secret.example/x"), "execution_error")
         self.assertEqual(health.classify_line("[claude] claude exit=1:"), "execution_error")
+        self.assertEqual(
+            health.classify_line(
+                "[claude] claude exit=1: Failed to authenticate: OAuth session expired and could not be refreshed"
+            ),
+            "auth_error",
+        )
+        self.assertEqual(
+            health.classify_line("[claude] 처리 실패 error=Claude OAuth 인증이 만료되어 실행하지 못했습니다."),
+            "auth_error",
+        )
         self.assertEqual(health.classify_line('[claude] provider error type=rate_limit_error retry-after: 60'), "rate_limited")
         self.assertEqual(health.classify_line("[antigravity] RESOURCE_EXHAUSTED: quota exceeded"), "usage_limited")
         self.assertIsNone(health.classify_line("text='how should I handle rate limits?'"))

@@ -32,6 +32,7 @@ from edge_agent_deliberation import (
     configured_barrier_timeout_seconds,
     roles_for_request,
     session_id_for_telegram,
+    should_publish_failure,
     should_publish_user_result,
 )
 from edge_agent_delegation import (
@@ -432,6 +433,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 answer = await asyncio.to_thread(_ollama_chat, prompt)
         except Exception as exc:  # keep Telegram polling alive on provider errors
             log.warning("request failed chat=%s: %s", chat.id, exc)
+            if deliberation_session_id:
+                try:
+                    DeliberationStore().record(
+                        deliberation_session_id,
+                        "roda",
+                        status="failed",
+                        summary=f"{type(exc).__name__}: {exc}",
+                    )
+                except (OSError, ValueError, TypeError):
+                    pass
             try:
                 write_task_state(role="gemma", chat_id=chat.id, text=original_text, status="failed", task_id=task_id, error=str(exc)[-500:])
             except (OSError, ValueError, TypeError):
@@ -441,7 +452,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     _CONTROL_PLANE.mark_task(chat.id, task_id, "failed", summary=str(exc))
                 except (ControlPlaneError, OSError, ValueError, TypeError):
                     pass
-            await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
+            if should_publish_failure("roda", deliberation_session_id):
+                await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
             return
     if deliberation_session_id:
         store = DeliberationStore()

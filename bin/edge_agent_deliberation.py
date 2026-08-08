@@ -63,6 +63,16 @@ def should_publish_user_result(role: str, session_id: str | None) -> bool:
     return not session_id or role == COORDINATOR_ROLE
 
 
+def should_publish_failure(role: str, session_id: str | None) -> bool:
+    """Only the deputy reports a meeting failure after coordinator takeover.
+
+    Claude and peer failures are recorded in the shared deliberation store.
+    Publishing each failure separately recreates the noisy multi-bot behavior
+    that the coordinator protocol is intended to prevent.
+    """
+    return not session_id or role == "codex"
+
+
 def _root() -> Path:
     return Path(os.environ.get("EDGE_AGENT_DELIBERATION_ROOT", str(Path.home() / ".edge-agent" / "state" / "deliberations"))).expanduser()
 
@@ -407,4 +417,5 @@ __all__ = [
     "roles_for_request",
     "session_id_for_telegram",
     "should_publish_user_result",
+    "should_publish_failure",
 ]

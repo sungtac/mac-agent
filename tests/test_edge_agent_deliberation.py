@@ -9,7 +9,12 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from edge_agent_deliberation import DeliberationStore, session_id_for_telegram, should_publish_user_result  # noqa: E402
+from edge_agent_deliberation import (  # noqa: E402
+    DeliberationStore,
+    session_id_for_telegram,
+    should_publish_failure,
+    should_publish_user_result,
+)
 
 BIN_DIR = Path(__file__).resolve().parents[1] / "bin"
 _BOT_TOKEN_ROOT = tempfile.TemporaryDirectory()
@@ -36,6 +41,13 @@ class DeliberationStoreTests(unittest.TestCase):
         self.assertFalse(should_publish_user_result("antigravity", "delib-1"))
         self.assertFalse(should_publish_user_result("roda", "delib-1"))
         self.assertTrue(should_publish_user_result("codex", None))
+
+    def test_only_deputy_can_publish_a_meeting_failure(self):
+        self.assertFalse(should_publish_failure("claude", "delib-1"))
+        self.assertFalse(should_publish_failure("antigravity", "delib-1"))
+        self.assertFalse(should_publish_failure("roda", "delib-1"))
+        self.assertTrue(should_publish_failure("codex", "delib-1"))
+        self.assertTrue(should_publish_failure("claude", None))
 
     def test_barrier_is_durable_and_ready_only_after_all_roles(self):
         with tempfile.TemporaryDirectory() as directory:

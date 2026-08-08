@@ -4,7 +4,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from edge_agent_ingress import classify, is_deliberation_request, routing_projection  # noqa: E402
+from edge_agent_ingress import classify, is_deliberation_request, is_group_address, routing_projection  # noqa: E402
 
 
 class IngressRoutingTests(unittest.TestCase):
@@ -42,6 +42,16 @@ class IngressRoutingTests(unittest.TestCase):
         self.assertEqual(decision.route, "broadcast")
         self.assertTrue(all(decision.accepts(role) for role in ("claude", "codex", "antigravity", "roda")))
 
+    def test_group_word_inside_a_noun_does_not_fan_out(self):
+        text = "이 방에 있는 에이전트들은 각자의 인격을 가지고 회의를 할 수 있어?"
+        decision = classify(text)
+        self.assertFalse(is_group_address(text))
+        self.assertEqual(decision.route, "default")
+        self.assertTrue(decision.accepts("codex"))
+        self.assertFalse(decision.accepts("claude"))
+        self.assertFalse(decision.accepts("antigravity"))
+        self.assertFalse(decision.accepts("roda"))
+
     def test_unrelated_bot_command_is_blocked(self):
         decision = classify("/start@some_other_bot 안녕")
         self.assertEqual(decision.route, "blocked")
@@ -74,6 +84,9 @@ class IngressRoutingTests(unittest.TestCase):
 
     def test_deliberation_marker_is_detected_without_changing_routing(self):
         self.assertTrue(is_deliberation_request("너희들이 30일 안에 수익을 만드는 방법들을 논의해"))
+        self.assertTrue(is_deliberation_request("얘들아 이 안건으로 회의를 해줘"))
+        self.assertTrue(is_deliberation_request("모두 이 문제를 토론하자"))
+        self.assertFalse(is_deliberation_request("각자의 인격으로 회의를 할 수 있어?"))
         self.assertFalse(is_deliberation_request("안녕하세요"))
 
     def test_pasted_telegram_history_does_not_wake_quoted_agents(self):
