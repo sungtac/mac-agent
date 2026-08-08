@@ -45,6 +45,39 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNone(health.classify_line("[codex] run_polling 종료 — 프로세스 재시작을 위해 종료합니다."))
         self.assertNotIn("https://", health._safe_detail("error https://secret.example/x"))
 
+    def test_auth_diagnostics_share_one_persistent_fingerprint(self):
+        first = health._fingerprint("claude", "auth_error", "claude exit=1: OAuth expired")
+        second = health._fingerprint("claude", "auth_error", "처리 실패 task=abc 인증 만료")
+        self.assertEqual(first, second)
+
+    def test_migration_coalesces_auth_and_supersedes_recent_generic_error(self):
+        state = health._migrate_state({
+            "schema_version": 4,
+            "incidents": {
+                "generic": {
+                    "incident_id": "generic", "role": "claude", "code": "execution_error",
+                    "status": "open", "first_seen_at": 100, "last_seen_at": 100,
+                },
+                "auth-a": {
+                    "incident_id": "auth-a", "role": "claude", "code": "auth_error",
+                    "status": "open", "first_seen_at": 120, "last_seen_at": 120,
+                    "detail": "first",
+                },
+                "auth-b": {
+                    "incident_id": "auth-b", "role": "claude", "code": "auth_error",
+                    "status": "open", "first_seen_at": 121, "last_seen_at": 121,
+                    "detail": "latest", "task_id": "task-1",
+                },
+            },
+        })
+        canonical = health._fingerprint("claude", "auth_error", "")
+        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["incidents"][canonical]["status"], "open")
+        self.assertEqual(state["incidents"][canonical]["detail"], "latest")
+        self.assertEqual(state["incidents"]["generic"]["status"], "superseded")
+        self.assertEqual(state["incidents"]["auth-a"]["status"], "superseded")
+        self.assertEqual(state["incidents"]["auth-b"]["status"], "superseded")
+
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
         self.assertEqual(health.classify_line("[claude] You've hit your session limit · resets 7pm"), "session_limited")

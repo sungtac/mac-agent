@@ -67,6 +67,7 @@ from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_ca
 from edge_agent_deliberation import (
     DeliberationStore,
     configured_barrier_timeout_seconds,
+    first_pass_prompt,
     roles_for_request,
     session_id_for_telegram,
     should_publish_failure,
@@ -2546,7 +2547,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     None,
                 )
                 assigned_role = assignment.role.value if assignment is not None else ROLE
-                provider_text = f"[이번 deliberation의 1차 역할: {assigned_role}]\n{text}"
+                provider_text = first_pass_prompt(ROLE, text)
+                if assigned_role != ROLE:
+                    provider_text = (
+                        f"[이번 요청에서 라우터가 배정한 세부 역할: {assigned_role}]\n"
+                        + provider_text
+                    )
                 if ROLE == "claude":
                     first_pass = await run_provider(
                         text,

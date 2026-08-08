@@ -30,6 +30,7 @@ from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_ca
 from edge_agent_deliberation import (
     DeliberationStore,
     configured_barrier_timeout_seconds,
+    first_pass_prompt,
     roles_for_request,
     session_id_for_telegram,
     should_publish_failure,
@@ -404,7 +405,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     prompt = f"{preparation.prompt_block}\n\n[사용자 요청]\n{text}" if preparation is not None else text
     if deliberation_session_id:
-        prompt = "[이번 deliberation의 Roda 1차 의견: 현실성·사용자 관점]\n" + prompt
+        prompt = first_pass_prompt("roda", prompt)
 
     await context.bot.send_chat_action(chat_id=chat.id, action="typing")
     task_id = ""

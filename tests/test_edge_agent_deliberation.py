@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from edge_agent_deliberation import (  # noqa: E402
     DeliberationStore,
+    first_pass_prompt,
     session_id_for_telegram,
     should_publish_failure,
     should_publish_user_result,
@@ -48,6 +49,13 @@ class DeliberationStoreTests(unittest.TestCase):
         self.assertFalse(should_publish_failure("roda", "delib-1"))
         self.assertTrue(should_publish_failure("codex", "delib-1"))
         self.assertTrue(should_publish_failure("claude", None))
+
+    def test_first_pass_cannot_impersonate_peer_roles(self):
+        prompt = first_pass_prompt("antigravity", "현재 시스템 장단점을 회의해줘")
+        self.assertIn("역할=antigravity", prompt)
+        self.assertIn("다른 에이전트의 의견을 대신 작성", prompt)
+        self.assertIn("내부 패킷", prompt)
+        self.assertNotIn("Claude 관점:", prompt)
 
     def test_barrier_is_durable_and_ready_only_after_all_roles(self):
         with tempfile.TemporaryDirectory() as directory:

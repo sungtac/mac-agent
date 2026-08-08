@@ -89,6 +89,13 @@ class IngressRoutingTests(unittest.TestCase):
         self.assertFalse(is_deliberation_request("각자의 인격으로 회의를 할 수 있어?"))
         self.assertFalse(is_deliberation_request("안녕하세요"))
 
+    def test_exact_live_meeting_request_is_detected(self):
+        text = "얘들아, 각자의 관점에서 현재 시스템의 장단점을 회의하고 마지막에는 하나의 결론으로 통합해줘."
+        decision = classify(text)
+        self.assertEqual(decision.route, "broadcast")
+        self.assertTrue(is_deliberation_request(text))
+        self.assertTrue(all(decision.accepts(role) for role in ("claude", "codex", "antigravity", "roda")))
+
     def test_pasted_telegram_history_does_not_wake_quoted_agents(self):
         text = (
             "코덱스야 아래 대화를 분석해줘. "

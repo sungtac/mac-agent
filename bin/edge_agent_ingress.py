@@ -55,7 +55,14 @@ _GROUP_ADDRESS = re.compile(
     r"(?![0-9A-Za-z가-힣_])"
 )
 _DELIBERATION_ACTION = re.compile(
-    r"(?:회의|토론|논의)(?:를|을)?\s*(?:해|하자|시작|진행)"
+    r"(?:회의|토론|논의)(?:를|을)?\s*"
+    r"(?:해|하자|하고|한\s*뒤|해서|후|시작|진행)"
+)
+_INTEGRATION_REQUEST = re.compile(
+    r"(?:마지막(?:에는|에)?\s*)?"
+    r"(?:하나의\s+결론|최종\s+결론|의견|결과)"
+    r"(?:으로|을|를)?\s*(?:통합|종합|정리|합의)"
+    r"|(?:통합|종합)(?:해|하자|하고|한\s*뒤|해서)"
 )
 
 
@@ -254,7 +261,7 @@ def is_deliberation_request(text: str) -> bool:
     normalized = " ".join(str(text or "").split()).casefold()
     return any(marker.casefold() in normalized for marker in DELIBERATION_MARKERS) or bool(
         _DELIBERATION_ACTION.search(normalized)
-    )
+    ) or bool(_INTEGRATION_REQUEST.search(normalized))
 
 
 def should_respond(text: str, role: str, *, default_role: str = DEFAULT_ROLE) -> bool:

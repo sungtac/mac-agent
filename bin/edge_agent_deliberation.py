@@ -73,6 +73,25 @@ def should_publish_failure(role: str, session_id: str | None) -> bool:
     return not session_id or role == "codex"
 
 
+def first_pass_prompt(role: str, request: str) -> str:
+    """Constrain a meeting participant to its own evidence-backed viewpoint."""
+    labels = {
+        "claude": "검토·통합 설계",
+        "codex": "구현·테스트·운영 증거",
+        "antigravity": "반론·위험·미관측 가정",
+        "roda": "사용자 이해·현실성·요약",
+    }
+    perspective = labels.get(role, "할당된 역할")
+    return (
+        f"[회의 1차 내부 의견 — 역할={role}; 관점={perspective}]\n"
+        "자신의 관점과 직접 확인 가능한 근거만 제출하라. "
+        "다른 에이전트의 의견을 대신 작성하거나 팀 전체를 대표하지 마라. "
+        "아직 최종 결론을 만들지 말고, 장점·단점·불확실성·제안을 간결히 기록하라. "
+        "이 결과는 사용자에게 직접 보내는 답변이 아니라 coordinator가 통합할 내부 패킷이다.\n\n"
+        f"{request}"
+    )
+
+
 def _root() -> Path:
     return Path(os.environ.get("EDGE_AGENT_DELIBERATION_ROOT", str(Path.home() / ".edge-agent" / "state" / "deliberations"))).expanduser()
 
@@ -414,6 +433,7 @@ __all__ = [
     "DeliberationStore",
     "EXPECTED_ROLES",
     "configured_max_rounds",
+    "first_pass_prompt",
     "roles_for_request",
     "session_id_for_telegram",
     "should_publish_user_result",

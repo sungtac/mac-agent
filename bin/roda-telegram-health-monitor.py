@@ -44,7 +44,7 @@ USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SEC
 # docs/roda-parallel-recovery-improvement-plan.md P2.
 PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SECONDS", str(24 * 60 * 60)))
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
-STATE_SCHEMA_VERSION = 4
+STATE_SCHEMA_VERSION = 5
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
@@ -331,6 +331,7 @@ def _migrate_state(payload: object) -> dict:
             state["metrics"][key] = int(state["metrics"][key])
         except (TypeError, ValueError):
             state["metrics"][key] = 0
+    _coalesce_specific_incidents(state)
     return state
 
 
@@ -709,8 +710,77 @@ def _usage_event(role: str, code: str, line: str, *, now: float | None = None) -
 
 
 def _fingerprint(role: str, code: str, line: str) -> str:
+    if code == "auth_error":
+        # Authentication failures are one persistent operational incident per
+        # provider. The CLI commonly emits both an exit diagnostic and a task
+        # failure line for the same OAuth problem; raw-line fingerprints turn
+        # those two lines into duplicate Telegram alerts.
+        return hashlib.sha256(f"{role}:{code}".encode()).hexdigest()[:16]
     normalized = re.sub(r"\d{2,}", "N", line.strip())
     return hashlib.sha256(f"{role}:{code}:{normalized}".encode()).hexdigest()[:16]
+
+
+def _coalesce_specific_incidents(state: dict) -> None:
+    """Merge duplicate auth diagnostics and retire their generic precursor."""
+    incidents = state.setdefault("incidents", {})
+    roles = {
+        str(item.get("role"))
+        for item in incidents.values()
+        if isinstance(item, dict)
+        and item.get("code") == "auth_error"
+        and item.get("status") in {"open", "reopened"}
+    }
+    for role in roles:
+        matches = [
+            (key, item)
+            for key, item in incidents.items()
+            if isinstance(item, dict)
+            and str(item.get("role")) == role
+            and item.get("code") == "auth_error"
+            and item.get("status") in {"open", "reopened"}
+        ]
+        if not matches:
+            continue
+        canonical_id = _fingerprint(role, "auth_error", "")
+        latest_key, latest = max(
+            matches,
+            key=lambda pair: float(pair[1].get("last_seen_at", pair[1].get("first_seen_at", 0)) or 0),
+        )
+        first_seen = min(float(item.get("first_seen_at", 0) or 0) for _, item in matches)
+        last_seen = max(float(item.get("last_seen_at", item.get("first_seen_at", 0)) or 0) for _, item in matches)
+        canonical = incidents.setdefault(canonical_id, {
+            "incident_id": canonical_id,
+            "status": "open",
+        })
+        canonical.update({
+            "role": role,
+            "code": "auth_error",
+            "status": "open",
+            "first_seen_at": first_seen,
+            "last_seen_at": last_seen,
+            "task_id": str(latest.get("task_id") or ""),
+            "detail": str(latest.get("detail") or "")[:1000],
+        })
+        for key, item in matches:
+            if key == canonical_id:
+                continue
+            item["status"] = "superseded"
+            item["resolved_at"] = last_seen
+            item["resolution"] = f"coalesced into persistent auth incident {canonical_id}"
+        # A generic execution error shortly before the specific OAuth signal
+        # is the same unresolved provider problem, not a second root cause.
+        for item in incidents.values():
+            if (
+                isinstance(item, dict)
+                and str(item.get("role")) == role
+                and item.get("code") == "execution_error"
+                and item.get("status") in {"open", "reopened"}
+            ):
+                generic_seen = float(item.get("last_seen_at", item.get("first_seen_at", 0)) or 0)
+                if 0 <= last_seen - generic_seen <= 3600:
+                    item["status"] = "superseded"
+                    item["resolved_at"] = last_seen
+                    item["resolution"] = f"refined to auth incident {canonical_id}"
 
 
 SENSITIVE_FIELD_RE = re.compile(
