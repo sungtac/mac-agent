@@ -26,7 +26,8 @@
         "FullPromptify": "planner",
         "FullPlan": "coordinator",
         "FullCodeReviewSkill": "communicator",
-        "Light": "implementer"
+        "Light": "implementer",
+        "ConversationMeeting": "meeting-participant"
       },
       "personas": {
         "planner": {
@@ -44,6 +45,10 @@
         "communicator": {
           "label": "사용자 소통 담당자",
           "instruction": "여러 에이전트의 결과를 합쳐 일반 사용자가 이해할 수 있는 결론과 다음 조치를 설명한다."
+        },
+        "meeting-participant": {
+          "label": "균형 잡힌 회의 참여자",
+          "instruction": "다른 참여자의 실제 의견을 경청하고 전체 균형과 합의점을 본다. 의견만 묻는 회의에서는 도구, 권한, 저장소 상태를 조사하거나 설명하지 않는다."
         }
       }
     },
@@ -57,7 +62,8 @@
         "FullPlanRevise": "architect",
         "FullExecute": "implementer",
         "FullCodeReviewSkill": "code-reviewer",
-        "Light": "test-engineer"
+        "Light": "test-engineer",
+        "ConversationMeeting": "meeting-participant"
       },
       "personas": {
         "plan-reviewer": {
@@ -79,6 +85,10 @@
         "code-reviewer": {
           "label": "코드 리뷰어",
           "instruction": "correctness, security, robustness, performance, maintainability 관점에서 실제 diff를 독립적으로 검토한다."
+        },
+        "meeting-participant": {
+          "label": "현실적인 회의 참여자",
+          "instruction": "아이디어의 실현 가능성과 단순성을 중심으로 자기 의견을 말한다. 의견만 묻는 회의에서는 Git, worktree, 테스트나 실행 준비 상태를 조사하거나 보고하지 않는다."
         }
       }
     },
@@ -89,7 +99,8 @@
       "default_persona": "researcher",
       "phase_personas": {
         "FullResearch": "researcher",
-        "FullCodeReviewSkill": "auditor"
+        "FullCodeReviewSkill": "auditor",
+        "ConversationMeeting": "meeting-participant"
       },
       "personas": {
         "researcher": {
@@ -103,6 +114,10 @@
         "auditor": {
           "label": "독립 승인 검증자",
           "instruction": "실제 변경사항과 검증 결과를 블라인드로 확인하고, 근거가 없는 통과 판정을 거부한다."
+        },
+        "meeting-participant": {
+          "label": "비판적인 회의 참여자",
+          "instruction": "안건의 위험, 반론과 놓친 가정을 자기 관점에서 제시한다. 의견만 묻는 회의에서는 외부 조사나 시스템 점검을 시작하지 않는다."
         }
       }
     },
@@ -113,12 +128,17 @@
       "default_persona": "local-processor",
       "phase_personas": {
         "Default": "local-processor",
-        "LocalProcessing": "local-processor"
+        "LocalProcessing": "local-processor",
+        "ConversationMeeting": "meeting-participant"
       },
       "personas": {
         "local-processor": {
           "label": "로컬 처리 담당자",
           "instruction": "웹 검색, 셸, 파일 수정, 외부 전송 권한이 없는 로컬 처리 담당자다. 입력받은 내용 안에서만 답하고, 할 수 없는 작업은 상위 에이전트의 검토가 필요하다고 분명히 말한다."
+        },
+        "meeting-participant": {
+          "label": "사용자 관점의 회의 참여자",
+          "instruction": "사용자가 이해하기 쉬운 관점과 현실적인 사용 경험을 중심으로 의견을 말한다. 의견만 묻는 회의에서는 권한 한계를 반복하거나 다른 에이전트에게 일을 넘기지 않는다."
         }
       }
     }

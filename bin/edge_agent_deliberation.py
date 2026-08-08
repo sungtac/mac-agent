@@ -20,10 +20,12 @@ from edge_agent_ingress import classify as classify_ingress
 
 EXPECTED_ROLES = ("claude", "codex", "antigravity", "roda")
 COORDINATOR_ROLE = "claude"
+CONVERSATION_COORDINATOR_ROLE = "codex"
 TERMINAL_STATUSES = frozenset({"completed", "failed", "not_observed"})
 MAX_SUMMARY_CHARS = 1800
 MAX_TIMEOUT_SECONDS = 300.0
 DEFAULT_BARRIER_TIMEOUT_SECONDS = 180.0
+DEFAULT_CONVERSATION_TIMEOUT_SECONDS = 60.0
 DEFAULT_MAX_ROUNDS = 3
 
 
@@ -37,6 +39,18 @@ def configured_barrier_timeout_seconds() -> float:
     except (TypeError, ValueError):
         value = DEFAULT_BARRIER_TIMEOUT_SECONDS
     return max(30.0, min(MAX_TIMEOUT_SECONDS, value))
+
+
+def configured_conversation_timeout_seconds() -> float:
+    """Return the shorter wait used by opinion-only meetings."""
+    try:
+        value = float(os.environ.get(
+            "EDGE_AGENT_CONVERSATION_MEETING_TIMEOUT_SECONDS",
+            str(DEFAULT_CONVERSATION_TIMEOUT_SECONDS),
+        ))
+    except (TypeError, ValueError):
+        value = DEFAULT_CONVERSATION_TIMEOUT_SECONDS
+    return max(15.0, min(120.0, value))
 
 
 def configured_max_rounds() -> int:
@@ -58,19 +72,20 @@ def roles_for_request(text: str) -> tuple[str, ...]:
     return selected or EXPECTED_ROLES
 
 
-def should_publish_user_result(role: str, session_id: str | None) -> bool:
+def should_publish_user_result(role: str, session_id: str | None, *, conversation_meeting: bool = False) -> bool:
     """Only the coordinator publishes a deliberation result to Telegram."""
-    return not session_id or role == COORDINATOR_ROLE
+    coordinator = CONVERSATION_COORDINATOR_ROLE if conversation_meeting else COORDINATOR_ROLE
+    return not session_id or role == coordinator
 
 
-def should_publish_failure(role: str, session_id: str | None) -> bool:
+def should_publish_failure(role: str, session_id: str | None, *, conversation_meeting: bool = False) -> bool:
     """Only the deputy reports a meeting failure after coordinator takeover.
 
     Claude and peer failures are recorded in the shared deliberation store.
     Publishing each failure separately recreates the noisy multi-bot behavior
     that the coordinator protocol is intended to prevent.
     """
-    return not session_id or role == "codex"
+    return not session_id or role == CONVERSATION_COORDINATOR_ROLE
 
 
 def first_pass_prompt(role: str, request: str) -> str:
@@ -86,7 +101,8 @@ def first_pass_prompt(role: str, request: str) -> str:
         f"[회의 1차 내부 의견 — 역할={role}; 관점={perspective}]\n"
         "자신의 관점과 직접 확인 가능한 근거만 제출하라. "
         "다른 에이전트의 의견을 대신 작성하거나 팀 전체를 대표하지 마라. "
-        "아직 최종 결론을 만들지 말고, 장점·단점·불확실성·제안을 간결히 기록하라. "
+        "아직 최종 결론을 만들지 말고, 장점·단점·제안을 간결히 기록하라. "
+        "의견만 묻는 회의에서는 Git, worktree, 테스트, 인증, 도구나 capability 상태를 언급하지 마라. "
         "이 결과는 사용자에게 직접 보내는 답변이 아니라 coordinator가 통합할 내부 패킷이다.\n\n"
         f"{request}"
     )
@@ -197,7 +213,14 @@ class DeliberationStore:
             "recorded_epoch": time.time(),
         }
 
-    def start(self, session_id: str, request: str, *, roles: tuple[str, ...] = EXPECTED_ROLES) -> dict[str, Any]:
+    def start(
+        self,
+        session_id: str,
+        request: str,
+        *,
+        roles: tuple[str, ...] = EXPECTED_ROLES,
+        mode: str = "verified",
+    ) -> dict[str, Any]:
         session_id = _safe_session(session_id)
         selected = tuple(dict.fromkeys(roles))
         if not selected or any(role not in EXPECTED_ROLES for role in selected):
@@ -208,12 +231,15 @@ class DeliberationStore:
             current = self._read(session_id)
             if current is not None:
                 return current
-            max_rounds = configured_max_rounds()
+            if mode not in {"verified", "conversation"}:
+                raise ValueError("invalid deliberation mode")
+            max_rounds = 1 if mode == "conversation" else configured_max_rounds()
             payload = {
                 "schema": "edge_agent.deliberation.v1",
                 "session_id": session_id,
                 "request": _bounded(request),
                 "expected_roles": list(selected),
+                "mode": mode,
                 "round": 1,
                 "max_rounds": max_rounds,
                 "status": "collecting",
@@ -321,9 +347,14 @@ class DeliberationStore:
                 str(round_results.get(item)) == "completed"
                 for item in payload["expected_roles"]
             )
-            if status == "failed":
+            conversation_mode = payload.get("mode") == "conversation"
+            terminal_round = all(
+                str(round_results.get(item)) in TERMINAL_STATUSES
+                for item in payload["expected_roles"]
+            )
+            if status == "failed" and not conversation_mode:
                 payload["status"] = "failed"
-            elif round_complete and current_round == max_rounds:
+            elif (round_complete or (conversation_mode and terminal_round)) and current_round == max_rounds:
                 payload["status"] = "barrier_ready"
                 payload["delivery"] = self._drain_final_deliveries(
                     session_id,
@@ -348,12 +379,19 @@ class DeliberationStore:
 
     def round_state(self, session_id: str, round_number: int) -> str:
         payload = self.snapshot(session_id) or {}
-        if payload.get("status") == "failed":
+        conversation_mode = payload.get("mode") == "conversation"
+        if payload.get("status") == "failed" and not conversation_mode:
             return "failed"
         entries = (payload.get("rounds") or {}).get(str(int(round_number))) or {}
-        if any(str(entries.get(role)) == "failed" for role in payload.get("expected_roles", EXPECTED_ROLES)):
+        expected_roles = payload.get("expected_roles", EXPECTED_ROLES)
+        if conversation_mode:
+            terminal = all(str(entries.get(role)) in TERMINAL_STATUSES for role in expected_roles)
+            if terminal:
+                return "ready" if any(str(entries.get(role)) == "completed" for role in expected_roles) else "failed"
+            return "collecting"
+        if any(str(entries.get(role)) == "failed" for role in expected_roles):
             return "failed"
-        if all(str(entries.get(role)) == "completed" for role in payload.get("expected_roles", EXPECTED_ROLES)):
+        if all(str(entries.get(role)) == "completed" for role in expected_roles):
             return "ready"
         return "collecting"
 
@@ -427,11 +465,30 @@ class DeliberationStore:
         lines.append(f"barrier_status={payload.get('status', 'not_observed')}; round={payload.get('round', 1)}")
         return "\n".join(lines)[:7200]
 
+    def render_conversation(self, session_id: str) -> str:
+        """Render only human-readable, actually observed meeting opinions."""
+        payload = self.snapshot(session_id) or {}
+        labels = {"claude": "Claude", "codex": "Codex", "antigravity": "Antigravity", "roda": "Roda"}
+        results = payload.get("results") or {}
+        lines = ["[실제 회의 참여자 의견]"]
+        unavailable: list[str] = []
+        for role in payload.get("expected_roles", EXPECTED_ROLES):
+            item = results.get(role) or {}
+            if item.get("trusted") is True and item.get("status") == "completed":
+                lines.append(f"- {labels.get(role, role)}: {_bounded(item.get('summary', ''))}")
+            else:
+                unavailable.append(labels.get(role, role))
+        if unavailable:
+            lines.append(f"[응답하지 못한 참여자] {', '.join(unavailable)}")
+        return "\n".join(lines)[:7200]
+
 
 __all__ = [
     "COORDINATOR_ROLE",
+    "CONVERSATION_COORDINATOR_ROLE",
     "DeliberationStore",
     "EXPECTED_ROLES",
+    "configured_conversation_timeout_seconds",
     "configured_max_rounds",
     "first_pass_prompt",
     "roles_for_request",

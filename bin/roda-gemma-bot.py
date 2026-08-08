@@ -43,7 +43,7 @@ from edge_agent_delegation import (
     public_search_unavailable_message,
 )
 from edge_agent_egress_queue import EgressQueueError, SharedEgressQueue
-from edge_agent_ingress import classify as classify_ingress, is_deliberation_request
+from edge_agent_ingress import classify as classify_ingress, is_conversation_meeting, is_deliberation_request
 from edge_agent_state import write_task_state
 from edge_agent_team_contract import render_team_contract
 from weather_adapter import fetch_weather, is_weather_request
@@ -69,6 +69,9 @@ MAX_PROMPT_CHARS = int(os.environ.get("RODA_GEMMA_MAX_PROMPT_CHARS", "6000"))
 MAX_OUTPUT_TOKENS = int(os.environ.get("RODA_GEMMA_MAX_OUTPUT_TOKENS", "512"))
 OLLAMA_TIMEOUT_SECONDS = int(os.environ.get("RODA_GEMMA_OLLAMA_TIMEOUT_SECONDS", "120"))
 OLLAMA_THINK = os.environ.get("RODA_GEMMA_THINK", "0").strip().lower() in {"1", "true", "yes", "on"}
+SIMPLE_MEETING_MODE = os.environ.get("EDGE_AGENT_SIMPLE_MEETING_MODE", "0").strip().casefold() in {
+    "1", "true", "yes", "on",
+}
 HEALTH_STATE_FILE = Path(
     os.environ.get("RODA_GEMMA_HEALTH_STATE_FILE", str(HOME / ".edge-agent/state/telegram-health-monitor.json"))
 ).expanduser()
@@ -153,13 +156,14 @@ def _context_store() -> ContextEnvelopeStore:
     return ContextEnvelopeStore(os.environ.get("TELEGRAM_CONTEXT_ROOT") or os.environ.get("RODA_CONTEXT_ROOT") or None)
 
 
-def _ollama_chat(prompt: str) -> str:
+def _ollama_chat(prompt: str, *, conversation_meeting: bool = False) -> str:
     shared_context = build_shared_context(
         prompt,
         provider="roda",
-        extra_context=SYSTEM_PROMPT,
+        extra_context="" if conversation_meeting else SYSTEM_PROMPT,
         channel="telegram",
         include_capability_preflight=False,
+        conversation_meeting=conversation_meeting,
     )
     payload = {
         "model": MODEL,
@@ -357,6 +361,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     original_text = text
     deliberation_session_id = None
+    conversation_meeting_active = SIMPLE_MEETING_MODE and is_conversation_meeting(original_text)
     if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         if chat.id not in ALLOWED_GROUP_IDS:
             return
@@ -365,7 +370,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             return
         if is_deliberation_request(original_text) and classify_ingress(original_text).accepts("claude"):
             deliberation_session_id = session_id_for_telegram(chat.id, message.message_id)
-            DeliberationStore().start(deliberation_session_id, original_text, roles=roles_for_request(original_text))
+            DeliberationStore().start(
+                deliberation_session_id,
+                original_text,
+                roles=roles_for_request(original_text),
+                mode="conversation" if conversation_meeting_active else "verified",
+            )
     elif chat.type != ChatType.PRIVATE:
         return
     if len(text) > MAX_PROMPT_CHARS:
@@ -431,7 +441,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     log.warning("weather lookup failed; refusing an unverified model guess: %s", type(weather_exc).__name__)
                     answer = "⚠️ 실시간 날씨 조회에 실패했습니다. 잠시 후 다시 요청해 주세요."
             else:
-                answer = await asyncio.to_thread(_ollama_chat, prompt)
+                if conversation_meeting_active:
+                    answer = await asyncio.to_thread(_ollama_chat, prompt, conversation_meeting=True)
+                else:
+                    answer = await asyncio.to_thread(_ollama_chat, prompt)
         except Exception as exc:  # keep Telegram polling alive on provider errors
             log.warning("request failed chat=%s: %s", chat.id, exc)
             if deliberation_session_id:
@@ -453,58 +466,67 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     _CONTROL_PLANE.mark_task(chat.id, task_id, "failed", summary=str(exc))
                 except (ControlPlaneError, OSError, ValueError, TypeError):
                     pass
-            if should_publish_failure("roda", deliberation_session_id):
+            if should_publish_failure(
+                "roda",
+                deliberation_session_id,
+                conversation_meeting=conversation_meeting_active,
+            ):
                 await message.reply_text("지금은 Gemma4에 연결하지 못했어요. 잠시 후 다시 시도해 주세요.")
             return
     if deliberation_session_id:
         store = DeliberationStore()
         store.record(deliberation_session_id, "roda", status="completed", summary=answer)
-        try:
-            await asyncio.to_thread(
-                store.wait_for_round,
-                deliberation_session_id,
-                1,
-                timeout_seconds=configured_barrier_timeout_seconds(),
-            )
-            if store.round_state(deliberation_session_id, 1) != "ready":
-                raise RuntimeError("deliberation round 1 barrier not ready")
-            follow_up = (
-                "[peer follow-up 단계]\n"
-                "다른 역할의 서명된 peer evidence를 검토하고, 반론·보완점·현실적인 실행 단계를 반영해 다시 답하라.\n\n"
-                f"{original_text}\n\n{store.render(deliberation_session_id, consumer_role="roda")}"
-            )
-            answer = await asyncio.to_thread(_ollama_chat, follow_up)
-            store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=2)
-            if store.max_rounds(deliberation_session_id) >= 3:
+        if not conversation_meeting_active:
+            try:
                 await asyncio.to_thread(
                     store.wait_for_round,
                     deliberation_session_id,
-                    2,
+                    1,
                     timeout_seconds=configured_barrier_timeout_seconds(),
                 )
-                if store.round_state(deliberation_session_id, 2) != "ready":
-                    raise RuntimeError("deliberation round 2 barrier not ready")
-                adjudication = (
-                    "[최종 adjudication 단계]\n"
-                    "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                if store.round_state(deliberation_session_id, 1) != "ready":
+                    raise RuntimeError("deliberation round 1 barrier not ready")
+                follow_up = (
+                    "[peer follow-up 단계]\n"
+                    "다른 역할의 서명된 peer evidence를 검토하고, 반론·보완점·현실적인 실행 단계를 반영해 다시 답하라.\n\n"
                     f"{original_text}\n\n{store.render(deliberation_session_id, consumer_role="roda")}"
                 )
-                answer = await asyncio.to_thread(_ollama_chat, adjudication)
-                store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=3)
-        except Exception as exc:
-            log.warning("peer follow-up failed; withholding final deliberation answer: %s", type(exc).__name__)
-            try:
-                store.record(
-                    deliberation_session_id,
-                    "roda",
-                    status="failed",
-                    summary=f"{type(exc).__name__}: {exc}",
-                    round_number=2,
-                )
-            except (OSError, ValueError, TypeError):
-                pass
-            answer = "⚠️ 네 역할 모두의 서명된 논의 결과가 모이지 않아 최종안을 보류합니다. 실패 원인을 확인한 뒤 다시 시도해 주세요."
-    if should_publish_user_result("roda", deliberation_session_id):
+                answer = await asyncio.to_thread(_ollama_chat, follow_up)
+                store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=2)
+                if store.max_rounds(deliberation_session_id) >= 3:
+                    await asyncio.to_thread(
+                        store.wait_for_round,
+                        deliberation_session_id,
+                        2,
+                        timeout_seconds=configured_barrier_timeout_seconds(),
+                    )
+                    if store.round_state(deliberation_session_id, 2) != "ready":
+                        raise RuntimeError("deliberation round 2 barrier not ready")
+                    adjudication = (
+                        "[최종 adjudication 단계]\n"
+                        "1·2차 peer evidence의 합의와 충돌을 비교하고, 불확실성은 명시한 최종안을 작성하라.\n\n"
+                        f"{original_text}\n\n{store.render(deliberation_session_id, consumer_role="roda")}"
+                    )
+                    answer = await asyncio.to_thread(_ollama_chat, adjudication)
+                    store.record(deliberation_session_id, "roda", status="completed", summary=answer, round_number=3)
+            except Exception as exc:
+                log.warning("peer follow-up failed; withholding final deliberation answer: %s", type(exc).__name__)
+                try:
+                    store.record(
+                        deliberation_session_id,
+                        "roda",
+                        status="failed",
+                        summary=f"{type(exc).__name__}: {exc}",
+                        round_number=2,
+                    )
+                except (OSError, ValueError, TypeError):
+                    pass
+                answer = "⚠️ 네 역할 모두의 서명된 논의 결과가 모이지 않아 최종안을 보류합니다. 실패 원인을 확인한 뒤 다시 시도해 주세요."
+    if should_publish_user_result(
+        "roda",
+        deliberation_session_id,
+        conversation_meeting=conversation_meeting_active,
+    ):
         try:
             for index, part in enumerate(_split_message(answer)):
                 sent = await _egress_send(

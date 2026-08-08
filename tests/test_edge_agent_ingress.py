@@ -4,7 +4,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
-from edge_agent_ingress import classify, is_deliberation_request, is_group_address, routing_projection  # noqa: E402
+from edge_agent_ingress import (  # noqa: E402
+    classify,
+    is_conversation_meeting,
+    is_deliberation_request,
+    is_group_address,
+    routing_projection,
+)
 
 
 class IngressRoutingTests(unittest.TestCase):
@@ -94,7 +100,13 @@ class IngressRoutingTests(unittest.TestCase):
         decision = classify(text)
         self.assertEqual(decision.route, "broadcast")
         self.assertTrue(is_deliberation_request(text))
+        self.assertTrue(is_conversation_meeting(text))
         self.assertTrue(all(decision.accepts(role) for role in ("claude", "codex", "antigravity", "roda")))
+
+    def test_meeting_with_explicit_execution_keeps_verified_workflow(self):
+        self.assertFalse(is_conversation_meeting("얘들아 이 버그를 논의하고 코드를 수정해줘"))
+        self.assertFalse(is_conversation_meeting("모두 로그를 확인해서 원인을 토론해줘"))
+        self.assertFalse(is_conversation_meeting("다같이 웹 검색해서 전략을 논의해줘"))
 
     def test_pasted_telegram_history_does_not_wake_quoted_agents(self):
         text = (

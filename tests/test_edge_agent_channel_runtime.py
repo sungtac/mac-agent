@@ -79,6 +79,32 @@ class ChannelRuntimeTests(unittest.TestCase):
         preflight.assert_not_called()
         self.assertIn("Roda capability boundary", prompt)
 
+    def test_conversation_meeting_omits_execution_diagnostics(self):
+        with patch.object(runtime, "render_capability_preflight") as preflight, \
+                patch.object(runtime, "render_team_contract") as team_contract, \
+                patch.object(runtime, "build_skill_context") as skill_context:
+            prompt = runtime.build_prompt(
+                "얘들아 현재 시스템 장단점을 회의해줘",
+                provider="codex",
+                workspace="/not/a/repository",
+                session_context="Git 저장소가 아님",
+                channel="telegram",
+                conversation_meeting=True,
+            )
+        preflight.assert_not_called()
+        team_contract.assert_not_called()
+        skill_context.assert_not_called()
+        self.assertIn("대화형 회의 규칙", prompt)
+        self.assertIn("회의 참여자", prompt)
+        self.assertNotIn("Git 저장소가 아님", prompt)
+        self.assertNotIn("공통 입력 라우팅 결정", prompt)
+
+    def test_execution_context_remains_unchanged_by_default(self):
+        with patch.object(runtime, "render_capability_preflight", return_value="CAPABILITY"):
+            prompt = runtime.build_prompt("로그를 확인해줘", provider="codex", channel="telegram")
+        self.assertIn("CAPABILITY", prompt)
+        self.assertIn("공통 입력 라우팅 결정", prompt)
+
     def test_capability_preflight_is_bounded_by_short_ttl_cache(self):
         with patch.object(runtime, "render_capability_preflight", return_value="CAPABILITY") as preflight, \
                 patch.object(runtime, "build_skill_context", return_value=""), \

@@ -11,6 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "bin"))
 
 from edge_agent_deliberation import (  # noqa: E402
     DeliberationStore,
+    configured_conversation_timeout_seconds,
     first_pass_prompt,
     session_id_for_telegram,
     should_publish_failure,
@@ -36,12 +37,21 @@ with patch.object(Path, "home", return_value=Path(_BOT_RUNTIME_HOME_ROOT.name)):
 
 
 class DeliberationStoreTests(unittest.TestCase):
+    def test_conversation_timeout_is_short_and_bounded(self):
+        with patch.dict("os.environ", {}, clear=False):
+            os.environ.pop("EDGE_AGENT_CONVERSATION_MEETING_TIMEOUT_SECONDS", None)
+            self.assertEqual(configured_conversation_timeout_seconds(), 60.0)
+        with patch.dict("os.environ", {"EDGE_AGENT_CONVERSATION_MEETING_TIMEOUT_SECONDS": "999"}):
+            self.assertEqual(configured_conversation_timeout_seconds(), 120.0)
+
     def test_only_coordinator_publishes_a_deliberation_result(self):
         self.assertTrue(should_publish_user_result("claude", "delib-1"))
         self.assertFalse(should_publish_user_result("codex", "delib-1"))
         self.assertFalse(should_publish_user_result("antigravity", "delib-1"))
         self.assertFalse(should_publish_user_result("roda", "delib-1"))
         self.assertTrue(should_publish_user_result("codex", None))
+        self.assertFalse(should_publish_user_result("claude", "delib-1", conversation_meeting=True))
+        self.assertTrue(should_publish_user_result("codex", "delib-1", conversation_meeting=True))
 
     def test_only_deputy_can_publish_a_meeting_failure(self):
         self.assertFalse(should_publish_failure("claude", "delib-1"))
@@ -56,6 +66,28 @@ class DeliberationStoreTests(unittest.TestCase):
         self.assertIn("다른 에이전트의 의견을 대신 작성", prompt)
         self.assertIn("내부 패킷", prompt)
         self.assertNotIn("Claude 관점:", prompt)
+        self.assertIn("Git, worktree, 테스트", prompt)
+
+    def test_conversation_meeting_uses_one_round_and_tolerates_failed_participant(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 106)
+                payload = store.start(session_id, "장단점을 회의해줘", mode="conversation")
+                self.assertEqual(payload["max_rounds"], 1)
+                for role in ("claude", "codex", "antigravity"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 의견")
+                store.record(session_id, "roda", status="failed", summary="provider unavailable")
+                self.assertEqual(store.round_state(session_id, 1), "ready")
+                self.assertEqual(store.snapshot(session_id)["status"], "barrier_ready")
+                rendered = store.render_conversation(session_id)
+                self.assertIn("Claude: claude 의견", rendered)
+                self.assertIn("Roda", rendered)
+                self.assertNotIn("provider unavailable", rendered)
+                self.assertNotIn("message bus", rendered)
 
     def test_barrier_is_durable_and_ready_only_after_all_roles(self):
         with tempfile.TemporaryDirectory() as directory:

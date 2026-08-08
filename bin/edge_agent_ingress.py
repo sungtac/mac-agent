@@ -64,6 +64,12 @@ _INTEGRATION_REQUEST = re.compile(
     r"(?:으로|을|를)?\s*(?:통합|종합|정리|합의)"
     r"|(?:통합|종합)(?:해|하자|하고|한\s*뒤|해서)"
 )
+_EXECUTION_ACTION = re.compile(
+    r"(?:코드(?:를)?\s*)?(?:구현|수정|고쳐|삭제|설치|배포|재시작|실행|테스트)(?:해|하자|하고|해서|해줘)"
+    r"|(?:파일|로그)(?:을|를)?\s*(?:읽|확인|점검)(?:해|하자|하고|해서|해줘)"
+    r"|(?:웹\s*)?(?:검색|조사)(?:해|하자|하고|해서|해줘)",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True)
@@ -262,6 +268,17 @@ def is_deliberation_request(text: str) -> bool:
     return any(marker.casefold() in normalized for marker in DELIBERATION_MARKERS) or bool(
         _DELIBERATION_ACTION.search(normalized)
     ) or bool(_INTEGRATION_REQUEST.search(normalized))
+
+
+def is_conversation_meeting(text: str) -> bool:
+    """Return whether a deliberation is opinion-only rather than execution.
+
+    Conversation meetings must not inherit repository, capability, or testing
+    diagnostics merely because several providers are present. Explicit action
+    verbs keep the existing verified execution path.
+    """
+    directive = routing_projection(text)
+    return is_deliberation_request(directive) and not bool(_EXECUTION_ACTION.search(directive))
 
 
 def should_respond(text: str, role: str, *, default_role: str = DEFAULT_ROLE) -> bool:

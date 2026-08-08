@@ -62,6 +62,12 @@ _RODA_CAPABILITY_BOUNDARY = (
     "Roda는 로컬 Ollama 대화 전용이다. 셸, 파일 쓰기, 웹 검색, 자격증명, 서비스 조작, "
     "외부 메시지 전송 권한이 없다. 다른 provider의 capability 상태를 Roda의 권한이나 실행 결과로 추론하지 마라."
 )
+_CONVERSATION_MEETING_POLICY = (
+    "[대화형 회의 규칙]\n"
+    "이 요청은 실행 작업이 아니라 의견 교환이다. 자기 관점의 장점, 단점과 제안만 간결히 말한다. "
+    "Git, worktree, 테스트, 인증, 도구 또는 capability 상태를 조사하거나 보고하지 않는다. "
+    "다른 에이전트의 의견을 대신 만들지 말고 실제로 전달된 의견만 반영한다."
+)
 
 
 def _validate_channel(channel: str) -> str:
@@ -105,9 +111,9 @@ def _render_cached_capability_preflight(
     return rendered
 
 
-def render_identity(role: str) -> str:
+def render_identity(role: str, *, phase: str | None = None) -> str:
     """Render the same provider identity used by every channel adapter."""
-    return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{render_agent_profile(normalize_role(role))}"
+    return f"[영구 아이덴티티 및 톤앤매너 규칙]\n{render_agent_profile(normalize_role(role), phase=phase)}"
 
 
 def render_routing_context(request: str, *, provider: str) -> str:
@@ -147,31 +153,41 @@ def build_shared_context(
     headless: bool = False,
     channel: str = "internal",
     include_capability_preflight: bool | None = None,
+    conversation_meeting: bool = False,
 ) -> str:
     """Build the channel-independent context envelope."""
     _validate_channel(channel)
     selected_role = normalize_role(provider)
-    blocks = [
-        render_team_contract(),
-        (
-            f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
-            "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라."
-        ),
-        render_identity(selected_role),
-    ]
-    if headless and selected_role == "antigravity":
+    if conversation_meeting:
+        blocks = [
+            render_identity(selected_role, phase="ConversationMeeting"),
+            _CONVERSATION_MEETING_POLICY,
+        ]
+    else:
+        blocks = [
+            render_team_contract(),
+            (
+                f"공통 운영 계약을 먼저 읽어라: {RUNTIME_CONTRACT}. "
+                "계약은 권한 부여가 아니며, 실제 실행 결과와 현재 작업공간을 확인하라."
+            ),
+            render_identity(selected_role),
+        ]
+    if headless and selected_role == "antigravity" and not conversation_meeting:
         blocks.append(_HEADLESS_POLICY)
+    if conversation_meeting:
+        include_capability_preflight = False
     if include_capability_preflight is None:
         include_capability_preflight = selected_role != "roda"
     if include_capability_preflight:
         blocks.append(_render_cached_capability_preflight(workspace))
-    elif selected_role == "roda":
+    elif selected_role == "roda" and not conversation_meeting:
         blocks.append(_RODA_CAPABILITY_BOUNDARY)
-    blocks.append(render_routing_context(request, provider=selected_role))
-    skills = build_skill_context(request, max_chars=6000, include_peer=False)
+    if not conversation_meeting:
+        blocks.append(render_routing_context(request, provider=selected_role))
+    skills = "" if conversation_meeting else build_skill_context(request, max_chars=6000, include_peer=False)
     if skills:
         blocks.append(skills)
-    if session_context:
+    if session_context and not conversation_meeting:
         blocks.append(session_context.strip())
     if extra_context:
         blocks.append(extra_context.strip())
@@ -188,6 +204,7 @@ def build_prompt(
     headless: bool = False,
     channel: str = "internal",
     include_capability_preflight: bool | None = None,
+    conversation_meeting: bool = False,
 ) -> str:
     context = build_shared_context(
         request,
@@ -198,6 +215,7 @@ def build_prompt(
         headless=headless,
         channel=channel,
         include_capability_preflight=include_capability_preflight,
+        conversation_meeting=conversation_meeting,
     )
     return f"{context}\n\n[사용자 요청]\n{request}" if request else context
 

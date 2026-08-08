@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import ExitStack
 import importlib.util
 import os
 import sys
@@ -334,6 +335,150 @@ class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"TELEGRAM_CONTEXT_ROOT": self.tempdir.name}), patch.object(self.roda, "_ollama_chat", side_effect=AssertionError("Ollama must not run")), patch.object(self.roda, "_context_store", return_value=self.store):
             await self.roda.handle_message(update, context)
         self.assertEqual(len(captured), 1)
+
+    async def test_simple_meeting_peers_are_internal_and_codex_publishes_once(self):
+        sent = []
+        provider_calls = []
+
+        class MeetingStore:
+            results = {"roda": "사용자 관점 의견"}
+
+            def start(self, session_id, request, *, roles, mode):
+                self.mode = mode
+                return {"mode": mode}
+
+            def record(self, session_id, role, *, status, summary, **kwargs):
+                if status == "completed":
+                    self.results[role] = summary
+                return {"status": "collecting"}
+
+            def wait_for_round(self, *args, **kwargs):
+                return {"status": "barrier_ready"}
+
+            def render_conversation(self, session_id):
+                return "\n".join(f"- {role}: {summary}" for role, summary in sorted(self.results.items()))
+
+        store = MeetingStore()
+
+        async def fake_provider(prompt, **kwargs):
+            provider_calls.append((self.bot.ROLE, kwargs))
+            if self.bot.ROLE == "codex" and "회의 사회자 통합" in kwargs.get("provider_text", ""):
+                return "세 의견을 들은 통합 결론"
+            return f"{self.bot.ROLE}의 독립 의견"
+
+        async def fake_egress(chat_id, delivery_id, chunk_index, sender):
+            return await sender()
+
+        def fake_delivery(**kwargs):
+            return {"delivery_id": "delivery-1"}
+
+        def meeting_update():
+            async def reply_text(value):
+                sent.append(value)
+                return FakeSent(950 + len(sent))
+
+            message = SimpleNamespace(
+                text="얘들아 현재 시스템 장단점을 회의하고 하나의 결론으로 통합해줘",
+                caption=None,
+                entities=None,
+                caption_entities=None,
+                from_user=SimpleNamespace(is_bot=False, id=1),
+                chat_id=-1003952617795,
+                message_id=901,
+                reply_to_message=None,
+                date=datetime.now(timezone.utc),
+                reply_text=reply_text,
+            )
+            return SimpleNamespace(
+                effective_message=message,
+                effective_chat=SimpleNamespace(type=self.bot.ChatType.GROUP, id=-1003952617795),
+            )
+
+        common = (
+            patch.object(self.bot, "SIMPLE_MEETING_MODE", True),
+            patch.object(self.bot, "DeliberationStore", return_value=store),
+            patch.object(self.bot, "run_provider", side_effect=fake_provider),
+            patch.object(self.bot, "_prepare_context", return_value=None),
+            patch.object(self.bot, "_ingress_identity", return_value=None),
+            patch.object(self.bot, "_is_stale", return_value=False),
+            patch.object(self.bot, "_observe_shadow_update"),
+            patch.object(self.bot, "write_task_state", side_effect=lambda **kwargs: kwargs.get("task_id") or f"task-{self.bot.ROLE}"),
+            patch.object(self.bot, "start_session", side_effect=lambda **kwargs: f"session-{self.bot.ROLE}"),
+            patch.object(self.bot, "update_session"),
+            patch.object(self.bot, "write_reflection"),
+            patch.object(self.bot, "_record_telegram_efficiency"),
+            patch.object(self.bot, "_update_task_worktree_status"),
+            patch.object(self.bot, "create_delivery", side_effect=fake_delivery),
+            patch.object(self.bot, "mark_chunk_sent"),
+            patch.object(self.bot, "mark_delivery_succeeded"),
+            patch.object(self.bot, "_egress_send", side_effect=fake_egress),
+            patch.object(self.bot._CONTROL_PLANE, "start_task"),
+            patch.object(self.bot._CONTROL_PLANE, "mark_task"),
+        )
+        with ExitStack() as stack:
+            for manager in common:
+                stack.enter_context(manager)
+            for role in ("claude", "antigravity", "codex"):
+                with patch.object(self.bot, "ROLE", role):
+                    self.bot.ACTIVE_TASK_WORKSPACE = None
+                    self.bot.ACTIVE_LOGICAL_SESSION_ID = None
+                    await self.bot.handle_message(meeting_update(), SimpleNamespace())
+
+        self.assertEqual(sent, ["세 의견을 들은 통합 결론"])
+        self.assertEqual([role for role, _ in provider_calls], ["claude", "antigravity", "codex", "codex"])
+        self.assertTrue(all(kwargs.get("conversation_meeting") is True for _, kwargs in provider_calls))
+        self.assertEqual(store.mode, "conversation")
+
+    async def test_roda_simple_meeting_submits_internal_opinion_without_reply(self):
+        sent = []
+        observed = []
+
+        class MeetingStore:
+            def start(self, session_id, request, *, roles, mode):
+                observed.append(("mode", mode))
+                return {"mode": mode}
+
+            def record(self, session_id, role, *, status, summary, **kwargs):
+                observed.append((role, status, summary))
+                return {"status": "collecting"}
+
+        async def reply_text(value):
+            sent.append(value)
+            return FakeSent(990)
+
+        async def send_chat_action(**kwargs):
+            return None
+
+        def run_roda(text, *, conversation_meeting=False):
+            observed.append(("provider", conversation_meeting))
+            return "Roda의 사용자 관점 의견"
+
+        message = SimpleNamespace(
+            text="얘들아 현재 시스템 장단점을 회의하고 하나의 결론으로 통합해줘",
+            caption=None,
+            message_id=902,
+            reply_to_message=None,
+            reply_text=reply_text,
+        )
+        update = SimpleNamespace(
+            effective_message=message,
+            effective_chat=SimpleNamespace(type=self.roda.ChatType.GROUP, id=-1003952617795),
+            effective_user=SimpleNamespace(id=6417205500),
+        )
+        context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=send_chat_action))
+        with patch.object(self.roda, "SIMPLE_MEETING_MODE", True), \
+                patch.object(self.roda, "DeliberationStore", return_value=MeetingStore()), \
+                patch.object(self.roda, "_ollama_chat", side_effect=run_roda), \
+                patch.object(self.roda, "_context_store", return_value=self.store), \
+                patch.object(self.roda, "write_task_state", return_value="task-roda"), \
+                patch.object(self.roda._CONTROL_PLANE, "start_task"), \
+                patch.object(self.roda._CONTROL_PLANE, "mark_task"):
+            await self.roda.handle_message(update, context)
+
+        self.assertEqual(sent, [])
+        self.assertIn(("mode", "conversation"), observed)
+        self.assertIn(("provider", True), observed)
+        self.assertIn(("roda", "completed", "Roda의 사용자 관점 의견"), observed)
 
 
 if __name__ == "__main__":

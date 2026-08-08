@@ -67,13 +67,19 @@ from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_ca
 from edge_agent_deliberation import (
     DeliberationStore,
     configured_barrier_timeout_seconds,
+    configured_conversation_timeout_seconds,
     first_pass_prompt,
     roles_for_request,
     session_id_for_telegram,
     should_publish_failure,
     should_publish_user_result,
 )
-from edge_agent_ingress import classify as classify_ingress, is_deliberation_request, is_group_address
+from edge_agent_ingress import (
+    classify as classify_ingress,
+    is_conversation_meeting,
+    is_deliberation_request,
+    is_group_address,
+)
 from weather_adapter import fetch_weather, is_weather_request
 from edge_agent_parallel_locks import ParallelLockBusy, repository_lifecycle_lock
 from edge_agent_workspace_lock import RepoLockBusy, acquire_repo_lock
@@ -140,6 +146,9 @@ if not ALLOWED_CHAT_ID:
 REQUIRE_FULL_GROUP_INTAKE = os.environ.get("EDGE_AGENT_REQUIRE_FULL_GROUP_INTAKE", "1").strip().casefold() not in {"0", "false", "no", "off"}
 TIMEOUT_SECONDS = int(os.environ.get("TELEGRAM_AGENT_TIMEOUT_SECONDS", "1800"))
 STALE_SECONDS = int(os.environ.get("TELEGRAM_AGENT_STALE_SECONDS", "600"))
+SIMPLE_MEETING_MODE = os.environ.get("EDGE_AGENT_SIMPLE_MEETING_MODE", "0").strip().casefold() in {
+    "1", "true", "yes", "on",
+}
 CLAUDE_NATIVE_MAX_TURNS = max(1, min(32, int(os.environ.get("TELEGRAM_AGENT_CLAUDE_NATIVE_MAX_TURNS", "8"))))
 CLAUDE_DELEGATED_REVIEW_MAX_TURNS = max(
     2,
@@ -854,6 +863,7 @@ def _runtime_prompt_parts(
     *,
     role: str | None = None,
     workspace: Path | None = None,
+    conversation_meeting: bool = False,
 ) -> tuple[str, dict[str, str | int]]:
     selected_role = role or ROLE
     selected_workspace = workspace or _provider_workspace(selected_role)
@@ -870,6 +880,7 @@ def _runtime_prompt_parts(
         session_context=session_block,
         headless=True,
         channel="telegram",
+        conversation_meeting=conversation_meeting,
     )
     if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE:
         prepared = _EFFICIENCY_ADAPTER.prepare(
@@ -1385,6 +1396,7 @@ async def _run_cli(
     chat_id: str | int | None = None,
     fresh_session: bool = False,
     workspace_override: str | None = None,
+    conversation_meeting: bool = False,
 ) -> str:
     timeout_seconds = timeout_seconds if timeout_seconds is not None else TIMEOUT_SECONDS
     call_deadline = time.monotonic() + max(1, timeout_seconds)
@@ -1402,6 +1414,7 @@ async def _run_cli(
         effective_prompt,
         role=role,
         workspace=provider_workspace,
+        conversation_meeting=conversation_meeting,
     )
     native_session_id: str | None = None
     native_session_is_new = False
@@ -1451,9 +1464,14 @@ async def _run_cli(
             args.extend(["--permission-mode", "plan", "--output-format", "text"])
         else:
             args.extend(["--permission-mode", "acceptEdits", "--output-format", "text"])
+        system_prompt = (
+            "너는 이 Telegram 단체방의 Claude 회의 참여자다. 도구를 사용하지 말고 안건에 대한 자기 의견만 제시하라."
+            if conversation_meeting
+            else f"너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라. 공통 운영 계약은 {RUNTIME_CONTRACT}에 있다."
+        )
         args.extend([
             "--append-system-prompt",
-            f"너는 이 Telegram 단체방의 Claude 담당 에이전트다. OpenClaw를 사용하지 말고 직접 작업하라. 공통 운영 계약은 {RUNTIME_CONTRACT}에 있다.",
+            system_prompt,
             "--", runtime_prompt,
         ])
     elif role == "codex":
@@ -1461,7 +1479,7 @@ async def _run_cli(
         if _EFFICIENCY_ADAPTER.mode == EfficiencyMode.ENFORCE and runtime_options.get("reasoning_effort"):
             args.extend(["-c", f'model_reasoning_effort="{runtime_options["reasoning_effort"]}"'])
         args.extend([
-            "--json", "-s", sandbox_mode,
+            "--json", "-s", "read-only" if conversation_meeting else sandbox_mode,
             "-C", str(provider_workspace), "--skip-git-repo-check", "--", runtime_prompt,
         ])
     else:
@@ -1639,8 +1657,8 @@ async def _run_cli(
     return output
 
 
-async def run_provider(prompt: str, on_wait=None, *, context_prompt: str | None = None, provider_text: str | None = None, chat_id: str | int | None = None, fresh_session: bool = False, workspace_override: str | None = None) -> str:
-    return await _run_cli(ROLE, prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=provider_text, chat_id=chat_id, fresh_session=fresh_session, workspace_override=workspace_override)
+async def run_provider(prompt: str, on_wait=None, *, context_prompt: str | None = None, provider_text: str | None = None, chat_id: str | int | None = None, fresh_session: bool = False, workspace_override: str | None = None, conversation_meeting: bool = False) -> str:
+    return await _run_cli(ROLE, prompt, on_wait=on_wait, context_prompt=context_prompt, provider_text=provider_text, chat_id=chat_id, fresh_session=fresh_session, workspace_override=workspace_override, conversation_meeting=conversation_meeting)
 
 
 async def run_provider_as(
@@ -1654,6 +1672,7 @@ async def run_provider_as(
     chat_id: str | int | None = None,
     fresh_session: bool = False,
     workspace_override: str | None = None,
+    conversation_meeting: bool = False,
 ) -> str:
     """Run a bounded provider explicitly instead of silently using ROLE."""
     if provider_role not in ROLES:
@@ -1668,6 +1687,7 @@ async def run_provider_as(
         chat_id=chat_id,
         fresh_session=fresh_session,
         workspace_override=workspace_override,
+        conversation_meeting=conversation_meeting,
     )
 
 
@@ -2221,6 +2241,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = addressed_text(update)
     if text is None:
         return
+    conversation_meeting_active = SIMPLE_MEETING_MODE and is_conversation_meeting(text)
 
     message = update.effective_message
     if _is_stale(message):
@@ -2358,7 +2379,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         deliberation_round = 1
         if is_deliberation_request(text) and classify_ingress(text).accepts("claude"):
             deliberation_session_id = session_id_for_telegram(message.chat_id, message.message_id)
-            DeliberationStore().start(deliberation_session_id, text, roles=roles_for_request(text))
+            DeliberationStore().start(
+                deliberation_session_id,
+                text,
+                roles=roles_for_request(text),
+                mode="conversation" if conversation_meeting_active else "verified",
+            )
         if _is_delivery_retry_request(text):
             await _handle_delivery_retry(message, context)
             return
@@ -2393,9 +2419,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             await message.reply_text(f"❌ 공통 세션 초기화 오류: {exc}")
             return
 
-        coordination_request = ROLE == "claude" and (
-            _message_route(text, _wake_roles(text)) == "coordination"
-            or (is_deliberation_request(text) and classify_ingress(text).accepts("claude"))
+        coordination_request = (
+            conversation_meeting_active and ROLE == "codex"
+        ) or (
+            not conversation_meeting_active
+            and ROLE == "claude"
+            and (
+                _message_route(text, _wake_roles(text)) == "coordination"
+                or (is_deliberation_request(text) and classify_ingress(text).accepts("claude"))
+            )
         )
         progress = None
         # The coordinator's progress message is itself an unwanted answer in
@@ -2553,7 +2585,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                         f"[이번 요청에서 라우터가 배정한 세부 역할: {assigned_role}]\n"
                         + provider_text
                     )
-                if ROLE == "claude":
+                if conversation_meeting_active:
+                    first_pass = await run_provider(
+                        text,
+                        on_wait=_notify_waiting,
+                        context_prompt=preparation.prompt_block if preparation else None,
+                        provider_text=provider_text,
+                        chat_id=message.chat_id,
+                        conversation_meeting=True,
+                    )
+                    meeting_store = DeliberationStore()
+                    meeting_store.record(deliberation_session_id, ROLE, status="completed", summary=first_pass)
+                    if ROLE == "codex":
+                        await asyncio.to_thread(
+                            meeting_store.wait_for_round,
+                            deliberation_session_id,
+                            1,
+                            timeout_seconds=configured_conversation_timeout_seconds(),
+                        )
+                        transcript = meeting_store.render_conversation(deliberation_session_id)
+                        reply = await run_provider(
+                            text,
+                            on_wait=_notify_waiting,
+                            provider_text=(
+                                "[회의 사회자 통합]\n"
+                                "아래에는 실제로 도착한 참여자 의견만 있다. 각 의견의 공통점과 차이를 자연스럽게 연결해 "
+                                "하나의 간결한 결론을 작성하라. 운영 진단 보고서처럼 쓰지 말고 Git, worktree, 테스트, "
+                                "인증 또는 capability를 안건과 무관하게 언급하지 마라. 응답하지 못한 참여자가 있으면 "
+                                "마지막에 한 문장으로만 알리고, 그 사람의 의견을 추측하지 마라.\n\n"
+                                f"안건: {text}\n\n{transcript}"
+                            ),
+                            chat_id=message.chat_id,
+                            conversation_meeting=True,
+                        )
+                    else:
+                        reply = first_pass
+                elif ROLE == "claude":
                     first_pass = await run_provider(
                         text,
                         on_wait=_notify_waiting,
@@ -2775,7 +2842,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             # A meeting failure is peer evidence for the deputy coordinator.
             # Publishing it here would expose a noisy partial result before
             # Codex can issue the single fallback verdict.
-            if not should_publish_failure(ROLE, deliberation_session_id):
+            if not should_publish_failure(
+                ROLE,
+                deliberation_session_id,
+                conversation_meeting=conversation_meeting_active,
+            ):
                 log(
                     f"회의 역할 실패를 내부 기록으로 유지 task={task_id} "
                     f"role={ROLE} coordinator_fallback=codex"
@@ -2820,7 +2891,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 event_type="provider_succeeded_delivery_pending",
             )
 
-        if not deliberation_fallback and not should_publish_user_result(ROLE, deliberation_session_id):
+        if not deliberation_fallback and not should_publish_user_result(
+            ROLE,
+            deliberation_session_id,
+            conversation_meeting=conversation_meeting_active,
+        ):
             # Peer opinions are durable signed evidence for the coordinator,
             # not separate user-facing conclusions.  Finishing here prevents
             # four near-duplicate Telegram answers for one meeting request.
