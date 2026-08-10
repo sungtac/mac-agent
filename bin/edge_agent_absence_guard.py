@@ -37,7 +37,20 @@ ABSENCE_CLAIM_RE = re.compile(
 )
 
 
-_DIFF_BLOCK_RE = re.compile(r"^diff --git.*?(?=^diff --git|\Z)", re.MULTILINE | re.DOTALL)
+# Only strip text that actually has unified-diff shape (header, then
+# --- /+++ , then at least one @@ hunk of +/-/space/no-newline lines). A
+# bare "diff --git" line with no such structure behind it is left in place
+# and still scanned — requiring the real shape closes the earlier bypass
+# where a message could hide everything after that line from the guard by
+# imitating just the header, without providing an actual diff.
+_DIFF_BLOCK_RE = re.compile(
+    r"^diff --git \S+ \S+\n"
+    r"(?:(?:index [0-9a-fA-F]+\.\.[0-9a-fA-F]+.*|new file mode \d+|deleted file mode \d+|"
+    r"similarity index \d+%|rename (?:from|to) .*|copy (?:from|to) .*|Binary files .* differ)\n)*"
+    r"--- .*\n\+\+\+ .*\n"
+    r"(?:@@.*\n(?:[-+ ].*\n|\\ No newline at end of file\n?)*)+",
+    re.MULTILINE,
+)
 
 
 def _strip_diff_blocks(text: str) -> str:

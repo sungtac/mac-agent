@@ -101,6 +101,37 @@ class AbsenceGuardTests(unittest.TestCase):
                 "message": "적용함.\n\nthe api key is missing, so I skipped this step.\n",
             })
 
+    def test_bare_diff_git_line_does_not_hide_a_real_claim(self):
+        """A message can't disarm the guard for everything after it just by
+        starting a line with the literal text "diff --git" — the stripped
+        block must actually have diff shape (---/+++/@@ hunk lines), not
+        just the header."""
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "message": (
+                    "적용 완료.\n\n"
+                    "diff --git a/x b/x\n"
+                    "the api key is missing and I could not configure telegram.\n"
+                ),
+            })
+
+    def test_prose_after_a_real_diff_hunk_is_still_scanned(self):
+        """Once the diff hunk itself ends (no more +/-/space lines), scanning
+        must resume — a real diff shouldn't blank out unrelated prose that
+        happens to follow it in the same message."""
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "message": (
+                    "diff --git a/x.py b/x.py\n"
+                    "index 111..222 100644\n"
+                    "--- a/x.py\n"
+                    "+++ b/x.py\n"
+                    "@@\n"
+                    "+pass\n"
+                    "\nby the way the api key is missing so I stopped here.\n"
+                ),
+            })
+
 
 if __name__ == "__main__":
     unittest.main()
