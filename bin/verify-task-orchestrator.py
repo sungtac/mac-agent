@@ -3,8 +3,10 @@
 
 The Claude Workflow runtime cannot execute local processes directly.  This
 entrypoint therefore owns the deterministic harness and invokes the
-subscription-backed provider CLIs as ordinary host subprocesses.  Claude is
-used only as the light implementer or the independent full-track reviewer.
+subscription-backed provider CLIs as ordinary host subprocesses.  Codex is
+used for light and full-track implementation; Claude and Antigravity provide
+independent reviews for the full track, while Antigravity reviews the light
+track.
 """
 
 from __future__ import annotations
@@ -455,10 +457,10 @@ class HostOrchestrator:
         return "\n".join(sections)
 
     def implement_prompt(self, context: dict[str, Any], feedback: str = "") -> str:
-        return f"""[agent profile v1.0.0]\n영구 역할: 제한된 구현자 또는 독립 리뷰어\n현재 persona: implementer\n\n작업 디렉토리: {self.cwd}\n허용된 파일만 수정하고 저장소 전체를 탐색하지 마.\n\n[원 작업]\n{self.task}\n\n[하네스 패키지]\n{self.context_text(context)}\n\n[추가 수정 지시]\n{feedback or '(첫 구현)'}\n\n실제로 파일을 수정한 뒤 변경 파일과 실행한 테스트를 짧게 설명해."""
+        return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: implementer\n\n작업 디렉토리: {self.cwd}\n허용된 파일만 수정하고 저장소 전체를 탐색하지 마.\n\n[원 작업]\n{self.task}\n\n[하네스 패키지]\n{self.context_text(context)}\n\n[추가 수정 지시]\n{feedback or '(첫 구현)'}\n\n실제로 파일을 수정한 뒤 변경 파일과 실행한 테스트를 짧게 설명해."""
 
     def light_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any]) -> str:
-        return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: test-engineer\n\n경량 트랙의 독립 차단 리뷰어다. 점수는 매기지 않는다. 실제 diff, 하네스 트랙 판정, 테스트 요약만 근거로 판단한다.\n\n[원 작업]\n{self.task}\n[허용 파일/정책]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[트랙]\n{json.dumps(diff.get('policy', {}), ensure_ascii=False)}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\nJSON으로만 답해: {{"verdict":"pass|changes_required|full_track_required","blocking_issues":[]}}"""
+        return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: auditor\n\n경량 트랙의 독립 차단 리뷰어다. 점수는 매기지 않는다. 실제 diff, 하네스 트랙 판정, 테스트 요약만 근거로 판단한다.\n\n[원 작업]\n{self.task}\n[허용 파일/정책]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[트랙]\n{json.dumps(diff.get('policy', {}), ensure_ascii=False)}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\nJSON으로만 답해: {{"verdict":"pass|changes_required|full_track_required","blocking_issues":[]}}"""
 
     def review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
         persona = "communicator" if role == "claude" else "auditor"
@@ -478,22 +480,24 @@ class HostOrchestrator:
     def run_light(self, context: dict[str, Any]) -> dict[str, Any]:
         feedback = ""
         for round_number in range(1, self.max_rounds + 1):
-            implementation = self.claude_call(f"light-implement-round-{round_number}", self.implement_prompt(context, feedback))
-            if not implementation.get("ok"):
-                return {"passed": False, "tier": "light", "error": "claude_implementation_failed", "round": round_number}
+            implementation = self.execute_codex(f"light-implement-round-{round_number}", self.implement_prompt(context, feedback))
+            if implementation.get("dispatchFailed") or implementation.get("ok") is False:
+                return {"passed": False, "tier": "light", "error": "codex_implementation_failed", "round": round_number}
             verification = self.snapshot_tests()
             policy = verification.get("policy", {})
             if policy.get("track") == "full" or len(verification.get("files_changed", [])) > 3:
                 return self.run_full(context, verification, baseline=True)
-            review = self.dispatch("codex", f"light-eval-round-{round_number}", self.light_review_prompt(context, verification, verification.get("test_summary", {})), "light-eval")
-            HARNESS.write_json(self.run_dir / "review-codex.json", review)
+            review = self.dispatch("agy", f"light-eval-round-{round_number}", self.light_review_prompt(context, verification, verification.get("test_summary", {})), "light-eval", context)
+            HARNESS.write_json(self.run_dir / "review-antigravity.json", review)
             self.history.append({"tier": "light", "round": round_number, "review": review, "test_summary": verification.get("test_summary")})
-            issues = review.get("blocking_issues", [])
-            verdict = review.get("verdict")
-            if verification.get("test_summary", {}).get("status") == "passed" and verdict == "pass" and not issues:
-                return {"passed": True, "tier": "light", "round": round_number}
             if review.get("dispatchFailed"):
                 return {"passed": False, "tier": "light", "error": "light_review_failed", "round": round_number}
+            issues = review.get("blocking_issues", [])
+            verdict = review.get("verdict")
+            if verdict == "full_track_required":
+                return self.run_full(context, verification, baseline=True)
+            if verification.get("test_summary", {}).get("status") == "passed" and verdict == "pass" and not issues:
+                return {"passed": True, "tier": "light", "round": round_number}
             if round_number == self.max_rounds:
                 return {"passed": False, "tier": "light", "error": "changes_required", "round": round_number, "blocking_issues": issues}
             feedback = json.dumps(issues, ensure_ascii=False)
