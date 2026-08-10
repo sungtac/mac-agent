@@ -157,6 +157,45 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 runner.dispatch("codex", "role", "prompt", "review")
             mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
 
+    def test_execute_codex_survives_a_broken_reload_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true, "message": "done"}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=SyntaxError("guard mid-edit")):
+                result = runner.execute_codex("role", "prompt")
+            self.assertTrue(result.get("dispatchFailed"))
+            self.assertEqual(result.get("error"), "absence_guard_reload_failed")
+
+    def test_claude_call_survives_a_broken_reload_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.claude = "faux-claude"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true, "message": "done"}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=SyntaxError("guard mid-edit")):
+                result = runner.claude_call("role", "prompt")
+            self.assertFalse(result.get("ok"))
+            self.assertEqual(result.get("error"), "absence_guard_reload_failed")
+
+    def test_dispatch_survives_a_broken_reload_instead_of_crashing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=SyntaxError("guard mid-edit")):
+                result = runner.dispatch("codex", "role", "prompt", "review")
+            self.assertTrue(result.get("dispatchFailed"))
+            self.assertEqual(result.get("dispatchFailureReason"), "absence_guard_reload_failed")
+
 
 if __name__ == "__main__":
     unittest.main()

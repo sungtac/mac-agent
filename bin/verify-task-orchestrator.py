@@ -329,6 +329,9 @@ class HostOrchestrator:
         self.record_metric("claude", role, prompt, usage)
         try:
             importlib.reload(HARNESS.ABSENCE_GUARD)
+        except Exception as exc:
+            return {"ok": False, "error": "absence_guard_reload_failed", "message": f"{type(exc).__name__}: {exc}"}
+        try:
             HARNESS.ABSENCE_GUARD.validate_provider_payload(result if result is not None else output)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"ok": False, "error": "unsupported_absence_claim", "message": str(exc), "discovery_required": True}
@@ -367,6 +370,9 @@ class HostOrchestrator:
             return {"dispatchFailed": True, "dispatchFailureReason": f"{tool} dispatch failed: {output[-1000:]}"}
         try:
             importlib.reload(HARNESS.ABSENCE_GUARD)
+        except Exception as exc:
+            return {"dispatchFailed": True, "dispatchFailureReason": "absence_guard_reload_failed", "message": f"{type(exc).__name__}: {exc}"}
+        try:
             HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"dispatchFailed": True, "dispatchFailureReason": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
@@ -386,6 +392,9 @@ class HostOrchestrator:
             return {"ok": False, "dispatchFailed": True, "message": output[-2000:]}
         try:
             importlib.reload(HARNESS.ABSENCE_GUARD)
+        except Exception as exc:
+            return {"ok": False, "dispatchFailed": True, "error": "absence_guard_reload_failed", "message": f"{type(exc).__name__}: {exc}"}
+        try:
             HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"ok": False, "dispatchFailed": True, "error": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
@@ -488,7 +497,13 @@ class HostOrchestrator:
             if policy.get("track") == "full" or len(verification.get("files_changed", [])) > 3:
                 return self.run_full(context, verification, baseline=True)
             review = self.dispatch("agy", f"light-eval-round-{round_number}", self.light_review_prompt(context, verification, verification.get("test_summary", {})), "light-eval", context)
-            HARNESS.write_json(self.run_dir / "review-antigravity.json", review)
+            # Distinct filename from run_full's review-antigravity.json: a
+            # light->full escalation reuses this same run_dir, and would
+            # otherwise silently overwrite the light-track review that was
+            # the very evidence for escalating right as it happens. The
+            # record also lives in self.history/final-verdict.json either
+            # way; this keeps the standalone snapshot file honest too.
+            HARNESS.write_json(self.run_dir / "review-antigravity-light.json", review)
             self.history.append({"tier": "light", "round": round_number, "review": review, "test_summary": verification.get("test_summary")})
             if review.get("dispatchFailed"):
                 return {"passed": False, "tier": "light", "error": "light_review_failed", "round": round_number}
