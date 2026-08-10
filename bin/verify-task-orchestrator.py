@@ -326,6 +326,7 @@ class HostOrchestrator:
         result, usage = nested_provider_result(envelope)
         self.record_metric("claude", role, prompt, usage)
         try:
+            importlib.reload(HARNESS.ABSENCE_GUARD)
             HARNESS.ABSENCE_GUARD.validate_provider_payload(result if result is not None else output)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"ok": False, "error": "unsupported_absence_claim", "message": str(exc), "discovery_required": True}
@@ -363,6 +364,7 @@ class HostOrchestrator:
         if code != 0 or not isinstance(value, dict):
             return {"dispatchFailed": True, "dispatchFailureReason": f"{tool} dispatch failed: {output[-1000:]}"}
         try:
+            importlib.reload(HARNESS.ABSENCE_GUARD)
             HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"dispatchFailed": True, "dispatchFailureReason": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
@@ -381,6 +383,7 @@ class HostOrchestrator:
         if code != 0 or not isinstance(value, dict):
             return {"ok": False, "dispatchFailed": True, "message": output[-2000:]}
         try:
+            importlib.reload(HARNESS.ABSENCE_GUARD)
             HARNESS.ABSENCE_GUARD.validate_provider_payload(value)
         except HARNESS.ABSENCE_GUARD.UnsupportedAbsenceClaim as exc:
             return {"ok": False, "dispatchFailed": True, "error": "unsupported_absence_claim", "discoveryRequired": True, "message": str(exc)}
