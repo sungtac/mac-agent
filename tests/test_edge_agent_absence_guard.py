@@ -16,6 +16,18 @@ SPEC.loader.exec_module(MODULE)
 
 
 class AbsenceGuardTests(unittest.TestCase):
+    def test_unrelated_compound_word_near_negation_is_allowed(self):
+        result = MODULE.validate_provider_payload({"summary": "패키지 의존성 변경은 없다"})
+        self.assertTrue(result["validated"])
+
+    def test_korean_key_absence_claim_with_particle_is_rejected(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({"summary": "API 키가 없습니다"})
+
+    def test_korean_token_absence_claim_is_rejected(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({"summary": "토큰이 없음"})
+
     def test_bare_capability_absence_claim_is_rejected(self):
         with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
             MODULE.validate_provider_payload({"summary": "Telegram token is not configured"})
@@ -56,6 +68,38 @@ class AbsenceGuardTests(unittest.TestCase):
         complete = MODULE.DiscoveryEvidence("x", ("environment", "/tmp/config"), ("scan",), (), True, "now")
         claim = MODULE.scoped_absence_claim("x", complete)
         self.assertEqual(claim["status"], "not_found_in_searched_scope")
+
+    def test_split_across_sentences_is_allowed(self):
+        result = MODULE.validate_provider_payload({
+            "summary": "The target file matches expectations. Later in a separate sentence we confirm nothing is missing here.",
+        })
+        self.assertTrue(result["validated"])
+
+    def test_same_clause_absence_claim_still_rejected(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({"summary": "the config file is missing"})
+
+    def test_diff_hunk_literal_is_not_scanned_as_claim(self):
+        message = (
+            "적용함.\n\n"
+            "diff --git a/tests/example_test.py b/tests/example_test.py\n"
+            "index 111..222 100644\n"
+            "--- a/tests/example_test.py\n"
+            "+++ b/tests/example_test.py\n"
+            "@@\n"
+            "+    def test_same_clause_absence_claim_still_rejected(self):\n"
+            "+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):\n"
+            "+            MODULE.validate_provider_payload({\"summary\": \"the config file is missing\"})\n"
+        )
+        result = MODULE.validate_provider_payload({"ok": True, "message": message})
+        self.assertTrue(result["validated"])
+
+    def test_prose_claim_outside_diff_still_rejected(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "ok": True,
+                "message": "적용함.\n\nthe api key is missing, so I skipped this step.\n",
+            })
 
 
 if __name__ == "__main__":

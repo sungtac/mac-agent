@@ -109,8 +109,8 @@ class ProviderPilotTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertIn("not confirm", detail)
             ok, detail = module._usage_gate("codex", allow_unmetered=True)
-        self.assertTrue(ok)
-        self.assertIn("explicit", detail)
+            self.assertTrue(ok)
+            self.assertIn("explicit", detail)
 
         completed.stdout = "PROCEED - codex 5h창 잔여 N/A / 7d창 잔여 90%\n"
         with patch.object(module.subprocess, "run", return_value=completed):

@@ -27,14 +27,35 @@ SOURCE_NAME_RE = re.compile(
 )
 ABSENCE_CLAIM_RE = re.compile(
     r"(?:"
-    r"(?:token|api\s*key|secret|credential|인증|자격|토큰|키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
-    r"[^\n\\]{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
+    r"(?:token|api\s*key|secret|credential|인증|자격|토큰|(?<![가-힣])키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
+    r"[^.!?\n\\]{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
     r"|"
     r"(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
-    r"[^\n\\]{0,80}(?:token|api\s*key|secret|credential|인증|자격|토큰|키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
+    r"[^.!?\n\\]{0,80}(?:token|api\s*key|secret|credential|인증|자격|토큰|(?<![가-힣])키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
     r")",
     re.IGNORECASE,
 )
+
+
+_DIFF_BLOCK_RE = re.compile(r"^diff --git.*?(?=^diff --git|\Z)", re.MULTILINE | re.DOTALL)
+
+
+def _strip_diff_blocks(text: str) -> str:
+    """Drop unified-diff hunks so quoted code/test literals inside a diff are
+    never scanned as the provider's own prose claim."""
+    return _DIFF_BLOCK_RE.sub("", text)
+
+
+def _claim_scan_text(value: Any) -> str:
+    """Flatten a provider payload into scannable prose, stripping diff hunks
+    per string leaf before any JSON escaping collapses real newlines."""
+    if isinstance(value, str):
+        return _strip_diff_blocks(value)
+    if isinstance(value, Mapping):
+        return "\n".join(_claim_scan_text(item) for item in value.values())
+    if isinstance(value, (list, tuple)):
+        return "\n".join(_claim_scan_text(item) for item in value)
+    return str(value)
 
 
 class UnsupportedAbsenceClaim(ValueError):
@@ -140,10 +161,7 @@ def _has_discovery_evidence(value: Any) -> bool:
 
 def validate_provider_payload(value: Any) -> dict[str, Any]:
     """Reject capability/configuration absence claims without search evidence."""
-    try:
-        encoded = json.dumps(value, ensure_ascii=False, default=str)
-    except (TypeError, ValueError):
-        encoded = str(value)
+    encoded = _claim_scan_text(value)
     if ABSENCE_CLAIM_RE.search(encoded) and not _has_discovery_evidence(value):
         raise UnsupportedAbsenceClaim(
             "capability/configuration absence claim requires discovery_evidence, searched_scopes, or search_scope"

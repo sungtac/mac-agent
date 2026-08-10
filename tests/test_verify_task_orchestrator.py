@@ -121,6 +121,42 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             self.assertIn("improvement_task", result)
             self.assertEqual(len(history_file.read_text(encoding="utf-8").splitlines()), 2)
 
+    def test_execute_codex_reloads_absence_guard_before_validating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true, "message": "done"}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload") as mock_reload:
+                runner.execute_codex("role", "prompt")
+            mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
+
+    def test_claude_call_reloads_absence_guard_before_validating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.claude = "faux-claude"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true, "message": "done"}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload") as mock_reload:
+                runner.claude_call("role", "prompt")
+            mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
+
+    def test_dispatch_reloads_absence_guard_before_validating(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            with patch.object(runner, "process", return_value=(0, '{"ok": true}')), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload") as mock_reload:
+                runner.dispatch("codex", "role", "prompt", "review")
+            mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
+
 
 if __name__ == "__main__":
     unittest.main()
