@@ -162,10 +162,21 @@ def discover_local_sources(
     )
 
 
+def _is_meaningful_evidence_value(value: Any) -> bool:
+    """A discovery-evidence key merely being present isn't evidence: an empty
+    list/dict/string or None means nothing was actually searched or recorded,
+    the same way an empty ``searched_scopes: []`` would fail
+    ``scoped_absence_claim``'s own completeness check below."""
+    if isinstance(value, (str, list, tuple, dict)):
+        return len(value) > 0
+    return False
+
+
 def _has_discovery_evidence(value: Any) -> bool:
     if isinstance(value, Mapping):
-        if any(key in value for key in ("discovery_evidence", "searched_scopes", "search_scope")):
-            return True
+        for key in ("discovery_evidence", "searched_scopes", "search_scope"):
+            if key in value and _is_meaningful_evidence_value(value[key]):
+                return True
         return any(_has_discovery_evidence(item) for item in value.values())
     if isinstance(value, (list, tuple)):
         return any(_has_discovery_evidence(item) for item in value)

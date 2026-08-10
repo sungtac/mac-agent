@@ -132,6 +132,34 @@ class AbsenceGuardTests(unittest.TestCase):
                 ),
             })
 
+    def test_empty_searched_scopes_is_not_evidence(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "summary": "the api key is missing",
+                "searched_scopes": [],
+            })
+
+    def test_empty_discovery_evidence_dict_is_not_evidence(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "summary": "the token is not configured",
+                "discovery_evidence": {},
+            })
+
+    def test_null_discovery_evidence_is_not_evidence(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "summary": "the config file is missing",
+                "discovery_evidence": None,
+            })
+
+    def test_empty_search_scope_string_is_not_evidence(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({
+                "summary": "the secret is missing",
+                "search_scope": "",
+            })
+
 
 if __name__ == "__main__":
     unittest.main()
