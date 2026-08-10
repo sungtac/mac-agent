@@ -49,7 +49,7 @@ LOGFILE="$STATE_DIR/${TODAY}.log"
 GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
 if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
   echo "usage gate: ${GATE_OUTPUT} — skipping this run." >> "$LOGFILE"
-  MSG_ID="$(bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 주간보고서 실행을 건너뛰었습니다 — 계정 사용량 부족.
+  MSG_ID="$(bash "$HOME/mac-agent/bin/telegram-notify.sh" "⏳ 주간보고서 실행을 건너뛰었습니다 — 계정 사용량 부족.
 ${GATE_OUTPUT#SKIP: }
 이 메시지에 답장하면 (사용량 회복 후) 다시 시도합니다." || true)"
   if [ -n "$MSG_ID" ]; then
@@ -211,7 +211,7 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   # 변형들을 추가로 커버.
   if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'calendar.*(not authenticated|requires?.*auth|unauthorized|needs?.*(re)?auth|oauth.*(expired|invalid|fail)|token.*(missing|expired|invalid))|(not authenticated|unauthorized|oauth.*(expired|invalid)).*calendar|mcp.*(server)?.*(unavailable|not available|unreachable|connection required)'; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: Calendar MCP 미인증 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
-    bash "$HOME/mac-agent/bin/discord-notify.sh" "🔑 주간보고서 생성 실패 — Google Calendar MCP 미인증으로 보입니다. /mcp 명령으로 재인증 후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
+    bash "$HOME/mac-agent/bin/telegram-notify.sh" "🔑 주간보고서 생성 실패 — Google Calendar MCP 미인증으로 보입니다. /mcp 명령으로 재인증 후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
     exit 1
   fi
 
@@ -228,7 +228,7 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
   # 표현은 놓쳤다 — 흔한 변형 추가.
   if printf '%s' "$ATTEMPT_OUTPUT" | grep -qiE 'hit your (session|usage) limit|rate.?limit(_error| exceeded)?|usage cap|quota exceeded|\boverloaded\b|\b429\b'; then
     echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: 사용 한도 초과 감지 — 재시도로 해결 불가, fail-fast." >> "$LOGFILE"
-    bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 주간보고서 생성 실패 — 계정 사용 한도 초과. 한도 리셋 이후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
+    bash "$HOME/mac-agent/bin/telegram-notify.sh" "⏳ 주간보고서 생성 실패 — 계정 사용 한도 초과. 한도 리셋 이후 !주간보고서로 다시 요청하세요. 로그: ${LOGFILE}" || true
     exit 1
   fi
 done
@@ -238,7 +238,7 @@ if [ "$SUCCESS" -ne 1 ]; then
   # discord-notify.sh returns the posted message's Discord id on stdout (Phase 2).
   # If we get one back, record a pending-job file keyed by that id so
   # discord-bot.py can recognize a reply to THIS message and retry the script.
-  MSG_ID="$(bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 주간보고서 생성 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}
+  MSG_ID="$(bash "$HOME/mac-agent/bin/telegram-notify.sh" "⚠️ 주간보고서 생성 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}
 이 메시지에 답장하면 다시 시도합니다." || true)"
   if [ -n "$MSG_ID" ]; then
     PENDING_DIR="$HOME/.claude/discord-bot/pending"

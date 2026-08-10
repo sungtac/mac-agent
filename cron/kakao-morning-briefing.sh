@@ -56,7 +56,7 @@ LOGFILE="$STATE_DIR/${TODAY}.log"
 GATE_OUTPUT="$(bash "$HOME/mac-agent/workflows/lib/usage-preflight-gate.sh" claude 2>/dev/null || echo "PROCEED (gate script error — not enforced)")"
 if [[ "$GATE_OUTPUT" == SKIP:* ]]; then
   echo "usage gate: ${GATE_OUTPUT} — skipping today's briefing." >> "$LOGFILE"
-  bash "$HOME/mac-agent/bin/discord-notify.sh" "⏳ 오늘 카톡 모닝 브리핑을 건너뛰었습니다 — 계정 사용량 부족.
+  bash "$HOME/mac-agent/bin/telegram-notify.sh" "⏳ 오늘 카톡 모닝 브리핑을 건너뛰었습니다 — 계정 사용량 부족.
 ${GATE_OUTPUT#SKIP: }" || true
   exit 4
 fi
@@ -167,7 +167,7 @@ for ATTEMPT in $(seq 1 "$MAX_ATTEMPTS"); do
     # own ambiguous-classification case.
     if [ -f "$DEBUG_LOGFILE" ] && grep -q 'KakaotalkChat-MemoChat' "$DEBUG_LOGFILE" 2>/dev/null; then
       echo "attempt ${ATTEMPT}/${MAX_ATTEMPTS}: 타임아웃 직전 카톡 발송 도구 호출 흔적이 debug 로그에 있음 — 이미 보냈을 수 있어 재시도(중복발송 위험) 대신 여기서 중단." >> "$LOGFILE"
-      bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 카톡 모닝 브리핑 — ${ATTEMPT}번째 시도가 타임아웃됐는데, 발송 직전까지 진행된 흔적이 있어 재시도하지 않았습니다(중복발송 방지). 실제로 도착했는지 확인해주세요. 로그: ${LOGFILE}" || true
+      bash "$HOME/mac-agent/bin/telegram-notify.sh" "⚠️ 카톡 모닝 브리핑 — ${ATTEMPT}번째 시도가 타임아웃됐는데, 발송 직전까지 진행된 흔적이 있어 재시도하지 않았습니다(중복발송 방지). 실제로 도착했는지 확인해주세요. 로그: ${LOGFILE}" || true
       exit 3
     fi
     rm -f "$ATTEMPT_OUTFILE"
@@ -191,6 +191,6 @@ done
 
 if [ "$SUCCESS" -ne 1 ]; then
   echo "all ${MAX_ATTEMPTS} attempts failed." >> "$LOGFILE"
-  bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 카톡 모닝 브리핑 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}" || true
+  bash "$HOME/mac-agent/bin/telegram-notify.sh" "⚠️ 카톡 모닝 브리핑 실패 — ${MAX_ATTEMPTS}회 재시도 모두 실패. 로그: ${LOGFILE}" || true
   exit 1
 fi

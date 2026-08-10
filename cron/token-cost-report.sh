@@ -36,7 +36,7 @@ mkdir -p "$OUT_DIR"
 if [ ! -f "$ANALYZE_SCRIPT" ]; then
   echo "--- run $(date) ---" >> "$LOGFILE"
   echo "치명적 오류: analyze_sessions.py를 찾을 수 없음 (${ANALYZE_SCRIPT})" >> "$LOGFILE"
-  bash "$HOME/mac-agent/bin/discord-notify.sh" "🚨 토큰비용 일일 리포트 전체 실패 — analyze_sessions.py 스크립트가 없음 (${ANALYZE_SCRIPT}). skill-catalog 재설치가 필요할 수 있습니다." || true
+  bash "$HOME/mac-agent/bin/telegram-notify.sh" "🚨 토큰비용 일일 리포트 전체 실패 — analyze_sessions.py 스크립트가 없음 (${ANALYZE_SCRIPT}). skill-catalog 재설치가 필요할 수 있습니다." || true
   exit 1
 fi
 
@@ -80,7 +80,7 @@ done <<< "$REPOS_LIST"
 
 if [ "${#FAILED_REPOS[@]}" -gt 0 ]; then
   FAILED_STR="$(IFS=', '; echo "${FAILED_REPOS[*]}")"
-  bash "$HOME/mac-agent/bin/discord-notify.sh" "⚠️ 토큰비용 일일 리포트 일부 실패: ${FAILED_STR}. 로그: ${LOGFILE}" || true
+  bash "$HOME/mac-agent/bin/telegram-notify.sh" "⚠️ 토큰비용 일일 리포트 일부 실패: ${FAILED_STR}. 로그: ${LOGFILE}" || true
 fi
 
 exit 0
