@@ -25,10 +25,24 @@ SOURCE_NAME_RE = re.compile(
     r"(?:token|secret|credential|auth|config|setting|key|password|chat|telegram|plist|service)",
     re.IGNORECASE,
 )
+# The Korean "없다" family (없습니다/없음/없다) idiomatically negates
+# whatever noun+particle immediately precedes it ("X가/이/은/는 없다" = "there
+# is no X"). Letting that ending pair with a subject noun found up to 80
+# characters earlier — the same wide gap the English "missing"/"not found"
+# endings need — misreads sentences where an unrelated noun sits between the
+# two, e.g. "기존 파일에는 변경이 없다" ("no *changes* to the existing file")
+# reads "변경이 없다" (no changes), not a claim that the file itself is
+# missing. Keeping the gap tight (particle-only) for this ending specifically
+# requires the negated noun to be the word directly in front of "없다".
+_NO_EXIST_GAP = r"\s*(?:이|가|은|는|도|만|조차|마저)?\s{0,2}"
 ABSENCE_CLAIM_RE = re.compile(
     r"(?:"
     r"(?:token|api\s*key|secret|credential|인증|자격|토큰|(?<![가-힣])키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"
-    r"[^.!?\n\\]{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
+    r"(?:"
+    r"[^.!?\n\\]{0,80}(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|찾을\s+수\s+없|미설정|구성되지\s+않)"
+    r"|"
+    r"" + _NO_EXIST_GAP + r"없(?:습니다|음|다)"
+    r")"
     r"|"
     r"(?:missing|not\s+(?:found|present|configured|available|set)|does\s+not\s+exist|unavailable|없(?:습니다|음|다)|찾을\s+수\s+없|미설정|구성되지\s+않)"
     r"[^.!?\n\\]{0,80}(?:token|api\s*key|secret|credential|인증|자격|토큰|(?<![가-힣])키|설정|구성|config(?:uration)?|service|서비스|executable|실행파일|capability|기능|file|파일)"

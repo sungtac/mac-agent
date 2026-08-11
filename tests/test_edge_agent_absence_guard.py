@@ -20,6 +20,19 @@ class AbsenceGuardTests(unittest.TestCase):
         result = MODULE.validate_provider_payload({"summary": "패키지 의존성 변경은 없다"})
         self.assertTrue(result["validated"])
 
+    def test_trigger_noun_with_unrelated_subject_before_negation_is_allowed(self):
+        """"파일" earlier in the sentence must not pair with an unrelated
+        noun's "없다" ("기존 파일에는 변경이 없다" says there are no
+        *changes*, not that the file is missing)."""
+        result = MODULE.validate_provider_payload({
+            "plan": "코드와 기존 파일에는 변경이 없다.",
+        })
+        self.assertTrue(result["validated"])
+
+    def test_trigger_noun_directly_negated_is_still_rejected(self):
+        with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
+            MODULE.validate_provider_payload({"summary": "대상 파일이 없다"})
+
     def test_korean_key_absence_claim_with_particle_is_rejected(self):
         with self.assertRaises(MODULE.UnsupportedAbsenceClaim):
             MODULE.validate_provider_payload({"summary": "API 키가 없습니다"})
