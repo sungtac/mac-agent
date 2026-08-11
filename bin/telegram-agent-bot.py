@@ -1460,7 +1460,7 @@ async def _run_cli(
         # permission state for ordinary work, while delegated verification is
         # explicitly plan-only. The provider sandbox remains an independent
         # path-boundary defence.
-        if fresh_session:
+        if fresh_session or conversation_meeting:
             args.extend(["--permission-mode", "plan", "--output-format", "text"])
         else:
             args.extend(["--permission-mode", "acceptEdits", "--output-format", "text"])
@@ -1506,7 +1506,11 @@ async def _run_cli(
         # global permission bypass.  `accept-edits` is the documented
         # non-interactive mode for file edits; `--sandbox` adds the provider
         # terminal boundary, while the wrapper protects Team OS paths.
-        args = [str(cli_path), "--sandbox", "--mode", "accept-edits", "--print", runtime_prompt]
+        args = [
+            str(cli_path), "--sandbox", "--mode",
+            "plan" if conversation_meeting else "accept-edits",
+            "--print", runtime_prompt,
+        ]
 
     if role != "codex" and not workspace_override:
         provider_workspace = _provider_workspace(role)
@@ -2241,8 +2245,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     text = addressed_text(update)
     if text is None:
         return
-    conversation_meeting_active = SIMPLE_MEETING_MODE and is_conversation_meeting(text)
-
+    chat = update.effective_chat
+    conversation_meeting_active = (
+        SIMPLE_MEETING_MODE
+        and chat is not None
+        and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP)
+        and is_conversation_meeting(text)
+    )
     message = update.effective_message
     if _is_stale(message):
         log(f"오래된 메시지 무시 chat={message.chat_id} age>{STALE_SECONDS}s")
@@ -2795,6 +2804,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     context_prompt=preparation.prompt_block if preparation else None,
                     provider_text=provider_text,
                     chat_id=message.chat_id,
+                    **({"conversation_meeting": True} if conversation_meeting_active else {}),
                 )
         except Exception as exc:
             log(f"처리 실패 task={task_id} chat={message.chat_id} duration={time.monotonic() - started:.1f}s error={exc}")

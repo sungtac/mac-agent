@@ -480,6 +480,72 @@ class AdapterIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(("provider", True), observed)
         self.assertIn(("roda", "completed", "Roda의 사용자 관점 의견"), observed)
 
+    async def test_private_chats_never_enter_conversation_meeting_mode(self):
+        meeting_text = "현재 시스템 장단점을 회의하고 하나의 결론으로 통합해줘"
+        direct_update = self.update(meeting_text, message_id=903)
+        direct_update.effective_chat.type = self.bot.ChatType.PRIVATE
+        direct_provider = AsyncMock(return_value="일반 답변")
+
+        with patch.object(self.bot, "addressed_text", return_value=meeting_text), \
+                patch.object(self.bot, "SIMPLE_MEETING_MODE", True), \
+                patch.object(self.bot, "is_conversation_meeting", return_value=True) as direct_detector, \
+                patch.object(self.bot, "is_deliberation_request", return_value=False), \
+                patch.object(self.bot, "run_provider", new=direct_provider), \
+                patch.object(self.bot, "_prepare_context", return_value=None), \
+                patch.object(self.bot, "_ingress_identity", return_value=None), \
+                patch.object(self.bot, "_is_stale", return_value=False), \
+                patch.object(self.bot, "_needs_task_worktree", return_value=False), \
+                patch.object(self.bot, "write_task_state", return_value="task-private"), \
+                patch.object(self.bot, "start_session", return_value="session-private"), \
+                patch.object(self.bot, "update_session"), \
+                patch.object(self.bot, "write_reflection"), \
+                patch.object(self.bot, "_record_telegram_efficiency"), \
+                patch.object(self.bot, "_update_task_worktree_status"), \
+                patch.object(self.bot._CONTROL_PLANE, "start_task"), \
+                patch.object(self.bot._CONTROL_PLANE, "mark_task"):
+            self.bot.ACTIVE_TASK_WORKSPACE = None
+            self.bot.ACTIVE_LOGICAL_SESSION_ID = None
+            await self.bot.handle_message(direct_update, SimpleNamespace())
+
+        direct_detector.assert_not_called()
+        self.assertIs(direct_provider.await_args.kwargs.get("conversation_meeting", False), False)
+
+        roda_calls = []
+
+        async def reply_text(value):
+            return FakeSent(991)
+
+        async def send_chat_action(**kwargs):
+            return None
+
+        def run_roda(text, **kwargs):
+            roda_calls.append(kwargs)
+            return "일반 답변"
+
+        roda_update = SimpleNamespace(
+            effective_message=SimpleNamespace(
+                text=meeting_text,
+                caption=None,
+                message_id=904,
+                reply_to_message=None,
+                reply_text=reply_text,
+            ),
+            effective_chat=SimpleNamespace(type=self.roda.ChatType.PRIVATE, id=6417205500),
+            effective_user=SimpleNamespace(id=6417205500),
+        )
+        roda_context = SimpleNamespace(bot=SimpleNamespace(send_chat_action=send_chat_action))
+        with patch.object(self.roda, "SIMPLE_MEETING_MODE", True), \
+                patch.object(self.roda, "is_conversation_meeting", return_value=True) as roda_detector, \
+                patch.object(self.roda, "_ollama_chat", side_effect=run_roda), \
+                patch.object(self.roda, "_context_store", return_value=self.store), \
+                patch.object(self.roda, "write_task_state", return_value="task-roda-private"), \
+                patch.object(self.roda._CONTROL_PLANE, "start_task"), \
+                patch.object(self.roda._CONTROL_PLANE, "mark_task"):
+            await self.roda.handle_message(roda_update, roda_context)
+
+        roda_detector.assert_not_called()
+        self.assertEqual(roda_calls, [{}])
+
 
 if __name__ == "__main__":
     unittest.main()

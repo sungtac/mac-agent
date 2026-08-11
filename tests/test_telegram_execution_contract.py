@@ -183,7 +183,73 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
         source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")
         self.assertNotIn("--dangerously-skip-permissions", source)
         self.assertIn('"--permission-mode", "acceptEdits"', source)
-        self.assertIn('"--sandbox", "--mode", "accept-edits"', source)
+        self.assertIn('"plan" if conversation_meeting else "accept-edits"', source)
+
+    async def test_conversation_meeting_uses_plan_mode_for_claude_and_antigravity(self):
+        commands = []
+
+        class Unlocked:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class CompletedProcess:
+            pid = os.getpid()
+            returncode = 0
+
+            async def communicate(self):
+                return b"meeting opinion", b""
+
+        async def spawn(*args, **kwargs):
+            commands.append(args)
+            return CompletedProcess()
+
+        test_roles = {
+            role: {**BOT.ROLES[role], "binary": Path(sys.executable)}
+            for role in ("claude", "antigravity")
+        }
+        with patch.dict(BOT.ROLES, test_roles), \
+                patch.object(BOT, "acquire_workspace_lock", return_value=Unlocked()), \
+                patch.object(BOT.asyncio, "create_subprocess_exec", side_effect=spawn), \
+                patch.object(BOT, "_load_native_session_record", return_value=None), \
+                patch.object(BOT, "_persist_native_session_id"):
+            await BOT._run_cli("claude", "의견", conversation_meeting=True)
+            await BOT._run_cli("antigravity", "의견", conversation_meeting=True)
+
+        claude_args, antigravity_args = commands
+        self.assertEqual(claude_args[claude_args.index("--permission-mode") + 1], "plan")
+        self.assertEqual(antigravity_args[antigravity_args.index("--mode") + 1], "plan")
+
+    async def test_legacy_meeting_coordination_forwards_read_only_state(self):
+        provider = AsyncMock(return_value="통합 결론")
+        sent = FakeSent(11)
+        update = make_update(sent)
+        with patch.object(BOT, "addressed_text", return_value="논의하고 의견을 통합해줘"), \
+                patch.object(BOT, "SIMPLE_MEETING_MODE", True), \
+                patch.object(BOT, "is_conversation_meeting", return_value=True), \
+                patch.object(BOT, "is_deliberation_request", return_value=False), \
+                patch.object(BOT, "_prepare_context", return_value=None), \
+                patch.object(BOT, "_ingress_identity", return_value=None), \
+                patch.object(BOT, "_is_stale", return_value=False), \
+                patch.object(BOT, "_needs_task_worktree", return_value=False), \
+                patch.object(BOT, "wait_for_peer_results", new=AsyncMock(return_value="peer opinions")), \
+                patch.object(BOT, "run_provider", new=provider), \
+                patch.object(BOT, "write_task_state", return_value="task-meeting"), \
+                patch.object(BOT, "start_session", return_value="session-meeting"), \
+                patch.object(BOT, "update_session"), \
+                patch.object(BOT, "write_reflection"), \
+                patch.object(BOT, "_record_telegram_efficiency"), \
+                patch.object(BOT, "_update_task_worktree_status"), \
+                patch.dict(os.environ, {"EDGE_AGENT_TELEGRAM_DELIVERY_ROOT": self.delivery_root.name}), \
+                patch.object(BOT, "ROLE", "codex"):
+            BOT.ACTIVE_TASK_WORKSPACE = None
+            BOT.ACTIVE_LOGICAL_SESSION_ID = None
+            await BOT.handle_message(update, SimpleNamespace())
+
+        provider.assert_awaited_once()
+        self.assertIs(provider.await_args.kwargs["conversation_meeting"], True)
 
     def test_delegation_delivery_uses_defined_reply_chunker(self):
         source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")

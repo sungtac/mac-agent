@@ -361,7 +361,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     original_text = text
     deliberation_session_id = None
-    conversation_meeting_active = SIMPLE_MEETING_MODE and is_conversation_meeting(original_text)
+    conversation_meeting_active = (
+        SIMPLE_MEETING_MODE
+        and chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}
+        and is_conversation_meeting(original_text)
+    )
     if chat.type in {ChatType.GROUP, ChatType.SUPERGROUP}:
         if chat.id not in ALLOWED_GROUP_IDS:
             return
