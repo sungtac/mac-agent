@@ -343,6 +343,27 @@ class HostOrchestrator:
         envelope = last_json(output)
         result, usage = nested_provider_result(envelope)
         self.record_metric("claude", role, prompt, usage)
+        if expect_json and not isinstance(result, dict):
+            repair_prompt = (
+                "[중요] 이전 응답이 요구된 JSON 형식을 지키지 않았다. "
+                "지금부터 응답은 예외 없이 아래 지시가 요구하는 JSON 객체 하나만 출력해야 한다. "
+                "설명, 요약, 코드블록, 추가 텍스트를 절대 포함하지 마라. "
+                "응답 전체가 그 자체로 유효한 JSON이어야 한다.\n\n"
+                + prompt
+            )
+            retry_role = f"{role}-retry"
+            retry_code, retry_output = self.process(
+                [self.claude, "-p", "--model", "sonnet", "--effort", "medium", "--output-format", "json", repair_prompt],
+                retry_role,
+                900,
+                retry_role,
+                {"CLAUDE_CODE_PRINT_BG_WAIT_CEILING_MS": "0"},
+            )
+            retry_envelope = last_json(retry_output)
+            retry_result, retry_usage = nested_provider_result(retry_envelope)
+            self.record_metric("claude", retry_role, repair_prompt, retry_usage)
+            if isinstance(retry_result, dict):
+                code, output, result, usage = retry_code, retry_output, retry_result, retry_usage
         try:
             importlib.reload(HARNESS.ABSENCE_GUARD)
         except Exception as exc:

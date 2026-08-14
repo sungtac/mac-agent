@@ -145,6 +145,55 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 runner.claude_call("role", "prompt")
             mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
 
+    def test_claude_call_retries_once_and_returns_repaired_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.claude = "faux-claude"
+            repaired = {"hasBlockingIssue": False, "issues": [], "checks": ["reviewed"]}
+            with patch.object(
+                runner,
+                "process",
+                side_effect=[(0, "prose response"), (0, json.dumps(repaired))],
+            ) as process, patch.object(runner, "record_metric") as record_metric, patch.object(
+                MODULE.importlib, "reload", side_effect=lambda module: module
+            ):
+                result = runner.claude_call("claude-review", "review prompt", expect_json=True)
+
+            self.assertTrue(result["ok"])
+            self.assertFalse(result["hasBlockingIssue"])
+            self.assertEqual(result["checks"], ["reviewed"])
+            self.assertEqual(process.call_count, 2)
+            retry_call = process.call_args_list[1]
+            self.assertEqual(retry_call.args[1], "claude-review-retry")
+            self.assertEqual(retry_call.args[3], "claude-review-retry")
+            self.assertIn("JSON 객체 하나만 출력", retry_call.args[0][-1])
+            self.assertTrue(retry_call.args[0][-1].endswith("review prompt"))
+            self.assertEqual(record_metric.call_count, 2)
+            self.assertEqual(record_metric.call_args_list[1].args[1], "claude-review-retry")
+
+    def test_claude_call_retries_only_once_when_json_is_still_missing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.claude = "faux-claude"
+            with patch.object(
+                runner,
+                "process",
+                side_effect=[(0, "first prose response"), (0, "second prose response")],
+            ) as process, patch.object(runner, "record_metric") as record_metric, patch.object(
+                MODULE.importlib, "reload", side_effect=lambda module: module
+            ), patch.object(MODULE.HARNESS.ABSENCE_GUARD, "validate_provider_payload") as validate:
+                result = runner.claude_call("claude-review", "review prompt", expect_json=True)
+
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error"], "claude_json_result_missing")
+            self.assertEqual(process.call_count, 2)
+            self.assertEqual(record_metric.call_count, 2)
+            validate.assert_called_once_with("first prose response")
+
     def test_dispatch_reloads_absence_guard_before_validating(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
