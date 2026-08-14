@@ -263,6 +263,40 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             self.assertTrue(result.get("dispatchFailed"))
             self.assertEqual(result.get("dispatchFailureReason"), "absence_guard_reload_failed")
 
+    def test_run_full_stops_on_failed_tests_before_reviews(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            verification = {"test_summary": {"status": "failed"}}
+            with patch.object(runner, "dispatch") as dispatch, \
+                 patch.object(runner, "claude_call") as claude_call:
+                result = runner.run_full({}, verification)
+
+            self.assertEqual(result, {
+                "passed": False,
+                "tier": "full",
+                "error": "tests_failed",
+                "test_summary": {"status": "failed"},
+            })
+            dispatch.assert_not_called()
+            claude_call.assert_not_called()
+
+    def test_run_full_enters_independent_reviews_without_codex_self_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            verification = {"test_summary": {"status": "passed"}}
+            review = {"hasBlockingIssue": False, "issues": [], "checks": []}
+            with patch.object(runner, "dispatch", return_value=review) as dispatch, \
+                 patch.object(runner, "claude_call", return_value={"ok": True, **review}):
+                result = runner.run_full({}, verification)
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(dispatch.call_args.args[:2], ("agy", "antigravity-review-round-1"))
+
 
 if __name__ == "__main__":
     unittest.main()

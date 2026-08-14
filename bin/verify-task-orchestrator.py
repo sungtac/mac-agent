@@ -515,9 +515,6 @@ class HostOrchestrator:
     def plan_prompt(self, context: dict[str, Any], research: list[dict[str, Any]]) -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: architect\n\nAntigravity 조사와 하네스 패키지만 보고 Codex가 바로 실행할 구현 계획을 작성한다. 허용 파일, 의존성 순서, 통합 단계, 테스트 명령을 포함한다.\n[원 작업]\n{self.task}\n[하네스 패키지]\n{self.context_text(context)}\n[조사 요약]\n{json.dumps(research, ensure_ascii=False)}\n\nJSON으로만 답해: {{"needsClarification":false,"clarifyingQuestions":"","plan":"구현 순서, 파일 소유권, 통합 및 테스트"}}"""
 
-    def self_check_prompt(self, context: dict[str, Any], diff: dict[str, Any], tests: dict[str, Any]) -> str:
-        return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: test-engineer\n\n구현자의 자기점검이다. 독립 리뷰 슬롯으로 계산하지 않는다.\n[원 작업]\n{self.task}\n[허용 파일]\n{json.dumps(context.get('relevant_files', []), ensure_ascii=False)}\n[실제 diff]\n{diff.get('content', '')}\n[테스트]\n{json.dumps(tests, ensure_ascii=False)}\n\nJSON으로만 답해: {{"verdict":"pass|changes_required","blocking_issues":[]}}"""
-
     def run_light(self, context: dict[str, Any]) -> dict[str, Any]:
         feedback = ""
         for round_number in range(1, self.max_rounds + 1):
@@ -582,10 +579,8 @@ class HostOrchestrator:
                 return {"passed": False, "tier": "full", "error": "execution_failed"}
             verification = self.snapshot_tests()
         tests = verification.get("test_summary", {})
-        self_check = self.dispatch("codex", "codex-self-check", self.self_check_prompt(context, verification, tests), "review")
-        HARNESS.write_json(self.run_dir / "review-codex-self.json", self_check)
-        if self_check.get("dispatchFailed") or self_check.get("verdict") != "pass" or self_check.get("blocking_issues") or tests.get("status") != "passed":
-            return {"passed": False, "tier": "full", "error": "self_check_blocked", "test_summary": tests, "self_check": self_check}
+        if tests.get("status") != "passed":
+            return {"passed": False, "tier": "full", "error": "tests_failed", "test_summary": tests}
 
         for round_number in range(1, self.max_rounds + 1):
             claude_prompt = self.review_prompt(context, verification, tests, plan, "claude")
