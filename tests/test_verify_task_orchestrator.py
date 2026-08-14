@@ -157,6 +157,33 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 runner.dispatch("codex", "role", "prompt", "review")
             mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
 
+    def test_dispatch_scopes_research_absence_exemption(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            runner.agy = "faux-agy"
+            provider_output = '{"findings": "missing file"}'
+            with patch.object(runner, "process", return_value=(0, provider_output)), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=lambda module: module):
+                research = runner.dispatch("codex", "role", "prompt", "research")
+                review = runner.dispatch("codex", "role", "prompt", "review")
+                omitted = runner.dispatch(
+                    "agy",
+                    "role",
+                    "prompt",
+                    "research",
+                    {"relevant_files": ["missing.py"]},
+                )
+
+            self.assertEqual(research["discovery_evidence"][0]["source"], "research_role_exempt")
+            self.assertEqual(research["discovery_evidence"][0]["omitted_files"], [])
+            self.assertEqual(review["dispatchFailureReason"], "unsupported_absence_claim")
+            self.assertEqual(omitted["discovery_evidence"][0]["source"], "host_policy_omission")
+            self.assertEqual(omitted["discovery_evidence"][0]["omitted_files"], ["missing.py"])
+
     def test_execute_codex_survives_a_broken_reload_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

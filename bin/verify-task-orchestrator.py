@@ -369,10 +369,14 @@ class HostOrchestrator:
         self.record_metric(tool, role, prompt)
         if code != 0 or not isinstance(value, dict):
             return {"dispatchFailed": True, "dispatchFailureReason": f"{tool} dispatch failed: {output[-1000:]}"}
-        if headless_omitted:
+        if headless_omitted or schema_kind == "research":
             host_evidence = {
-                "source": "host_policy_omission",
-                "note": "orchestrator withheld these file contents under its own headless evidence budget/protection policy before this response was generated; any absence language about them reflects that host policy, not an unverified provider claim",
+                "source": "host_policy_omission" if headless_omitted else "research_role_exempt",
+                "note": (
+                    "orchestrator withheld these file contents under its own headless evidence budget/protection policy before this response was generated; any absence language about them reflects that host policy, not an unverified provider claim"
+                    if headless_omitted
+                    else "this is a read-only research/investigation role describing repository code and environment behavior, not a capability/credential/configuration absence claim the guard is meant to catch"
+                ),
                 "omitted_files": headless_omitted,
             }
             existing_evidence = value.get("discovery_evidence")
