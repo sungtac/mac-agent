@@ -17,6 +17,69 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyTaskOrchestratorTests(unittest.TestCase):
+    def test_ensure_git_worktree_initializes_non_git_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+
+            result = MODULE.ensure_git_worktree(repo)
+
+            self.assertEqual(result, {"initialized": True})
+            self.assertTrue((repo / ".git").is_dir())
+            self.assertTrue((repo / ".gitignore").is_file())
+            completed = subprocess.run(
+                ["git", "-C", str(repo), "log", "--oneline"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            self.assertTrue(completed.stdout.strip())
+
+    def test_ensure_git_worktree_noop_on_existing_git_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            gitignore = repo / ".gitignore"
+            original_contents = "keep-this-entry/\n"
+            gitignore.write_text(original_contents, encoding="utf-8")
+
+            result = MODULE.ensure_git_worktree(repo)
+
+            self.assertEqual(result, {"initialized": False})
+            self.assertEqual(gitignore.read_text(encoding="utf-8"), original_contents)
+
+    def test_ensure_git_worktree_returns_error_on_non_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            file_path = root / "plain-file"
+            file_path.write_text("not a directory\n", encoding="utf-8")
+
+            for path in (root / "missing", file_path):
+                with self.subTest(path=path):
+                    self.assertEqual(
+                        MODULE.ensure_git_worktree(path),
+                        {"initialized": False, "error": "not_a_directory"},
+                    )
+
+    def test_ensure_git_worktree_returns_error_when_git_init_fails(self):
+        failed_init = subprocess.CompletedProcess(
+            args=["git", "init"],
+            returncode=1,
+            stdout="",
+            stderr="fatal: simulated init failure\n",
+        )
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            MODULE.subprocess, "run", return_value=failed_init
+        ) as run:
+            result = MODULE.ensure_git_worktree(Path(directory))
+
+        self.assertEqual(result, {
+            "initialized": False,
+            "error": "git_init_failed",
+            "detail": "fatal: simulated init failure",
+        })
+        run.assert_called_once()
+
     def test_antigravity_prompt_contains_bounded_evidence_and_forbids_tools(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

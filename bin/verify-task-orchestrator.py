@@ -63,6 +63,67 @@ def resolve_binary(env_name: str, candidates: list[Path], command: str) -> str |
     return found
 
 
+def ensure_git_worktree(cwd: Path) -> dict[str, Any]:
+    if (cwd / ".git").exists():
+        return {"initialized": False}
+    if not cwd.is_dir():
+        return {"initialized": False, "error": "not_a_directory"}
+
+    try:
+        gitignore = cwd / ".gitignore"
+        if not gitignore.exists():
+            gitignore.write_text(
+                "*.log\n"
+                "*.jsonl\n"
+                "*.jsonl.lock\n"
+                "cache/\n"
+                "*cache*/\n"
+                "sessions/\n"
+                "session-*/\n"
+                "*token*\n"
+                "*credential*\n"
+                "*secret*\n"
+                "*.key\n"
+                "*.pem\n"
+                "backups/\n"
+                "downloads/\n"
+                "paste-cache/\n"
+                "shell-snapshots/\n"
+                "telemetry/\n"
+                ".verify/\n",
+                encoding="utf-8",
+            )
+        commands = [
+            ["git", "init"],
+            ["git", "add", "-A"],
+            [
+                "git",
+                "-c", "user.email=verify-task@local",
+                "-c", "user.name=verify-task-gate",
+                "commit", "-m", "chore: initialize git worktree for verify-task gate",
+            ],
+        ]
+        for command in commands:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=20,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return {
+                    "initialized": False,
+                    "error": "git_init_failed",
+                    "detail": completed.stderr.strip(),
+                }
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"initialized": False, "error": "git_init_failed", "detail": str(exc)}
+    return {"initialized": True}
+
+
 def shutil_which(command: str) -> str | None:
     for directory in os.environ.get("PATH", "").split(os.pathsep):
         if not directory:
@@ -639,8 +700,17 @@ class HostOrchestrator:
         return {"passed": False, "tier": "full", "error": "full_exhausted"}
 
     def run(self) -> dict[str, Any]:
-        if not self.cwd.is_dir() or not (self.cwd / ".git").exists():
+        if not self.cwd.is_dir():
             return {"passed": False, "error": "invalid_git_worktree", "cwd": str(self.cwd)}
+        if not (self.cwd / ".git").exists():
+            init_result = ensure_git_worktree(self.cwd)
+            if not init_result.get("initialized"):
+                return {
+                    "passed": False,
+                    "error": "invalid_git_worktree",
+                    "cwd": str(self.cwd),
+                    "git_init_error": init_result.get("error"),
+                }
         self.run_dir.mkdir(parents=True, exist_ok=True)
         preflight = self.preflight()
         self.preflight_result = preflight
@@ -732,7 +802,9 @@ def main() -> int:
     runner = HostOrchestrator(task, cwd, run_dir, args.max_rounds, args.full)
     runner.preflight_result = None
     if args.dry_run:
-        if not cwd.is_dir() or not (cwd / ".git").exists():
+        if not cwd.is_dir():
+            result = {"passed": False, "error": "invalid_git_worktree", "cwd": str(cwd), "run_dir": str(run_dir)}
+        elif not (cwd / ".git").exists() and not ensure_git_worktree(cwd).get("initialized"):
             result = {"passed": False, "error": "invalid_git_worktree", "cwd": str(cwd), "run_dir": str(run_dir)}
         else:
             context = runner.init()

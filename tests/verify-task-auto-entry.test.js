@@ -99,7 +99,6 @@ test('failed host orchestration keeps the gate closed, while subagent writes byp
       prompt: '버그를 수정해줘',
     }, env)
     const failedCwd = path.join(env.root, 'not-a-git-project')
-    fs.mkdirSync(failedCwd)
     const result = runHost(env, failedCwd, '버그 수정')
     assert.notEqual(result.status, 0)
     assert.equal(state(env).status, 'workflow_failed')
