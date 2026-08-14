@@ -351,8 +351,9 @@ class HostOrchestrator:
         schema_kind: str,
         context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        headless_omitted: list[str] = []
         if tool == "agy":
-            prompt = self.headless_evidence_prompt(prompt, context, include_files=schema_kind == "research")
+            prompt, headless_omitted = self.headless_evidence_prompt(prompt, context, include_files=schema_kind == "research")
         prompt_path = self.write_prompt(role, prompt)
         binary = self.codex if tool == "codex" else self.agy
         if not binary:
@@ -368,6 +369,17 @@ class HostOrchestrator:
         self.record_metric(tool, role, prompt)
         if code != 0 or not isinstance(value, dict):
             return {"dispatchFailed": True, "dispatchFailureReason": f"{tool} dispatch failed: {output[-1000:]}"}
+        if headless_omitted:
+            host_evidence = {
+                "source": "host_policy_omission",
+                "note": "orchestrator withheld these file contents under its own headless evidence budget/protection policy before this response was generated; any absence language about them reflects that host policy, not an unverified provider claim",
+                "omitted_files": headless_omitted,
+            }
+            existing_evidence = value.get("discovery_evidence")
+            if isinstance(existing_evidence, list):
+                existing_evidence.append(host_evidence)
+            else:
+                value["discovery_evidence"] = [host_evidence]
         try:
             importlib.reload(HARNESS.ABSENCE_GUARD)
         except Exception as exc:
@@ -414,7 +426,7 @@ class HostOrchestrator:
         prompt: str,
         context: dict[str, Any] | None = None,
         include_files: bool = True,
-    ) -> str:
+    ) -> tuple[str, list[str]]:
         """Turn an Antigravity call into a bounded, tool-free evidence review.
 
         `agy -p` cannot ask for command permission.  Supplying repository paths
@@ -431,7 +443,7 @@ class HostOrchestrator:
             prompt,
         ]
         if not context:
-            return "\n".join(sections)
+            return "\n".join(sections), []
 
         snippets: list[str] = []
         omitted: list[str] = []
@@ -463,7 +475,7 @@ class HostOrchestrator:
         rules_text = context.get("rules_text")
         if isinstance(rules_text, str) and rules_text:
             sections.extend(["", "[APPLICABLE RULE TEXT]", rules_text[:HEADLESS_RULE_CHARS]])
-        return "\n".join(sections)
+        return "\n".join(sections), omitted
 
     def implement_prompt(self, context: dict[str, Any], feedback: str = "") -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: implementer\n\n작업 디렉토리: {self.cwd}\n허용된 파일만 수정하고 저장소 전체를 탐색하지 마.\n\n[원 작업]\n{self.task}\n\n[하네스 패키지]\n{self.context_text(context)}\n\n[추가 수정 지시]\n{feedback or '(첫 구현)'}\n\n실제로 파일을 수정한 뒤 변경 파일과 실행한 테스트를 짧게 설명해."""

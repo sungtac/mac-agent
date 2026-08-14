@@ -24,7 +24,7 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             source = repo / "example.ts"
             source.write_text("export const value = 1;\n", encoding="utf-8")
             runner = MODULE.HostOrchestrator("example.ts 수정", repo, repo / ".verify", 1, False)
-            prompt = runner.headless_evidence_prompt(
+            prompt, _ = runner.headless_evidence_prompt(
                 "조사 결과를 JSON으로 반환하라.",
                 {"relevant_files": ["example.ts"], "rules_text": "- 테스트를 실행하지 마라."},
             )
@@ -39,7 +39,7 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             repo.mkdir()
             (repo / "example.ts").write_text("export const value = 1;\n", encoding="utf-8")
             runner = MODULE.HostOrchestrator("example.ts 수정", repo, repo / ".verify", 1, False)
-            prompt = runner.headless_evidence_prompt(
+            prompt, _ = runner.headless_evidence_prompt(
                 "diff를 검토하라.",
                 {"relevant_files": ["example.ts"]},
                 include_files=False,
