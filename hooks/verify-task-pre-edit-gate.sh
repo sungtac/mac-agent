@@ -49,6 +49,35 @@ if [ -n "$FILE_PATH" ] && [[ "$FILE_PATH" =~ $DOTFILE_FASTPATH_RE ]]; then
 fi
 # ---------------------------------------------------------------------------
 
+# --- Fast-path: Claude JSON settings, outside any git repo -----------------
+CLAUDE_SETTINGS_JSON_FASTPATH_RE='^'"${HOME}"'/\.claude/settings\.json$'
+CLAUDE_SETTINGS_LOCAL_JSON_FASTPATH_RE='^'"${HOME}"'/\.claude/settings\.local\.json$'
+if [ -n "$FILE_PATH" ] && { [[ "$FILE_PATH" =~ $CLAUDE_SETTINGS_JSON_FASTPATH_RE ]] || [[ "$FILE_PATH" =~ $CLAUDE_SETTINGS_LOCAL_JSON_FASTPATH_RE ]]; }; then
+  if ! git -C "$HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    BACKUP_DIR="$HOME/.claude/hooks-state/dotfile-fastpath-backups"
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    if [ -f "$FILE_PATH" ]; then
+      cp -p "$FILE_PATH" "$BACKUP_DIR/$(basename "$FILE_PATH").$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+    fi
+    exit 0
+  fi
+fi
+# ---------------------------------------------------------------------------
+
+# --- Fast-path: Claude project memory Markdown, outside any git repo -------
+CLAUDE_MEMORY_FASTPATH_RE='^'"${HOME}"'/\.claude/projects/-Users-edge-ai--claude/memory/[^/]+\.md$'
+if [ -n "$FILE_PATH" ] && [[ "$FILE_PATH" =~ $CLAUDE_MEMORY_FASTPATH_RE ]]; then
+  if ! git -C "$HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    BACKUP_DIR="$HOME/.claude/hooks-state/dotfile-fastpath-backups"
+    mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+    if [ -f "$FILE_PATH" ]; then
+      cp -p "$FILE_PATH" "$BACKUP_DIR/$(basename "$FILE_PATH").$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+    fi
+    exit 0
+  fi
+fi
+# ---------------------------------------------------------------------------
+
 if [ -z "$SESSION_ID" ] || [ -z "$CWD" ]; then
   jq -n ' {
     hookSpecificOutput: {

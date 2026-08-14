@@ -15,12 +15,119 @@
 # output as a failure, regardless of exit code. A background watchdog kills
 # the shell if sourcing hangs (e.g. an accidental infinite loop), since this
 # host has no `timeout`/`gtimeout` binary.
+# Also validates the same fast-path's Claude JSON settings and project memory
+# Markdown files, restoring the latest backup when validation fails.
 
 set -uo pipefail
 
 INPUT="$(cat)"
 FILE_PATH="$(printf '%s' "$INPUT" | jq -r '.tool_input.file_path // empty' 2>/dev/null)"
 [ -n "$FILE_PATH" ] || exit 0
+
+CLAUDE_SETTINGS_JSON_FASTPATH_RE='^'"${HOME}"'/\.claude/settings\.json$'
+CLAUDE_SETTINGS_LOCAL_JSON_FASTPATH_RE='^'"${HOME}"'/\.claude/settings\.local\.json$'
+CLAUDE_MEMORY_FASTPATH_RE='^'"${HOME}"'/\.claude/projects/-Users-edge-ai--claude/memory/[^/]+\.md$'
+
+report_fastpath_failure() {
+  local kind="$1"
+  local err="$2"
+  local backup_dir="$HOME/.claude/hooks-state/dotfile-fastpath-backups"
+  local basename latest_backup restore_msg
+
+  basename="$(basename "$FILE_PATH")"
+  latest_backup="$(ls -t "$backup_dir/${basename}".*.bak 2>/dev/null | head -1)"
+
+  if [ -n "$latest_backup" ]; then
+    if cp -p "$latest_backup" "$FILE_PATH" 2>/dev/null; then
+      restore_msg="오류가 있어 이전 백업($latest_backup)으로 자동 복구했습니다."
+    else
+      restore_msg="오류가 있어 백업 복구를 시도했지만 실패했습니다 — 파일을 직접 확인하세요."
+    fi
+  else
+    restore_msg="오류가 있는데 백업을 찾지 못해 자동 복구하지 못했습니다 — 파일을 직접 확인하세요."
+  fi
+
+  jq -n --arg kind "$kind" --arg file "$FILE_PATH" --arg err "$err" --arg restore "$restore_msg" '{
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: ("[" + $kind + " fast-path 검증 실패] " + $file + " 검증 오류: " + $err + " " + $restore)
+    }
+  }'
+}
+
+if [[ "$FILE_PATH" =~ $CLAUDE_SETTINGS_JSON_FASTPATH_RE ]] || [[ "$FILE_PATH" =~ $CLAUDE_SETTINGS_LOCAL_JSON_FASTPATH_RE ]]; then
+  if git -C "$HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    exit 0
+  fi
+  [ -f "$FILE_PATH" ] || exit 0
+
+  ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/json-fastpath-check.XXXXXX")"
+  trap 'rm -f "$ERR_FILE"' EXIT
+  if jq empty "$FILE_PATH" 2>"$ERR_FILE"; then
+    exit 0
+  fi
+
+  ERR="$(cat "$ERR_FILE" 2>/dev/null)"
+  [ -n "$ERR" ] || ERR="유효한 JSON 문서가 아닙니다."
+  report_fastpath_failure "JSON" "$ERR"
+  exit 0
+fi
+
+if [[ "$FILE_PATH" =~ $CLAUDE_MEMORY_FASTPATH_RE ]]; then
+  if git -C "$HOME" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    exit 0
+  fi
+  [ -f "$FILE_PATH" ] || exit 0
+
+  ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/memory-fastpath-check.XXXXXX")"
+  trap 'rm -f "$ERR_FILE"' EXIT
+  if [ "$(basename "$FILE_PATH")" = "MEMORY.md" ]; then
+    if [ -s "$FILE_PATH" ]; then
+      exit 0
+    fi
+    printf '%s\n' "MEMORY.md 파일이 비어 있습니다." >"$ERR_FILE"
+  elif awk '
+    NR == 1 {
+      if ($0 != "---") {
+        print "첫 줄이 ---가 아닙니다." > "/dev/stderr"
+        invalid = 1
+        exit 1
+      }
+      next
+    }
+    !closed && $0 == "---" {
+      closed = 1
+      next
+    }
+    !closed {
+      if ($0 ~ /^[[:space:]]*name[[:space:]]*:/) name_key = 1
+      if ($0 ~ /^[[:space:]]*description[[:space:]]*:/) description_key = 1
+      if ($0 ~ /^[[:space:]]*metadata[[:space:]]*:/) metadata_key = 1
+    }
+    END {
+      if (invalid) exit 1
+      if (!closed) {
+        print "frontmatter 종료 ---가 없습니다." > "/dev/stderr"
+        exit 1
+      }
+      if (!name_key || !description_key || !metadata_key) {
+        missing = ""
+        if (!name_key) missing = missing " name:"
+        if (!description_key) missing = missing " description:"
+        if (!metadata_key) missing = missing " metadata:"
+        print "frontmatter에 필수 키가 없습니다:" missing > "/dev/stderr"
+        exit 1
+      }
+    }
+  ' "$FILE_PATH" 2>"$ERR_FILE"; then
+    exit 0
+  fi
+
+  ERR="$(cat "$ERR_FILE" 2>/dev/null)"
+  [ -n "$ERR" ] || ERR="메모리 Markdown 구조가 올바르지 않습니다."
+  report_fastpath_failure "memory Markdown" "$ERR"
+  exit 0
+fi
 
 BASENAME="$(basename "$FILE_PATH")"
 case "$BASENAME" in
