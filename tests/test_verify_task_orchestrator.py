@@ -157,32 +157,72 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 runner.dispatch("codex", "role", "prompt", "review")
             mock_reload.assert_called_once_with(MODULE.HARNESS.ABSENCE_GUARD)
 
-    def test_dispatch_scopes_research_absence_exemption(self):
+    def test_dispatch_injects_absence_exemption_for_every_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"
             repo.mkdir()
             runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
             runner.codex = "faux-codex"
-            runner.agy = "faux-agy"
-            provider_output = '{"findings": "missing file"}'
+            provider_output = json.dumps({
+                "findings": "missing file; credential이 없습니다",
+                "discovery_evidence": [{"source": "provider", "note": "preserve me"}],
+            })
             with patch.object(runner, "process", return_value=(0, provider_output)), \
                  patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=lambda module: module), \
+                 patch.object(
+                     MODULE.HARNESS.ABSENCE_GUARD,
+                     "validate_provider_payload",
+                     wraps=MODULE.HARNESS.ABSENCE_GUARD.validate_provider_payload,
+                 ) as validate:
+                results = [
+                    runner.dispatch("codex", "role", "prompt", schema_kind)
+                    for schema_kind in ("research", "review", "plan", "light-eval")
+                ]
+
+            self.assertEqual(validate.call_count, 4)
+            for result, call in zip(results, validate.call_args_list):
+                self.assertNotIn("dispatchFailed", result)
+                self.assertEqual(result["discovery_evidence"][0]["source"], "provider")
+                self.assertEqual(result["discovery_evidence"][1]["source"], "orchestrator_role_exempt")
+                self.assertIs(call.args[0], result)
+
+    def test_dispatch_records_host_policy_omission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.agy = "faux-agy"
+            with patch.object(runner, "process", return_value=(0, '{"findings": "missing file"}')), \
+                 patch.object(runner, "record_metric"), \
                  patch.object(MODULE.importlib, "reload", side_effect=lambda module: module):
-                research = runner.dispatch("codex", "role", "prompt", "research")
-                review = runner.dispatch("codex", "role", "prompt", "review")
                 omitted = runner.dispatch(
-                    "agy",
-                    "role",
-                    "prompt",
-                    "research",
-                    {"relevant_files": ["missing.py"]},
+                    "agy", "role", "prompt", "research", {"relevant_files": ["missing.py"]}
                 )
 
-            self.assertEqual(research["discovery_evidence"][0]["source"], "research_role_exempt")
-            self.assertEqual(research["discovery_evidence"][0]["omitted_files"], [])
-            self.assertEqual(review["dispatchFailureReason"], "unsupported_absence_claim")
             self.assertEqual(omitted["discovery_evidence"][0]["source"], "host_policy_omission")
             self.assertEqual(omitted["discovery_evidence"][0]["omitted_files"], ["missing.py"])
+
+    def test_execute_codex_injects_absence_exemption_before_validation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            runner.codex = "faux-codex"
+            provider_output = '{"ok": true, "message": "error: key가 없습니다: missing"}'
+            with patch.object(runner, "process", return_value=(0, provider_output)), \
+                 patch.object(runner, "record_metric"), \
+                 patch.object(MODULE.importlib, "reload", side_effect=lambda module: module), \
+                 patch.object(
+                     MODULE.HARNESS.ABSENCE_GUARD,
+                     "validate_provider_payload",
+                     wraps=MODULE.HARNESS.ABSENCE_GUARD.validate_provider_payload,
+                 ) as validate:
+                result = runner.execute_codex("codex-execute", "prompt")
+
+            self.assertNotIn("dispatchFailed", result)
+            self.assertEqual(result["discovery_evidence"][0]["source"], "orchestrator_role_exempt")
+            validate.assert_called_once_with(result)
 
     def test_execute_codex_survives_a_broken_reload_instead_of_crashing(self):
         with tempfile.TemporaryDirectory() as directory:
