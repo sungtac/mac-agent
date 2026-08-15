@@ -100,6 +100,21 @@ def status_files(cwd: Path) -> list[str]:
         # must never trigger light→full promotion or enter the review diff.
         if normalized == ".verify" or normalized.startswith(".verify/runs/"):
             continue
+        # Live daemon state is runtime noise, not a task change. Exclude only
+        # the known paths so real changes still affect track and diff review.
+        if normalized == "hooks-state" or normalized.startswith("hooks-state/"):
+            continue
+        if normalized == "discord-bot/repo-locks" or normalized.startswith("discord-bot/repo-locks/"):
+            continue
+        if re.match(r"^jobs/[^/]+/tmp/", normalized):
+            continue
+        if normalized in {
+            "chrome/chrome-native-host",
+            "plugins/.last_inuse_sweep",
+            "last-update-result.json",
+            ".last-update-result.json",
+        }:
+            continue
         result.append(normalized)
     return sorted(set(result))
 

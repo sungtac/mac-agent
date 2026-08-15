@@ -16,6 +16,50 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyTaskHarnessTests(unittest.TestCase):
+    def test_status_files_excludes_known_runtime_noise_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            paths = [
+                "hooks-state/foo.json",
+                "discord-bot/repo-locks/abc.lock",
+                "jobs/xyz/tmp/file",
+                "chrome/chrome-native-host",
+                "plugins/.last_inuse_sweep",
+                "last-update-result.json",
+                ".last-update-result.json",
+            ]
+            for path in paths:
+                target = repo / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "add", *paths], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            for path in paths:
+                (repo / path).write_text("changed\n", encoding="utf-8")
+
+            self.assertEqual(MODULE.status_files(repo), [])
+
+    def test_status_files_still_reports_real_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            path = "skills/pptx/SKILL.md"
+            target = repo / path
+            target.parent.mkdir(parents=True)
+            target.write_text("initial\n", encoding="utf-8")
+            subprocess.run(["git", "add", path], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            target.write_text("changed\n", encoding="utf-8")
+
+            self.assertEqual(MODULE.status_files(repo), [path])
+
     def test_light_policy_is_deterministic_and_allows_code_paths(self):
         policy = MODULE.classify("작은 버그 수정", ["src/example.ts"])
         self.assertEqual(policy["track"], "light")
