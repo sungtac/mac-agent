@@ -7,8 +7,10 @@
 fail-closed 정책을 사용한다.
 
 공통 정책의 정본은 `bin/edge_agent_governance.py`이며, 메시지 전달은
-`bin/edge_agent_message_bus.py`, 소비·재시도는
-`bin/edge_agent_message_dispatcher.py`가 집행한다.
+`bin/edge_agent_message_bus.py`가 집행한다. 실제 메시지 소비는
+`bin/edge_agent_deliberation.py`가 배리어 드레인(claim 후 즉시 ack) 방식으로 직접
+처리한다. `bin/edge_agent_message_dispatcher.py`는 handler 콜백 기반 소비·재시도용
+범용 소비자이지만, 아직 실제 소비 경로에는 연결되지 않은 준비된 유틸리티다.
 
 ## 20개 문제와 집행책
 
