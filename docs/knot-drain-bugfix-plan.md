@@ -72,14 +72,19 @@ new_vault() {
 }
 
 # 1) 최초 획득은 성공한다
+# 주의: drain_lock_acquire는 성공 시 자신을 호출한 셸에 EXIT trap을 걸어 lock을
+# 자동 해제한다. 아래처럼 서브셸 안에서 호출하면 서브셸이 끝나는 순간 trap이 발동해
+# lock이 즉시 사라지므로, "lock이 실제로 만들어졌는지"는 서브셸이 끝나기 전에(같은
+# 서브셸 안에서) 확인해야 한다. 서브셸 밖에서 디렉터리 존재를 검사하면 항상 FAIL한다.
 VAULT1="$(new_vault)"
 (
   source "$LIB"
   drain_lock_acquire "$VAULT1"
   echo $? > "$VAULT1/.acquire_rc"
+  [ -d "$VAULT1/.knot/drain.lock" ] && echo 1 > "$VAULT1/.lockdir_exists" || echo 0 > "$VAULT1/.lockdir_exists"
 )
 assert_eq "최초 lock 획득 성공" "0" "$(cat "$VAULT1/.acquire_rc")"
-assert_eq "lock 디렉터리 생성됨" "1" "$([ -d "$VAULT1/.knot/drain.lock" ] && echo 1 || echo 0)"
+assert_eq "lock 디렉터리 생성됨" "1" "$(cat "$VAULT1/.lockdir_exists")"
 
 # 2) 살아있는 프로세스가 쥔 lock은 두번째 획득이 실패한다(동시 실행 중인 자기 자신의 PID를 기록해 시뮬레이션)
 VAULT2="$(new_vault)"
