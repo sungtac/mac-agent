@@ -345,6 +345,11 @@ echo "a" > "$VAULT/inbox/a-older-by-name-but-newer-mtime.md"
 # 즉 "이름순"과 "mtime순"이 서로 다른 결과를 내도록 의도적으로 구성.
 touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || date -d '-1 hour' +%Y%m%d%H%M)" "$VAULT/inbox/b-newer.md" 2>/dev/null
 
+# inbox 파일을 커밋해야 drain.sh의 "트리 더티" 시작 가드를 통과한다(실전에서는 knot의
+# save 동작이 저장 직후 커밋까지 마쳐서 트리를 clean 상태로 넘긴다 — 여기선 그 전제를 재현).
+git -C "$VAULT" add -A
+git -C "$VAULT" commit -q -m "add inbox fixtures"
+
 # 러너를 스텁으로 대체: 넘겨받은 프롬프트를 파일에 그대로 적어서 검사
 STUB_LOG="$VAULT/.stub-prompt.txt"
 cat > "$VAULT/.stub-runner" <<STUB
@@ -434,6 +439,8 @@ git commit -m "fix(drain): mtime 기준 파일 선택 + 대상 파일 명시적 
 # 러너가 실패(exit 1)하면서도 커밋을 만들어버린 상황 — HEAD_BEFORE로 복원되어야 함
 VAULT2="$(new_vault)"
 echo "content" > "$VAULT2/inbox/only.md"
+git -C "$VAULT2" add -A
+git -C "$VAULT2" commit -q -m "add inbox fixtures"
 
 cat > "$VAULT2/.stub-runner" <<'STUB'
 #!/bin/bash
@@ -464,6 +471,8 @@ import sys
 print("ERROR: 의도된 테스트 오류")
 sys.exit(1)
 PYEOF
+git -C "$VAULT3" add -A
+git -C "$VAULT3" commit -q -m "add inbox fixtures + failing lint"
 
 cat > "$VAULT3/.stub-runner" <<'STUB'
 #!/bin/bash
@@ -497,6 +506,8 @@ import sys
 print("ERROR: 의도된 테스트 오류")
 sys.exit(1)
 INNERLINT
+git -C "$VAULT3B" add -A
+git -C "$VAULT3B" commit -q -m "add inbox fixtures + failing lint"
 
 cat > "$VAULT3B/.stub-runner" <<'INNERSTUB'
 #!/bin/bash
@@ -634,6 +645,8 @@ git commit -m "fix(drain): 러너 exit code 존중, HEAD_BEFORE 롤백, lint 실
 # → 기존 판정(exit code+inbox 감소)은 성공으로 오인하지만, SHA-256 기반 판정은 실패로 잡아야 함
 VAULT4="$(new_vault)"
 echo "original content" > "$VAULT4/inbox/tampered.md"
+git -C "$VAULT4" add -A
+git -C "$VAULT4" commit -q -m "add inbox fixtures"
 
 cat > "$VAULT4/.stub-runner" <<'STUB'
 #!/bin/bash
