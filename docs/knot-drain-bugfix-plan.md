@@ -350,24 +350,27 @@ touch -t "$(date -v-1H +%Y%m%d%H%M 2>/dev/null || date -d '-1 hour' +%Y%m%d%H%M)
 git -C "$VAULT" add -A
 git -C "$VAULT" commit -q -m "add inbox fixtures"
 
-# 러너를 스텁으로 대체: 넘겨받은 프롬프트를 파일에 그대로 적어서 검사
-STUB_LOG="$VAULT/.stub-prompt.txt"
-cat > "$VAULT/.stub-runner" <<STUB
+# 러너를 스텁으로 대체: 넘겨받은 프롬프트를 파일에 그대로 적어서 검사.
+# 스텁 스크립트/로그는 vault **밖**(별도 tmp 디렉터리)에 둔다 — vault 안에 두면
+# 그 자체가 커밋 안 된 untracked 파일이 되어 drain.sh의 "트리 더티" 시작 가드에 걸린다.
+STUBDIR="$(mktemp -d)"
+STUB_LOG="$STUBDIR/stub-prompt.txt"
+cat > "$STUBDIR/stub-runner" <<STUB
 #!/bin/bash
 for a in "\$@"; do
   if [ "\$a" != "-p" ]; then echo "\$a" >> "$STUB_LOG"; fi
 done
 exit 0
 STUB
-chmod +x "$VAULT/.stub-runner"
+chmod +x "$STUBDIR/stub-runner"
 
-KNOT_VAULT="$VAULT" KNOT_RUNNER="$VAULT/.stub-runner" KNOT_MAX_ITER=1 \
+KNOT_VAULT="$VAULT" KNOT_RUNNER="$STUBDIR/stub-runner" KNOT_MAX_ITER=1 \
   bash "$VAULT/scripts/drain.sh" >/dev/null 2>&1
 
 assert_eq "mtime이 더 오래된 b-newer.md가 대상으로 선택됨" "1" \
   "$(grep -c "대상 파일: inbox/b-newer.md" "$STUB_LOG" 2>/dev/null || echo 0)"
 
-rm -rf "$VAULT"
+rm -rf "$VAULT" "$STUBDIR"
 exit $FAIL
 ```
 
@@ -442,7 +445,8 @@ echo "content" > "$VAULT2/inbox/only.md"
 git -C "$VAULT2" add -A
 git -C "$VAULT2" commit -q -m "add inbox fixtures"
 
-cat > "$VAULT2/.stub-runner" <<'STUB'
+STUBDIR2="$(mktemp -d)"
+cat > "$STUBDIR2/stub-runner" <<'STUB'
 #!/bin/bash
 cd "$KNOT_VAULT" || exit 1
 mv inbox/only.md raw/only.md
@@ -450,10 +454,10 @@ git add -A
 git commit -q -m "ingest: only (broken)"
 exit 1
 STUB
-chmod +x "$VAULT2/.stub-runner"
+chmod +x "$STUBDIR2/stub-runner"
 
 BEFORE_HEAD="$(git -C "$VAULT2" rev-parse HEAD)"
-KNOT_VAULT="$VAULT2" KNOT_RUNNER="$VAULT2/.stub-runner" KNOT_MAX_ITER=1 \
+KNOT_VAULT="$VAULT2" KNOT_RUNNER="$STUBDIR2/stub-runner" KNOT_MAX_ITER=1 \
   bash "$VAULT2/scripts/drain.sh" >/dev/null 2>&1
 AFTER_HEAD="$(git -C "$VAULT2" rev-parse HEAD)"
 
@@ -461,7 +465,7 @@ assert_eq "러너 실패 시 HEAD가 원복됨" "$BEFORE_HEAD" "$AFTER_HEAD"
 assert_eq "러너 실패 시 inbox 파일이 되돌아옴" "1" \
   "$(ls "$VAULT2/inbox" 2>/dev/null | wc -l | tr -d ' ')"
 
-rm -rf "$VAULT2"
+rm -rf "$VAULT2" "$STUBDIR2"
 
 # lint ERROR가 나면 drain 전체가 실패 처리되고 HEAD가 원복되어야 함
 VAULT3="$(new_vault)"
@@ -474,7 +478,8 @@ PYEOF
 git -C "$VAULT3" add -A
 git -C "$VAULT3" commit -q -m "add inbox fixtures + failing lint"
 
-cat > "$VAULT3/.stub-runner" <<'STUB'
+STUBDIR3="$(mktemp -d)"
+cat > "$STUBDIR3/stub-runner" <<'STUB'
 #!/bin/bash
 cd "$KNOT_VAULT" || exit 1
 mv inbox/bad.md raw/bad.md
@@ -482,10 +487,10 @@ git add -A
 git commit -q -m "ingest: bad"
 exit 0
 STUB
-chmod +x "$VAULT3/.stub-runner"
+chmod +x "$STUBDIR3/stub-runner"
 
 BEFORE_HEAD3="$(git -C "$VAULT3" rev-parse HEAD)"
-KNOT_VAULT="$VAULT3" KNOT_RUNNER="$VAULT3/.stub-runner" KNOT_MAX_ITER=1 \
+KNOT_VAULT="$VAULT3" KNOT_RUNNER="$STUBDIR3/stub-runner" KNOT_MAX_ITER=1 \
   bash "$VAULT3/scripts/drain.sh" >/dev/null 2>&1
 RC3=$?
 AFTER_HEAD3="$(git -C "$VAULT3" rev-parse HEAD)"
@@ -493,7 +498,7 @@ AFTER_HEAD3="$(git -C "$VAULT3" rev-parse HEAD)"
 assert_eq "lint ERROR면 drain이 실패 exit code" "1" "$RC3"
 assert_eq "lint ERROR면 HEAD가 원복됨" "$BEFORE_HEAD3" "$AFTER_HEAD3"
 
-rm -rf "$VAULT3"
+rm -rf "$VAULT3" "$STUBDIR3"
 
 # 배치에 파일이 2개 있고 둘 다 성공적으로 처리됐지만, 그 다음 lint가 실패하는 상황
 # → 마지막 항목뿐 아니라 이번 배치에서 만든 커밋 2개가 전부 되돌아가야 한다
@@ -509,7 +514,8 @@ INNERLINT
 git -C "$VAULT3B" add -A
 git -C "$VAULT3B" commit -q -m "add inbox fixtures + failing lint"
 
-cat > "$VAULT3B/.stub-runner" <<'INNERSTUB'
+STUBDIR3B="$(mktemp -d)"
+cat > "$STUBDIR3B/stub-runner" <<'INNERSTUB'
 #!/bin/bash
 cd "$KNOT_VAULT" || exit 1
 NEXT_ARG=""
@@ -523,10 +529,10 @@ git add -A
 git commit -q -m "ingest: $NEXT_ARG"
 exit 0
 INNERSTUB
-chmod +x "$VAULT3B/.stub-runner"
+chmod +x "$STUBDIR3B/stub-runner"
 
 BEFORE_HEAD3B="$(git -C "$VAULT3B" rev-parse HEAD)"
-KNOT_VAULT="$VAULT3B" KNOT_RUNNER="$VAULT3B/.stub-runner" KNOT_MAX_ITER=5 \
+KNOT_VAULT="$VAULT3B" KNOT_RUNNER="$STUBDIR3B/stub-runner" KNOT_MAX_ITER=5 \
   bash "$VAULT3B/scripts/drain.sh" >/dev/null 2>&1
 AFTER_HEAD3B="$(git -C "$VAULT3B" rev-parse HEAD)"
 
@@ -534,7 +540,7 @@ assert_eq "2건 성공 후 lint 실패 시 HEAD가 배치 시작 시점으로 �
 assert_eq "2건 성공 후 lint 실패 시 두 inbox 파일 모두 되돌아옴" "2" \
   "$(ls "$VAULT3B/inbox" 2>/dev/null | wc -l | tr -d ' ')"
 
-rm -rf "$VAULT3B"
+rm -rf "$VAULT3B" "$STUBDIR3B"
 ```
 
 - [ ] **Step 2: 테스트 실행해서 실패 확인**
@@ -648,7 +654,8 @@ echo "original content" > "$VAULT4/inbox/tampered.md"
 git -C "$VAULT4" add -A
 git -C "$VAULT4" commit -q -m "add inbox fixtures"
 
-cat > "$VAULT4/.stub-runner" <<'STUB'
+STUBDIR4="$(mktemp -d)"
+cat > "$STUBDIR4/stub-runner" <<'STUB'
 #!/bin/bash
 cd "$KNOT_VAULT" || exit 1
 echo "tampered content" > raw/tampered.md   # 원본과 다른 내용으로 raw에 씀(정책 위반 시뮬레이션)
@@ -657,10 +664,10 @@ git add -A
 git commit -q -m "ingest: tampered"
 exit 0
 STUB
-chmod +x "$VAULT4/.stub-runner"
+chmod +x "$STUBDIR4/stub-runner"
 
 BEFORE_HEAD4="$(git -C "$VAULT4" rev-parse HEAD)"
-KNOT_VAULT="$VAULT4" KNOT_RUNNER="$VAULT4/.stub-runner" KNOT_MAX_ITER=1 \
+KNOT_VAULT="$VAULT4" KNOT_RUNNER="$STUBDIR4/stub-runner" KNOT_MAX_ITER=1 \
   bash "$VAULT4/scripts/drain.sh" >/dev/null 2>&1
 RC4=$?
 AFTER_HEAD4="$(git -C "$VAULT4" rev-parse HEAD)"
@@ -668,7 +675,7 @@ AFTER_HEAD4="$(git -C "$VAULT4" rev-parse HEAD)"
 assert_eq "내용이 변조된 raw 이동은 실패로 판정됨" "$BEFORE_HEAD4" "$AFTER_HEAD4"
 assert_eq "drain 전체도 실패 exit code" "1" "$RC4"
 
-rm -rf "$VAULT4"
+rm -rf "$VAULT4" "$STUBDIR4"
 ```
 
 - [ ] **Step 2: 테스트 실행해서 실패 확인**
