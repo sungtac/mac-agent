@@ -394,6 +394,22 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
             dispatch.assert_not_called()
             claude_call.assert_not_called()
 
+    def test_run_full_treats_not_run_tests_as_non_blocking(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            verification = {"test_summary": {"status": "not_run"}}
+            review = {"hasBlockingIssue": False, "issues": [], "checks": []}
+            with patch.object(runner, "dispatch", return_value=review) as dispatch, \
+                 patch.object(runner, "claude_call", return_value={"ok": True, **review}) as claude_call:
+                result = runner.run_full({}, verification)
+
+            self.assertTrue(result["passed"])
+            self.assertEqual(dispatch.call_count, 1)
+            self.assertEqual(dispatch.call_args.args[:2], ("agy", "antigravity-review-round-1"))
+            claude_call.assert_called_once()
+
     def test_run_full_enters_independent_reviews_without_codex_self_check(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory) / "repo"

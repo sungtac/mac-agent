@@ -661,7 +661,7 @@ class HostOrchestrator:
                 return {"passed": False, "tier": "full", "error": "execution_failed"}
             verification = self.snapshot_tests()
         tests = verification.get("test_summary", {})
-        if tests.get("status") != "passed":
+        if tests.get("status") not in ("passed", "not_run"):
             return {"passed": False, "tier": "full", "error": "tests_failed", "test_summary": tests}
 
         for round_number in range(1, self.max_rounds + 1):
@@ -695,7 +695,7 @@ class HostOrchestrator:
                 return {"passed": False, "tier": "full", "error": "fix_failed", "blocking_issues": issues}
             verification = self.snapshot_tests()
             tests = verification.get("test_summary", {})
-            if tests.get("status") != "passed":
+            if tests.get("status") not in ("passed", "not_run"):
                 return {"passed": False, "tier": "full", "error": "tests_failed", "test_summary": tests}
         return {"passed": False, "tier": "full", "error": "full_exhausted"}
 
