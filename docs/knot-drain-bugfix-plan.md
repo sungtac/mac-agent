@@ -329,6 +329,10 @@ new_vault() {
   mkdir -p "$d/inbox" "$d/raw" "$d/wiki" "$d/scripts/lib"
   echo "# index" > "$d/index.md"
   echo "# log" > "$d/log.md"
+  # 실제 knot-vault처럼 .knot/을 무시해야 한다 — drain.sh가 lock/STATE로 그 아래에
+  # 만드는 파일들이 untracked로 잡히면 루프의 "트리 더티" 시작 가드가 매 iteration마다
+  # 바로 트리거되어 run_ingest가 한 번도 호출되지 못한 채 조용히 종료된다.
+  printf '.knot/\n' > "$d/.gitignore"
   cp "$SELF_DIR/../lib/drain-lock.sh" "$d/scripts/lib/drain-lock.sh"
   cp "$SELF_DIR/../drain.sh" "$d/scripts/drain.sh"
   git -C "$d" add -A
