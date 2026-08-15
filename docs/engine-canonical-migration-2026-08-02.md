@@ -2,6 +2,8 @@
 
 작성일: 2026-08-02
 
+마이그레이션 완료에 따라 퇴역 도구는 `bin/archive/edge_agent_engine_retirement.py`로 이동했다.
+
 ## 결정
 
 최신 구현인 `/Users/edge_ai/tools/multi-agent-starter/engine-repo`를 Codex
@@ -95,7 +97,7 @@ delivery status는 `succeeded`, verification consensus는 `true`였다. 이 결�
 read-only 판정 명령:
 
 ```bash
-python3 bin/edge_agent_engine_retirement.py --json
+python3 bin/archive/edge_agent_engine_retirement.py --json
 ```
 
 현재 gate는 rollback 대상 보존과 shared adapter 소유권을 확인했고, 다음 조치를
