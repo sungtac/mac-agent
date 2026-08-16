@@ -43,7 +43,7 @@ class PeerCoordinationTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 state = Path(directory) / "health.json"
                 state.write_text(
-                    '{"incidents":{"inc-1":{"incident_id":"inc-1","role":"codex","code":"no_response","status":"open","task_id":"task-1","last_seen_at":2},"inc-2":{"incident_id":"inc-2","role":"claude","code":"execution_error","status":"resolved","last_seen_at":1}}}',
+                    '{"incidents":{"inc-1":{"incident_id":"inc-1","role":"codex","code":"no_response","status":"open","task_id":"task-1","last_seen_at":2,"escalation_stage":"awaiting_ack"},"inc-2":{"incident_id":"inc-2","role":"claude","code":"execution_error","status":"resolved","last_seen_at":1}}}',
                     encoding="utf-8",
                 )
                 rendered = roda._render_unresolved_incidents(state)
