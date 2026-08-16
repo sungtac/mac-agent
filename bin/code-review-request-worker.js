@@ -305,6 +305,49 @@ function buildReport(request, target, codex, antigravity, delta = {}) {
   return report
 }
 
+function formatDeltaSummaryComment(report, previous) {
+  const statusBadge = report.status === 'AI_APPROVED' ? '✅ AI_APPROVED' : '❌ CHANGES_REQUIRED'
+  const titleFor = (finding) => finding.title || finding.description || finding.id || '제목 없는 이슈'
+  const formatList = (title, findings) => {
+    const items = findings.map((finding) => `- ${titleFor(finding)}`).join('\n') || '- 없음'
+    if (findings.length <= 5) return `### ${title}\n${items}`
+    return `### ${title}\n<details><summary>${title} (${findings.length}개)</summary>\n\n${items}\n\n</details>`
+  }
+
+  const lines = [
+    '<!-- mac-agent-code-review-summary -->',
+    `## Round ${report.round} 리뷰 요약`,
+    `판정: ${statusBadge}`,
+  ]
+
+  if (!previous) {
+    lines.push('', `이번 라운드 findings: ${(report.findings || []).length}개`, formatList('이번 라운드 이슈', report.findings || []))
+    return lines.join('\n')
+  }
+
+  const previousFindings = previous.findings || []
+  const currentFindings = report.findings || []
+  const currentIds = new Set(currentFindings.map((finding) => finding.id))
+  const previousIds = new Set(previousFindings.map((finding) => finding.id))
+  const fixed = previousFindings.filter((finding) => !currentIds.has(finding.id))
+  const open = previousFindings.filter((finding) => currentIds.has(finding.id))
+  const added = currentFindings.filter((finding) => !previousIds.has(finding.id))
+
+  lines.push(
+    '',
+    `✅ Fixed: ${fixed.length}개`,
+    `⚠️ Remaining Open: ${open.length}개`,
+    `🆕 New: ${added.length}개`,
+    '',
+    formatList('해결된 이슈', fixed),
+    '',
+    formatList('새로 생긴 이슈', added),
+    '',
+    formatList('여전히 open인 이슈', open),
+  )
+  return lines.join('\n')
+}
+
 async function runWorkerOnce(options = {}) {
   const queueRoot = options.queueRoot || DEFAULT_QUEUE_ROOT
   const stateRoot = options.stateRoot || DEFAULT_STATE_ROOT
@@ -346,6 +389,21 @@ async function runWorkerOnce(options = {}) {
     const antigravity = parseProviderResult(antigravityRaw, 'antigravity')
     const report = buildReport(request, target, codex, antigravity, { round: previous ? (previous.round || 1) + 1 : 1, parent_report_key: previous ? `${previous.review_id}::${previous.target.head_sha}` : null })
     const persisted = recordReviewReport(report, stateRoot)
+    if (request.target.pull_request && request.target.repository) {
+      let commentDirectory
+      try {
+        commentDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'code-review-comment-'))
+        const commentFile = path.join(commentDirectory, 'comment.md')
+        fs.writeFileSync(commentFile, formatDeltaSummaryComment(report, previous), { encoding: 'utf8', mode: 0o600 })
+        execFileSync('gh', ['pr', 'comment', String(request.target.pull_request), '--repo', request.target.repository, '--body-file', commentFile, '--edit-last', '--create-if-none'], { stdio: 'ignore' })
+      } catch (error) {
+        console.warn('failed to publish code review summary comment:', error.message)
+      } finally {
+        if (commentDirectory) {
+          try { fs.rmSync(commentDirectory, { recursive: true, force: true }) } catch {}
+        }
+      }
+    }
     completeReviewRequest(request.review_id, {
       status: report.status,
       report_id: report.review_id,
@@ -404,6 +462,7 @@ if (require.main === module) main().then((code) => { process.exitCode = code })
 module.exports = {
   CodeReviewWorkerError,
   buildReport,
+  formatDeltaSummaryComment,
   createPrompt,
   buildReviewEvidence,
   main,

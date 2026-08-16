@@ -6,7 +6,7 @@ const path = require('node:path')
 const { execFileSync } = require('node:child_process')
 const { recordReviewRequest, findReviewRequest, SCHEMA_VERSION: REQUEST_SCHEMA } = require('../workflows/lib/code-review-request-queue.js')
 const { findLatestReview } = require('../workflows/lib/code-review-store.js')
-const { runWorkerOnce } = require('../bin/code-review-request-worker.js')
+const { formatDeltaSummaryComment, runWorkerOnce } = require('../bin/code-review-request-worker.js')
 const { buildReviewEvidence, createPrompt } = require('../bin/code-review-request-worker.js')
 const workerSource = fs.readFileSync(path.join(__dirname, '..', 'bin', 'code-review-request-worker.js'), 'utf8')
 
@@ -53,6 +53,41 @@ function fakeDispatch(tool, promptFile) {
     notes: 'fake evidence',
   }
 }
+
+function finding(id, title) {
+  return { id, title }
+}
+
+test('round one summary has no delta counters', () => {
+  const comment = formatDeltaSummaryComment({ round: 1, status: 'AI_APPROVED', findings: [finding('a', '첫 이슈')] }, null)
+  assert.match(comment, /^<!-- mac-agent-code-review-summary -->\n## Round 1 리뷰 요약/)
+  assert.doesNotMatch(comment, /Fixed:|Remaining Open:|New:/)
+  assert.match(comment, /첫 이슈/)
+})
+
+test('summary classifies a missing previous finding as fixed', () => {
+  const comment = formatDeltaSummaryComment({ round: 2, status: 'CHANGES_REQUIRED', findings: [] }, { findings: [finding('a', '해결된 이슈')] })
+  assert.match(comment, /✅ Fixed: 1개/)
+  assert.match(comment, /해결된 이슈/)
+})
+
+test('summary classifies a new finding by id', () => {
+  const comment = formatDeltaSummaryComment({ round: 2, status: 'CHANGES_REQUIRED', findings: [finding('b', '새 이슈')] }, { findings: [finding('a', '이전 이슈')] })
+  assert.match(comment, /🆕 New: 1개/)
+  assert.match(comment, /새 이슈/)
+})
+
+test('summary classifies a finding present in both rounds as open', () => {
+  const comment = formatDeltaSummaryComment({ round: 2, status: 'CHANGES_REQUIRED', findings: [finding('a', '남은 이슈')] }, { findings: [finding('a', '남은 이슈')] })
+  assert.match(comment, /⚠️ Remaining Open: 1개/)
+  assert.match(comment, /남은 이슈/)
+})
+
+test('summary folds lists longer than five findings', () => {
+  const findings = Array.from({ length: 6 }, (_, index) => finding(`f-${index}`, `이슈 ${index}`))
+  const comment = formatDeltaSummaryComment({ round: 2, status: 'CHANGES_REQUIRED', findings: [] }, { findings })
+  assert.match(comment, /<details><summary>해결된 이슈 \(6개\)<\/summary>/)
+})
 
 test('dry-run verifies the exact clean SHA without invoking providers', async () => {
   const request = queueRequest()
