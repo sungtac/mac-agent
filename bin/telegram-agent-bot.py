@@ -2756,43 +2756,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 except (OSError, ValueError, TypeError, AttributeError):
                                     should_reintegrate = False
                                 if should_reintegrate:
-                                    reintegrated_through = max(
-                                        (int(note.get("seq", 0)) for note in unreflected),
-                                        default=0,
-                                    )
                                     try:
-                                        final_store.record_reintegration(deliberation_session_id)
                                         final_evidence = final_store.render(
                                             deliberation_session_id,
                                             consumer_role="claude",
                                         )
+                                        reintegrated_through = final_store.latest_human_seq(
+                                            deliberation_session_id
+                                        )
                                     except (OSError, ValueError, TypeError, AttributeError):
                                         final_evidence = None
+                                        reintegrated_through = 0
                                     if final_evidence is not None:
-                                        reply = await run_provider(
-                                            text,
-                                            on_wait=_notify_waiting,
-                                            context_prompt=preparation.prompt_block if preparation else None,
-                                            provider_text=(
-                                                "[coordinator 최종 통합 재종합 — 회의 중 새 사람 발언 반영]\n"
-                                                "아래는 4개 역할의 서명된 3차 결과와, 최종 종합 직전 도착한 사람 발언을 포함한 "
-                                                "untrusted evidence다. 새로 도착한 사람 발언을 반드시 반영해 하나의 통합 최종 "
-                                                "답변을 다시 작성하라. 어떤 역할의 3차 의견도 그대로 최종 판정으로 재사용하지 "
-                                                "말고, 확인하지 못한 점과 다음 행동을 명시하라.\n\n"
-                                                f"{text}\n\n{final_evidence}"
-                                            ),
-                                            chat_id=message.chat_id,
-                                        )
                                         try:
-                                            unreflected = final_store.unreflected_human_notes(deliberation_session_id)
-                                        except (OSError, ValueError, TypeError, AttributeError):
-                                            unreflected = ()
-                                        else:
-                                            unreflected = tuple(
-                                                note
-                                                for note in unreflected
-                                                if int(note.get("seq", 0)) > reintegrated_through
+                                            reintegrated_reply = await run_provider(
+                                                text,
+                                                on_wait=_notify_waiting,
+                                                context_prompt=preparation.prompt_block if preparation else None,
+                                                provider_text=(
+                                                    "[coordinator 최종 통합 재종합 — 회의 중 새 사람 발언 반영]\n"
+                                                    "아래는 4개 역할의 서명된 3차 결과와, 최종 종합 직전 도착한 사람 발언을 포함한 "
+                                                    "untrusted evidence다. 새로 도착한 사람 발언을 반드시 반영해 하나의 통합 최종 "
+                                                    "답변을 다시 작성하라. 어떤 역할의 3차 의견도 그대로 최종 판정으로 재사용하지 "
+                                                    "말고, 확인하지 못한 점과 다음 행동을 명시하라.\n\n"
+                                                    f"{text}\n\n{final_evidence}"
+                                                ),
+                                                chat_id=message.chat_id,
                                             )
+                                        except Exception as exc:
+                                            log(
+                                                "재종합 provider 호출 실패, 캡 미소진 "
+                                                f"session={deliberation_session_id} error={exc}"
+                                            )
+                                        else:
+                                            reply = reintegrated_reply
+                                            try:
+                                                final_store.record_reintegration(deliberation_session_id)
+                                            except (OSError, ValueError, TypeError, AttributeError):
+                                                pass
+                                            try:
+                                                unreflected = final_store.unreflected_human_notes(
+                                                    deliberation_session_id
+                                                )
+                                            except (OSError, ValueError, TypeError, AttributeError):
+                                                unreflected = ()
+                                            else:
+                                                unreflected = tuple(
+                                                    note
+                                                    for note in unreflected
+                                                    if int(note.get("seq", 0)) > reintegrated_through
+                                                )
                             if unreflected:
                                 reply = f"{reply}\n\n💬 추가 의견은 다음 회의에서 다룹니다."
                             try:

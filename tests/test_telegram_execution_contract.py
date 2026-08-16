@@ -393,6 +393,89 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
             completed_state = next(item for item in reversed(task_states) if item["status"] == "completed")
             self.assertNotIn("추가 의견은 다음 회의에서 다룹니다", completed_state["response_preview"])
 
+    async def test_failed_reintegration_does_not_consume_cap_and_closes_human_notes(self):
+        provider_outputs = iter([
+            "claude 1차 의견",
+            "claude 2차 의견",
+            "claude 3차 의견",
+            "최초 최종 종합",
+        ])
+        sent = FakeSent(15)
+        update = make_update(sent)
+        update.effective_message.message_id = 240
+        session_id = BOT.session_id_for_telegram(update.effective_chat.id, 240)
+        task_states = []
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            store = BOT.DeliberationStore(directory)
+
+            async def provider(*args, **kwargs):
+                if provider_mock.await_count == 5:
+                    raise RuntimeError("reintegration provider failed")
+                return next(provider_outputs)
+
+            provider_mock = AsyncMock(side_effect=provider)
+
+            def complete_round(current_session_id, round_number):
+                for role in ("codex", "antigravity", "roda"):
+                    store.record(
+                        current_session_id,
+                        role,
+                        status="completed",
+                        summary=f"{role} {round_number}차 의견",
+                        round_number=round_number,
+                    )
+                if round_number == 3:
+                    store.append_human_note(
+                        current_session_id,
+                        "재종합 실패 전의 늦은 발언",
+                        telegram_message_id=241,
+                    )
+
+            with patch.dict("os.environ", {
+                    "EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path),
+                    "EDGE_AGENT_TELEGRAM_DELIVERY_ROOT": self.delivery_root.name,
+                }), \
+                    patch.object(BOT, "addressed_text", return_value="장단점을 회의하고 최종 의견을 통합해줘"), \
+                    patch.object(BOT, "DeliberationStore", return_value=store), \
+                    patch.multiple(
+                        BOT,
+                        SIMPLE_MEETING_MODE=False,
+                        is_deliberation_request=lambda text: True,
+                        classify_ingress=lambda text: SimpleNamespace(accepts=lambda role: True),
+                        roles_for_request=lambda text: ("claude", "codex", "antigravity", "roda"),
+                    ), \
+                    patch.object(BOT, "_prepare_context", return_value=None), \
+                    patch.object(BOT, "_ingress_identity", return_value=None), \
+                    patch.object(BOT, "_is_stale", return_value=False), \
+                    patch.object(BOT, "_needs_task_worktree", return_value=False), \
+                    patch.object(BOT, "_require_deliberation_round", side_effect=complete_round), \
+                    patch.object(BOT, "run_provider", new=provider_mock), \
+                    patch.object(
+                        BOT,
+                        "write_task_state",
+                        side_effect=lambda **kwargs: task_states.append(kwargs) or "task-meeting-reintegration-failure",
+                    ), \
+                    patch.object(BOT, "start_session", return_value="session-meeting-reintegration-failure"), \
+                    patch.object(BOT, "update_session"), \
+                    patch.object(BOT, "write_reflection"), \
+                    patch.object(BOT, "_record_telegram_efficiency"), \
+                    patch.object(BOT, "_update_task_worktree_status"), \
+                    patch.object(BOT, "ROLE", "claude"):
+                BOT.ACTIVE_TASK_WORKSPACE = None
+                BOT.ACTIVE_LOGICAL_SESSION_ID = None
+                await BOT.handle_message(update, SimpleNamespace())
+
+            self.assertEqual(provider_mock.await_count, 5)
+            snapshot = store.snapshot(session_id)
+            self.assertEqual(store.reintegration_count(session_id), 0)
+            self.assertIs(snapshot["human_notes_closed"], True)
+            completed_state = next(item for item in reversed(task_states) if item["status"] == "completed")
+            self.assertIn("최초 최종 종합", completed_state["response_preview"])
+            self.assertIn("추가 의견은 다음 회의에서 다룹니다", completed_state["response_preview"])
+
     def test_delegation_delivery_uses_defined_reply_chunker(self):
         source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")
         self.assertNotIn("for part in _split_message(answer)", source)
