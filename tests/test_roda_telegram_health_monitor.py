@@ -741,6 +741,22 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 health.TARGETS = original_targets
                 health._service_running = original_running
 
+    def test_implementer_chain_default_order(self):
+        state = {"usage_watch": {}}
+        self.assertEqual(health._implementer_chain(state, current=1000.0), ["codex", "claude", "antigravity"])
+
+    def test_implementer_chain_skips_role_with_active_usage_watch(self):
+        state = {"usage_watch": {
+            "fp-usage": {"role": "codex", "status": "waiting_for_probe"},
+        }}
+        self.assertEqual(health._implementer_chain(state, current=1000.0), ["claude", "antigravity"])
+
+    def test_implementer_chain_ignores_expired_or_resolved_usage_watch(self):
+        state = {"usage_watch": {
+            "fp-usage": {"role": "codex", "status": "completed_success"},
+        }}
+        self.assertEqual(health._implementer_chain(state, current=1000.0), ["codex", "claude", "antigravity"])
+
     def test_repair_result_only_instructs_reprocess_after_success(self):
         event = {"role": "claude", "code": "service_down"}
         failed = health._format_repair_result(event, "Codex 진단 실행 실패: TimeoutExpired")

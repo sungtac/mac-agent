@@ -2011,6 +2011,16 @@ def _manual_mode_active(state: dict) -> bool:
     return bool(state.get("self_heal_manual_mode", {}).get("active"))
 
 
+def _implementer_chain(state: dict, current: float) -> list[str]:
+    base_order = ["codex", "claude", "antigravity"]
+    busy = set()
+    for role in base_order:
+        active = _active_usage_watch(state, role)
+        if active is not None:
+            busy.add(role)
+    return [role for role in base_order if role not in busy]
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
