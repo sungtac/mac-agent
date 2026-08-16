@@ -1695,6 +1695,30 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNotNone(event)
         self.assertNotIn("@", event["message"].split("\n")[0])
 
+    def test_owner_down_verdict_rechecks_live_service_and_downgrades_to_deliberation_when_running(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {
+            "role": "codex", "code": "execution_error", "routed_role": "codex", "reroute_count": 0,
+        }
+        with mock.patch.object(health, "_service_running", return_value=True):
+            event = health._apply_triage_verdict(
+                state, "fp1", incident, {"verdict": "OWNER_DOWN", "owner": None}, current=5000.0,
+            )
+        self.assertEqual(incident["escalation_stage"], "deliberation_triggered")
+        self.assertEqual(event["code"], "deliberation_triggered")
+
+    def test_owner_down_verdict_confirms_when_service_actually_down(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {
+            "role": "codex", "code": "execution_error", "routed_role": "codex", "reroute_count": 0,
+        }
+        with mock.patch.object(health, "_service_running", return_value=False):
+            event = health._apply_triage_verdict(
+                state, "fp1", incident, {"verdict": "OWNER_DOWN", "owner": None}, current=5000.0,
+            )
+        self.assertEqual(incident["escalation_stage"], "human_notified")
+        self.assertEqual(event["code"], "owner_down")
+
     def test_apply_triage_verdict_misrouted_reroutes_once(self):
         state = {"incidents": {}, "deliberation_history": []}
         incident = {"role": "codex", "code": "execution_error", "routed_role": "codex", "reroute_count": 0}

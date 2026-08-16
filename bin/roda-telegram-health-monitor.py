@@ -1787,6 +1787,16 @@ def _record_deliberation_trigger(state: dict, incident: dict, current: float, *,
 def _apply_triage_verdict(state: dict, fingerprint: str, incident: dict, verdict: dict, current: float) -> dict | None:
     label = verdict.get("verdict")
     if label == "OWNER_DOWN":
+        owner_role = incident.get("routed_role")
+        if isinstance(owner_role, str) and owner_role in TARGETS:
+            try:
+                owner_running = _service_running(TARGETS[owner_role]["label"])
+            except (OSError, subprocess.SubprocessError):
+                owner_running = False
+            if owner_running:
+                return _record_deliberation_trigger(
+                    state, incident, current, incident_ref=fingerprint,
+                )
         incident["escalation_stage"] = "human_notified"
         incident["escalation_reason"] = "owner_down"
         incident["escalated_at"] = current
