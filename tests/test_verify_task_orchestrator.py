@@ -17,6 +17,34 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyTaskOrchestratorTests(unittest.TestCase):
+    def test_match_open_finding_tracks_rename_with_same_symbol(self):
+        previous = [{"id": "old-1", "file": "old.py", "location": "old.py:parse_value", "anchor": "def parse_value(value):"}]
+        issue = {"file": "new.py", "location": "new.py:parse_value", "anchor": "def parse_value(value):"}
+        git_result = subprocess.CompletedProcess([], 0, "R100\told.py\tnew.py\n", "")
+        with patch.object(MODULE.subprocess, "run", return_value=git_result):
+            matched = MODULE.match_open_finding(issue, previous, Path("."))
+        self.assertEqual(matched["id"], "old-1")
+
+    def test_match_open_finding_rejects_different_file_and_symbol(self):
+        previous = [{"id": "old-1", "file": "old.py", "location": "old.py:parse_value", "anchor": "def parse_value(value):"}]
+        issue = {"file": "other.py", "location": "other.py:render_page", "anchor": "def render_page(page):"}
+        with patch.object(MODULE.subprocess, "run", side_effect=OSError("git unavailable")):
+            self.assertIsNone(MODULE.match_open_finding(issue, previous, Path(".")))
+
+    def test_match_open_finding_rejects_shared_generic_tokens_without_rename(self):
+        previous = [{"id": "old-1", "file": "old.py", "location": "old.py:bug_fix", "anchor": "bug fix in parser"}]
+        issue = {"file": "other.py", "location": "other.py:bug_fix", "anchor": "bug fix in renderer"}
+        git_result = subprocess.CompletedProcess([], 0, "", "")
+        with patch.object(MODULE.subprocess, "run", return_value=git_result):
+            self.assertIsNone(MODULE.match_open_finding(issue, previous, Path(".")))
+
+    def test_match_open_finding_falls_back_when_git_fails(self):
+        previous = [{"id": "old-1", "file": "same.py", "location": "same.py:parse_value", "anchor": "def parse_value(value):"}]
+        issue = {"file": "same.py", "location": "same.py:parse_value", "anchor": "def parse_value(value):"}
+        with patch.object(MODULE.subprocess, "run", side_effect=subprocess.CalledProcessError(1, "git diff")):
+            matched = MODULE.match_open_finding(issue, previous, Path("."))
+        self.assertEqual(matched["id"], "old-1")
+
     def test_ensure_git_worktree_initializes_non_git_directory(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

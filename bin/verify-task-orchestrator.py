@@ -12,6 +12,7 @@ track.
 from __future__ import annotations
 
 import argparse
+import difflib
 import fcntl
 import hashlib
 import importlib.util
@@ -43,7 +44,100 @@ CRITICAL_MIGRATION_RE = re.compile(r"migration|migrations|schema|database|db/|\.
 TEST_FAILURE_RE = re.compile(r"test.*fail|failed.*test|regression|회귀|실패 로그|assert", re.I)
 
 def delta_prompt_context(findings: list[dict[str, Any]]) -> str:
-    return "\n".join(json.dumps({"id": item.get("id"), "anchor": item.get("location") or item.get("anchor"), "evidence": item.get("evidence"), "title": item.get("title") or item.get("description")}, ensure_ascii=False) for item in findings) or "(이전 라운드 open finding 없음)"
+    return "\n".join(json.dumps({"id": item.get("id"), "file": item.get("file"), "anchor": item.get("location") or item.get("anchor"), "symbol": item.get("symbol"), "snippet": item.get("snippet"), "evidence": item.get("evidence"), "title": item.get("title") or item.get("description")}, ensure_ascii=False) for item in findings) or "(이전 라운드 open finding 없음)"
+
+
+FINDING_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{2,}")
+FINDING_STOPWORDS = {
+    "the", "and", "for", "from", "this", "that", "with", "issue", "file",
+    "line", "code", "error", "review", "finding", "description", "evidence",
+    "def", "class", "function", "return", "const", "let", "var", "public",
+    "bug", "fix", "test", "data",
+}
+
+
+def _finding_text(finding: dict[str, Any]) -> str:
+    return " ".join(str(finding.get(key) or "") for key in ("location", "anchor", "symbol", "snippet", "code", "evidence", "title", "description"))
+
+
+def _finding_paths(finding: dict[str, Any]) -> set[str]:
+    paths = {str(finding.get("file") or "").strip()}
+    for key in ("location", "anchor"):
+        value = str(finding.get(key) or "").strip()
+        if value:
+            paths.add(value.split(":", 1)[0].strip())
+    return {
+        path.replace("\\", "/").lstrip("./")
+        for path in paths
+        if path and ("/" in path or "." in path)
+    }
+
+
+def _finding_symbols(finding: dict[str, Any]) -> set[str]:
+    symbols = set()
+    symbol_text = " ".join(
+        str(finding.get(key) or "")
+        for key in ("location", "anchor", "symbol", "snippet", "code")
+    )
+    for token in FINDING_IDENTIFIER_RE.findall(symbol_text):
+        if token.lower() not in FINDING_STOPWORDS:
+            symbols.add(token)
+    return symbols
+
+
+def _git_path_mapping(cwd: Path) -> dict[str, set[str]] | None:
+    try:
+        result = subprocess.run(
+            ["git", "diff", "-M", "-C", "--name-status", "HEAD"],
+            cwd=cwd,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return None
+        mapping: dict[str, set[str]] = {}
+        for line in result.stdout.splitlines():
+            fields = line.split("\t")
+            if len(fields) >= 3 and fields[0][:1] in {"R", "C"}:
+                old_path, new_path = (field.replace("\\", "/").lstrip("./") for field in fields[-2:])
+                mapping.setdefault(old_path, set()).add(new_path)
+                mapping.setdefault(new_path, set()).add(old_path)
+        return mapping
+    except Exception:
+        return None
+
+
+def _paths_correspond(previous_paths: set[str], current_paths: set[str], mapping: dict[str, set[str]]) -> bool:
+    if previous_paths & current_paths:
+        return True
+    return any(mapped_path in current_paths for path in previous_paths for mapped_path in mapping.get(path, set()))
+
+
+def _snippet_similarity(previous: dict[str, Any], current: dict[str, Any]) -> float:
+    previous_text = " ".join(str(previous.get(key) or "") for key in ("snippet", "anchor", "evidence"))
+    current_text = " ".join(str(current.get(key) or "") for key in ("snippet", "anchor", "evidence"))
+    if not previous_text or not current_text:
+        return 0.0
+    return difflib.SequenceMatcher(None, previous_text, current_text).ratio()
+
+
+def match_open_finding(issue: dict[str, Any], previous_open: list[dict[str, Any]], cwd: Path) -> dict[str, Any] | None:
+    """Return the prior finding matching issue, using host-observed anchors."""
+    current_paths = _finding_paths(issue)
+    current_symbols = _finding_symbols(issue)
+    mapping = _git_path_mapping(cwd)
+    for previous in previous_open:
+        previous_paths = _finding_paths(previous)
+        paths_match = _paths_correspond(previous_paths, current_paths, mapping or {})
+        common_symbols = current_symbols & _finding_symbols(previous)
+        if paths_match and common_symbols:
+            return previous
+        if mapping is None and common_symbols:
+            return previous
+        if _snippet_similarity(previous, issue) >= 0.72 and (paths_match or not previous_paths or not current_paths):
+            return previous
+    return None
 
 def is_critical_delta_issue(issue: dict[str, Any], diff_text: str, tests: dict[str, Any]) -> bool:
     evidence = " ".join(str(issue.get(key, "")) for key in ("description", "issue", "evidence", "location", "file"))
@@ -612,7 +706,10 @@ class HostOrchestrator:
     def record_delta_report(self, round_number: int, issues: list[dict[str, Any]], deferred: list[dict[str, Any]], parent: str | None) -> str | None:
         report_path: str | None = None
         try:
-            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, text=True, capture_output=True, check=True).stdout.strip()
+            head_result = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, text=True, capture_output=True, check=False)
+            if head_result.returncode != 0:
+                return None
+            head = head_result.stdout.strip()
             findings = [{"id": item.get("id") or f"verify-{round_number}-{index + 1}", "severity": "medium" if index >= len(issues) else "blocker", "category": "security" if CRITICAL_SECURITY_RE.search(str(item)) else "correctness", "location": str(item.get("location") or item.get("file") or f"commit:{head}"), "title": str(item.get("title") or item.get("description") or item.get("issue") or "Delta Review finding")[:180], "evidence": str(item.get("evidence") or item.get("description") or "host review evidence"), "remediation": str(item.get("required_fix") or "Review and correct the finding."), "status": "deferred" if index >= len(issues) else "open"} for index, item in enumerate([*issues, *deferred])]
             report = {"schema_version": "edge_agent.code_review_report.v1", "review_id": "verify-task-" + hashlib.sha256(str(self.task).encode()).hexdigest()[:24] + f"-round-{round_number}", "status": "CHANGES_REQUIRED" if issues else "AI_APPROVED", "target": {"scope": "diff", "head_sha": head, "repository": str(self.cwd)}, "round": round_number, "parent_report_key": parent, "findings": findings, "checks": [{"name": "verify-task-review", "status": "passed"}]}
             if not issues: report["approval"] = {"provider": "verify-task-host", "reviewed_head_sha": head, "decision_reason": "bounded Delta Review completed"}
@@ -726,8 +823,10 @@ class HostOrchestrator:
                 diff_text = str(verification.get("diff", verification.get("content", "")))
                 allowed = []
                 for issue in issues:
-                    location = str(issue.get("location") or issue.get("file") or "")
-                    if any(location and location in str(item.get("location") or item.get("anchor") or "") for item in previous_open) or is_critical_delta_issue(issue, diff_text, tests): allowed.append(issue)
+                    matched = match_open_finding(issue, previous_open, self.cwd)
+                    if matched:
+                        allowed.append({**issue, "matched_open_finding_id": matched.get("id")})
+                    elif is_critical_delta_issue(issue, diff_text, tests): allowed.append(issue)
                     else: deferred.append({**issue, "blocking": False, "status": "deferred"})
                 issues = allowed
             parent_report_key = self.record_delta_report(round_number, issues, deferred, parent_report_key)
