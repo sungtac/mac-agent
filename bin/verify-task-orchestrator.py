@@ -707,11 +707,6 @@ class HostOrchestrator:
     def light_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any]) -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: auditor\n\n경량 트랙의 독립 차단 리뷰어다. 점수는 매기지 않는다. 실제 diff, 하네스 트랙 판정, 테스트 요약만 근거로 판단한다.\n\n[원 작업]\n{self.task}\n[허용 파일/정책]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[트랙]\n{json.dumps(diff.get('policy', {}), ensure_ascii=False)}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\nJSON으로만 답해: {{"verdict":"pass|changes_required|full_track_required","blocking_issues":[]}}"""
 
-    def _legacy_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
-        persona = "communicator" if role == "claude" else "auditor"
-        identity = "제한된 구현자 또는 독립 리뷰어" if role == "claude" else "독립 조사관이자 레드팀 검증자"
-        return f"""[agent profile v1.0.0]\n영구 역할: {identity}\n현재 persona: {persona}\n\n너는 독립 코드 리뷰어다. 점수는 매기지 않는다. 다른 리뷰어의 의견을 전제로 삼지 말고 제공된 패키지만 검토한다. 테스트를 다시 실행하지 마라.\n\n[원 작업]\n{self.task}\n[최종 계획]\n{plan or '(계획 없음)'}\n[허용 파일/적용 규칙]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\n문제가 있으면 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test, blocking을 포함한다.\nJSON으로만 답해: {{"hasBlockingIssue":false,"issues":[],"checks":[{{"name":"test-summary","status":"passed","evidence":"하네스 요약 확인"}}]}}"""
-
     def review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
         persona = "communicator" if role == "claude" else "auditor"
         identity = "제한된 구현자 또는 독립 리뷰어" if role == "claude" else "독립 조사관이자 레드팀 검증자"
