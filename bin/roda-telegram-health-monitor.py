@@ -46,6 +46,13 @@ PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SEC
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
 STATE_SCHEMA_VERSION = 6
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
+# Stage-1..3 escalation reuses the existing timing constants verbatim (design
+# doc 2026-08-16-roda-role-escalation-design.md, 확정 사항 1-3) — these are
+# aliases, not new tunables.
+ROUTING_ACK_TIMEOUT_SECONDS = NO_RESPONSE_SECONDS
+ROUTING_COMPLETION_TIMEOUT_SECONDS = PENDING_MERGE_TTL_SECONDS
+INCIDENT_MERGE_WINDOW_SECONDS = NO_RESPONSE_SECONDS
+REPEAT_FAILURE_WINDOW_SECONDS = ALERT_RETENTION_SECONDS
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
@@ -1436,6 +1443,96 @@ def _record_diagnostic_observation(state: dict, line: str, role: str, code: str 
         metrics["unknown"] = int(metrics.get("unknown", 0) or 0) + 1
 
 
+def _route_incident(role: str, code: str) -> str:
+    """Fixed owner table (design doc 확정 사항 1, rule 1).
+
+    ``main_dirty`` belongs to the repo's existing auto-repair authority
+    (Codex — see ``_run_codex_repair_impl``); every other code belongs to
+    the role the failure was already observed on.
+    """
+    if code == "main_dirty":
+        return "codex"
+    return role
+
+
+def _check_repeat_failure(state: dict, role: str, code: str, current: float) -> bool:
+    """Same (role, code) already reached full deliberation within the
+    repeat-failure window (design doc 확정 사항 3)."""
+    for record in state.get("deliberation_history", []):
+        if record.get("role") != role or record.get("code") != code:
+            continue
+        try:
+            triggered_at = float(record.get("triggered_at", 0))
+        except (TypeError, ValueError):
+            continue
+        if current - triggered_at <= REPEAT_FAILURE_WINDOW_SECONDS:
+            return True
+    return False
+
+
+def _find_mergeable_incident(state: dict, role: str, current: float) -> str | None:
+    """An open, already-routed, non-attached incident for the same role
+    seen within the merge window (design doc 확정 사항 2)."""
+    candidates = []
+    for fingerprint, incident in state.get("incidents", {}).items():
+        if incident.get("role") != role:
+            continue
+        if incident.get("status") not in {"open", "reopened"}:
+            continue
+        if incident.get("escalation_stage") in (None, "attached"):
+            continue
+        try:
+            last_seen = float(incident.get("last_seen_at", 0))
+        except (TypeError, ValueError):
+            continue
+        if current - last_seen <= INCIDENT_MERGE_WINDOW_SECONDS:
+            candidates.append((last_seen, fingerprint))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
+
+
+def _route_incident_event(state: dict, event: dict, current: float) -> None:
+    if event.get("kind") in {"recovery_result", "usage_recovery", "escalation_notice"}:
+        _upsert_incident(state, event, current)
+        return
+    fingerprint = str(event.get("fingerprint") or "")
+    is_new = fingerprint not in state.get("incidents", {})
+    _upsert_incident(state, event, current)
+    incident = state["incidents"].get(fingerprint)
+    if incident is None or not is_new:
+        return
+    role = str(event.get("role") or "unknown")
+    code = str(event.get("code") or "unknown")
+    if _check_repeat_failure(state, role, code, current):
+        incident["escalation_stage"] = "human_notified"
+        incident["escalation_reason"] = "repeat_failure"
+        incident["escalated_at"] = current
+        event["message"] += (
+            f"\n\n⚠️ 같은 문제({role}/{code})가 {REPEAT_FAILURE_WINDOW_SECONDS // 86400}일 내 "
+            "전체 디벨리버레이션까지 갔다가 반복되었습니다. 에이전트 체인을 건너뛰고 사람 확인이 필요합니다."
+        )
+        return
+    merge_target = _find_mergeable_incident(state, role, current)
+    if merge_target is not None:
+        incident["escalation_stage"] = "attached"
+        incident["attached_to"] = merge_target
+        primary = state["incidents"][merge_target]
+        primary.setdefault("related_incidents", [])
+        if fingerprint not in primary["related_incidents"]:
+            primary["related_incidents"].append(fingerprint)
+        return
+    routed_role = _route_incident(role, code)
+    incident["escalation_stage"] = "awaiting_ack"
+    incident["routed_role"] = routed_role
+    incident["routed_at"] = current
+    incident["ack_deadline"] = current + ROUTING_ACK_TIMEOUT_SECONDS
+    incident["reroute_count"] = 0
+    incident["related_incidents"] = []
+    event["message"] += f"\n\n@{BOT_USERNAMES.get(routed_role, routed_role)} 확인 요망 — 이 인시던트의 담당자입니다."
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -1598,7 +1695,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                     incident["resolved_at"] = current
                     incident["resolution"] = "post-repair request completed successfully"
     for event in alerts:
-        _upsert_incident(state, event, current)
+        _route_incident_event(state, event, current)
     state["initialized"] = True
     return alerts
 

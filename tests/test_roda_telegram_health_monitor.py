@@ -112,6 +112,112 @@ class RodaHealthMonitorTests(unittest.TestCase):
     def test_default_state_has_empty_deliberation_history(self):
         self.assertEqual(health._default_state()["deliberation_history"], [])
 
+    def test_route_incident_sends_main_dirty_to_codex_and_others_to_their_own_role(self):
+        self.assertEqual(health._route_incident("claude", "main_dirty"), "codex")
+        self.assertEqual(health._route_incident("antigravity", "main_dirty"), "codex")
+        self.assertEqual(health._route_incident("claude", "execution_error"), "claude")
+        self.assertEqual(health._route_incident("antigravity", "service_down"), "antigravity")
+
+    def test_route_incident_event_routes_new_failure_and_appends_mention(self):
+        state = {"incidents": {}, "alerted": {}, "deliberation_history": []}
+        event = {
+            "role": "codex", "code": "execution_error", "fingerprint": "fp1",
+            "message": "[Roda 감지] codex 봇에 execution_error 문제가 발생했습니다. 확인이 필요합니다.",
+            "detail": "boom",
+        }
+        health._route_incident_event(state, event, current=1000.0)
+        incident = state["incidents"]["fp1"]
+        self.assertEqual(incident["escalation_stage"], "awaiting_ack")
+        self.assertEqual(incident["routed_role"], "codex")
+        self.assertEqual(incident["routed_at"], 1000.0)
+        self.assertEqual(incident["ack_deadline"], 1000.0 + health.ROUTING_ACK_TIMEOUT_SECONDS)
+        self.assertEqual(incident["reroute_count"], 0)
+        self.assertIn(f"@{health.BOT_USERNAMES['codex']}", event["message"])
+
+    def test_route_incident_event_merges_same_role_incident_within_window(self):
+        state = {
+            "incidents": {
+                "primary": {
+                    "incident_id": "primary", "role": "codex", "code": "execution_error",
+                    "status": "open", "first_seen_at": 1000, "last_seen_at": 1000,
+                    "escalation_stage": "awaiting_ack", "routed_role": "codex",
+                    "routed_at": 1000, "ack_deadline": 1300, "reroute_count": 0,
+                    "related_incidents": [],
+                },
+            },
+            "alerted": {}, "deliberation_history": [],
+        }
+        event = {
+            "role": "codex", "code": "service_down", "fingerprint": "secondary",
+            "message": "[Roda 감지] codex 봇에 service_down 문제가 발생했습니다. 확인이 필요합니다.",
+            "detail": "proc dead",
+        }
+        health._route_incident_event(state, event, current=1100.0)
+        self.assertEqual(state["incidents"]["secondary"]["escalation_stage"], "attached")
+        self.assertEqual(state["incidents"]["secondary"]["attached_to"], "primary")
+        self.assertIn("secondary", state["incidents"]["primary"]["related_incidents"])
+        self.assertNotIn("routed_role", state["incidents"]["secondary"])
+
+    def test_route_incident_event_skips_already_routed_incident(self):
+        state = {
+            "incidents": {
+                "fp1": {
+                    "incident_id": "fp1", "role": "codex", "code": "execution_error",
+                    "status": "open", "first_seen_at": 1000, "last_seen_at": 1000,
+                    "escalation_stage": "awaiting_ack", "routed_role": "codex",
+                    "routed_at": 1000, "ack_deadline": 1300, "reroute_count": 0,
+                    "related_incidents": [],
+                },
+            },
+            "alerted": {}, "deliberation_history": [],
+        }
+        event = {
+            "role": "codex", "code": "execution_error", "fingerprint": "fp1",
+            "message": "재발", "detail": "boom again",
+        }
+        health._route_incident_event(state, event, current=1050.0)
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "awaiting_ack")
+        self.assertEqual(state["incidents"]["fp1"]["routed_at"], 1000)
+        self.assertEqual(event["message"], "재발")
+
+    def test_repeat_failure_within_window_skips_routing_and_notifies_human(self):
+        state = {
+            "incidents": {},
+            "alerted": {},
+            "deliberation_history": [
+                {"role": "codex", "code": "execution_error", "triggered_at": 1000.0},
+            ],
+        }
+        event = {
+            "role": "codex", "code": "execution_error", "fingerprint": "fp2",
+            "message": "[Roda 감지] codex 봇에 execution_error 문제가 발생했습니다. 확인이 필요합니다.",
+            "detail": "boom",
+        }
+        current = 1000.0 + health.REPEAT_FAILURE_WINDOW_SECONDS - 1
+        health._route_incident_event(state, event, current=current)
+        incident = state["incidents"]["fp2"]
+        self.assertEqual(incident["escalation_stage"], "human_notified")
+        self.assertEqual(incident["escalation_reason"], "repeat_failure")
+        self.assertNotIn("routed_role", incident)
+        self.assertIn("반복", event["message"])
+
+    def test_repeat_failure_outside_window_routes_normally(self):
+        state = {
+            "incidents": {},
+            "alerted": {},
+            "deliberation_history": [
+                {"role": "codex", "code": "execution_error", "triggered_at": 1000.0},
+            ],
+        }
+        event = {
+            "role": "codex", "code": "execution_error", "fingerprint": "fp3",
+            "message": "[Roda 감지] codex 봇에 execution_error 문제가 발생했습니다. 확인이 필요합니다.",
+            "detail": "boom",
+        }
+        current = 1000.0 + health.REPEAT_FAILURE_WINDOW_SECONDS + 1
+        health._route_incident_event(state, event, current=current)
+        self.assertEqual(state["incidents"]["fp3"]["escalation_stage"], "awaiting_ack")
+
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
         self.assertEqual(health.classify_line("[claude] You've hit your session limit · resets 7pm"), "session_limited")
