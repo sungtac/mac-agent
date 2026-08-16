@@ -191,6 +191,106 @@ class VerifyTaskHarnessTests(unittest.TestCase):
             self.assertTrue((run_dir / "current.diff").is_file())
             self.assertTrue((run_dir / "task.json").is_file())
 
+    def test_snapshot_prioritizes_relevant_evidence_before_large_unrelated_noise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "baseline.txt"], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            for index in range(4):
+                (repo / f"unrelated-{index}.log").write_text("N" * 12000, encoding="utf-8")
+            relevant = repo / "target.py"
+            relevant.write_text("RELEVANT_TARGET_EVIDENCE\n", encoding="utf-8")
+            run_dir = repo / ".verify" / "runs" / "TASK-NOISE"
+            run_dir.mkdir(parents=True)
+            (run_dir / "relevant-files.txt").write_text("target.py\n", encoding="utf-8")
+
+            snapshot = MODULE.snapshot(repo, "target.py 수정", run_dir, False)
+
+            self.assertTrue(snapshot["truncated"])
+            self.assertIn("UNTRACKED OR UNDIFFED FILE: target.py", snapshot["content"])
+            self.assertIn("RELEVANT_TARGET_EVIDENCE", (run_dir / "current.diff").read_text(encoding="utf-8"))
+
+    def test_snapshot_uses_porcelain_untracked_status_not_diff_text_matching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            tracked.write_text("mentions ghost.py in the diff body\n", encoding="utf-8")
+            ghost = repo / "ghost.py"
+            ghost.write_text("GHOST_FILE_EVIDENCE\n", encoding="utf-8")
+            run_dir = repo / ".verify" / "runs" / "TASK-STATUS"
+
+            self.assertEqual(MODULE.untracked_files(repo), {"ghost.py"})
+            snapshot = MODULE.snapshot(repo, "ghost.py 추가", run_dir, False)
+
+            self.assertIn("UNTRACKED OR UNDIFFED FILE: ghost.py", snapshot["content"])
+            self.assertIn("GHOST_FILE_EVIDENCE", snapshot["content"])
+
+    def test_snapshot_falls_back_to_task_paths_for_empty_relevant_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            (repo / "baseline.txt").write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "baseline.txt"], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            (repo / "fallback.py").write_text("FALLBACK_TASK_PATH_EVIDENCE\n", encoding="utf-8")
+            run_dir = repo / ".verify" / "runs" / "TASK-FALLBACK"
+            run_dir.mkdir(parents=True)
+            (run_dir / "relevant-files.txt").write_text("\n", encoding="utf-8")
+
+            snapshot = MODULE.snapshot(repo, "fallback.py 추가", run_dir, False)
+
+            self.assertIn("FALLBACK_TASK_PATH_EVIDENCE", snapshot["content"])
+
+    def test_snapshot_classifies_with_original_full_diff_and_status_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+            tracked = repo / "tracked.txt"
+            tracked.write_text("before\n", encoding="utf-8")
+            subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+            subprocess.run([
+                "git", "-c", "user.email=test@example.com", "-c", "user.name=test",
+                "commit", "-qm", "initial",
+            ], cwd=repo, check=True)
+            tracked.write_text("after\n", encoding="utf-8")
+            extra = repo / "extra.txt"
+            extra.write_text("extra\n", encoding="utf-8")
+            run_dir = repo / ".verify" / "runs" / "TASK-CLASSIFY"
+
+            expected_code, expected_diff, _ = MODULE.git(repo, "diff", "--binary", "HEAD", timeout=60)
+            expected_files = MODULE.status_files(repo)
+            captured = {}
+            original_classify = MODULE.classify
+
+            def capture_classify(task, files, explicit_full=False):
+                captured["task"] = task
+                captured["files"] = files
+                captured["explicit_full"] = explicit_full
+                return original_classify(task, files, explicit_full)
+
+            with patch.object(MODULE, "classify", side_effect=capture_classify):
+                MODULE.snapshot(repo, "tracked.txt 수정", run_dir, False)
+
+            self.assertEqual(expected_code, 0)
+            self.assertEqual(captured["files"], expected_files)
+            self.assertEqual(captured["explicit_full"], False)
+            self.assertEqual(captured["task"], "tracked.txt 수정")
+
     def test_init_includes_matching_existing_test_in_allowed_handoff(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)

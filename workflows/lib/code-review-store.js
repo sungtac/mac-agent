@@ -19,6 +19,7 @@ const FINDING_CATEGORIES = new Set([
   'tooling',
   'scope',
 ])
+const FINDING_STATUSES = new Set(['open', 'fixed', 'regression', 'deferred', 'superseded'])
 const REQUIRED_FINDING_FIELDS = [
   'id',
   'severity',
@@ -88,6 +89,9 @@ function validateReport(report) {
     throw new CodeReviewStoreError('invalid_report', 'schema_version must be ' + SCHEMA_VERSION)
   }
   assertText(report.review_id, 'review_id')
+  if (report.round !== undefined && (!Number.isInteger(report.round) || report.round < 1)) throw new CodeReviewStoreError('invalid_report', 'round must be a positive integer')
+  if (report.parent_report_key !== undefined && report.parent_report_key !== null) assertNonEmptyText(report.parent_report_key, 'parent_report_key')
+  if (report.pr_number !== undefined && report.pr_number !== null && (!Number.isInteger(report.pr_number) || report.pr_number < 1)) throw new CodeReviewStoreError('invalid_report', 'pr_number must be a positive integer or null')
   if (!['REVIEWED', 'AI_APPROVED', 'CHANGES_REQUIRED', 'ESCALATED', 'SUPERSEDED'].includes(report.status)) {
     throw new CodeReviewStoreError('invalid_report', 'status is invalid')
   }
@@ -112,6 +116,7 @@ function validateReport(report) {
     if (!FINDING_CATEGORIES.has(finding.category)) {
       throw new CodeReviewStoreError('invalid_report', `findings[${index}].category is invalid`)
     }
+    if (finding.status !== undefined && !FINDING_STATUSES.has(finding.status)) throw new CodeReviewStoreError('invalid_report', `findings[${index}].status is invalid`)
   }
   for (const [index, check] of report.checks.entries()) {
     if (!isPlainObject(check) || typeof check.name !== 'string' || !check.name) {
@@ -205,6 +210,21 @@ function findLatestReview(reviewId, stateRoot = DEFAULT_STATE_ROOT) {
   return report
 }
 
+function findLatestReviewByPr(prNumber, repository, stateRoot = DEFAULT_STATE_ROOT) {
+  if (!Number.isInteger(prNumber) || prNumber < 1) throw new CodeReviewStoreError('invalid_query', 'pr_number must be a positive integer')
+  const paths = pathsFor(stateRoot)
+  if (!fs.existsSync(paths.reports)) return null
+  let latest = null
+  for (const filename of fs.readdirSync(paths.reports).filter((value) => value.endsWith('.json'))) {
+    const report = readJson(path.join(paths.reports, filename))
+    if (!report) continue
+    validateReport(report)
+    if (report.pr_number !== prNumber || (repository && report.target.repository !== repository)) continue
+    if (!latest || (report.round || 1) > (latest.round || 1)) latest = report
+  }
+  return latest
+}
+
 function main() {
   const mode = process.argv[2]
   const stateRoot = process.env.EDGE_AGENT_CODE_REVIEW_STATE_ROOT || process.env.EDGE_AGENT_STATE_ROOT || DEFAULT_STATE_ROOT
@@ -237,4 +257,6 @@ module.exports = {
   validateReport,
   recordReviewReport,
   findLatestReview,
+  findLatestReviewByPr,
+  FINDING_STATUSES,
 }

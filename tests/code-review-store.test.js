@@ -7,6 +7,7 @@ const path = require('node:path')
 const {
   CodeReviewStoreError,
   findLatestReview,
+  findLatestReviewByPr,
   recordReviewReport,
 } = require('../workflows/lib/code-review-store.js')
 
@@ -103,4 +104,24 @@ test('accepts multiline evidence and remediation in findings', () => {
     }],
   }), root)
   assert.equal(result.outcome, 'appended')
+})
+
+test('supports delta fields, finding statuses, PR lookup, and legacy reports', () => {
+  const first = report({
+    round: 1,
+    pr_number: 7,
+    target: { scope: 'diff', head_sha: 'sha-1', repository: 'acme/widget' },
+    findings: [{ id: 'f-1', severity: 'medium', category: 'correctness', status: 'open', location: 'app.js#run', title: 'Issue', evidence: 'evidence', remediation: 'fix' }],
+  })
+  const second = report({
+    round: 2, parent_report_key: 'parent-key', pr_number: 7,
+    target: { scope: 'diff', head_sha: 'sha-2', repository: 'acme/widget' },
+    approval: { provider: 'antigravity', reviewed_head_sha: 'sha-2', decision_reason: 'verified again' },
+  })
+  recordReviewReport(first, root)
+  recordReviewReport(second, root)
+  assert.equal(findLatestReviewByPr(7, 'acme/widget', root).round, 2)
+  assert.throws(() => recordReviewReport(report({ round: 0 }), root), /round must be/)
+  assert.throws(() => recordReviewReport(report({ findings: [{ id: 'f', severity: 'low', category: 'correctness', status: 'unknown', location: 'x', title: 'x', evidence: 'x', remediation: 'x' }] }), root), /status is invalid/)
+  assert.equal(findLatestReview('repo-1-pr-7', root).round, 2)
 })

@@ -38,6 +38,18 @@ HISTORY_SCHEMA = "edge_agent.verify_task_history.v1"
 HEADLESS_FILE_CHARS = 12000
 HEADLESS_TOTAL_FILE_CHARS = 24000
 HEADLESS_RULE_CHARS = 6000
+CRITICAL_SECURITY_RE = re.compile(r"security|secret|credential|token|auth|permission|injection|xss|csrf|취약|보안", re.I)
+CRITICAL_MIGRATION_RE = re.compile(r"migration|migrations|schema|database|db/|\.sql$|마이그레이션|스키마", re.I)
+TEST_FAILURE_RE = re.compile(r"test.*fail|failed.*test|regression|회귀|실패 로그|assert", re.I)
+
+def delta_prompt_context(findings: list[dict[str, Any]]) -> str:
+    return "\n".join(json.dumps({"id": item.get("id"), "anchor": item.get("location") or item.get("anchor"), "evidence": item.get("evidence"), "title": item.get("title") or item.get("description")}, ensure_ascii=False) for item in findings) or "(이전 라운드 open finding 없음)"
+
+def is_critical_delta_issue(issue: dict[str, Any], diff_text: str, tests: dict[str, Any]) -> bool:
+    evidence = " ".join(str(issue.get(key, "")) for key in ("description", "issue", "evidence", "location", "file"))
+    if tests.get("status") not in {"passed", "not_run"} and TEST_FAILURE_RE.search(evidence): return True
+    if CRITICAL_SECURITY_RE.search(evidence) and (CRITICAL_SECURITY_RE.search(diff_text) or issue.get("evidence")): return True
+    return bool(CRITICAL_MIGRATION_RE.search(evidence) and CRITICAL_MIGRATION_RE.search(diff_text))
 
 
 def load_harness():
@@ -597,6 +609,26 @@ class HostOrchestrator:
     def plan_prompt(self, context: dict[str, Any], research: list[dict[str, Any]]) -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 정밀 구현 및 검증 엔지니어\n현재 persona: architect\n\nAntigravity 조사와 하네스 패키지만 보고 Codex가 바로 실행할 구현 계획을 작성한다. 허용 파일, 의존성 순서, 통합 단계, 테스트 명령을 포함한다.\n[원 작업]\n{self.task}\n[하네스 패키지]\n{self.context_text(context)}\n[조사 요약]\n{json.dumps(research, ensure_ascii=False)}\n\nJSON으로만 답해: {{"needsClarification":false,"clarifyingQuestions":"","plan":"구현 순서, 파일 소유권, 통합 및 테스트"}}"""
 
+    def record_delta_report(self, round_number: int, issues: list[dict[str, Any]], deferred: list[dict[str, Any]], parent: str | None) -> str | None:
+        report_path: str | None = None
+        try:
+            head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.cwd, text=True, capture_output=True, check=True).stdout.strip()
+            findings = [{"id": item.get("id") or f"verify-{round_number}-{index + 1}", "severity": "medium" if index >= len(issues) else "blocker", "category": "security" if CRITICAL_SECURITY_RE.search(str(item)) else "correctness", "location": str(item.get("location") or item.get("file") or f"commit:{head}"), "title": str(item.get("title") or item.get("description") or item.get("issue") or "Delta Review finding")[:180], "evidence": str(item.get("evidence") or item.get("description") or "host review evidence"), "remediation": str(item.get("required_fix") or "Review and correct the finding."), "status": "deferred" if index >= len(issues) else "open"} for index, item in enumerate([*issues, *deferred])]
+            report = {"schema_version": "edge_agent.code_review_report.v1", "review_id": "verify-task-" + hashlib.sha256(str(self.task).encode()).hexdigest()[:24] + f"-round-{round_number}", "status": "CHANGES_REQUIRED" if issues else "AI_APPROVED", "target": {"scope": "diff", "head_sha": head, "repository": str(self.cwd)}, "round": round_number, "parent_report_key": parent, "findings": findings, "checks": [{"name": "verify-task-review", "status": "passed"}]}
+            if not issues: report["approval"] = {"provider": "verify-task-host", "reviewed_head_sha": head, "decision_reason": "bounded Delta Review completed"}
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", delete=False) as handle:
+                json.dump(report, handle, ensure_ascii=False); report_path = handle.name
+            subprocess.run(["node", str(ROOT / "workflows/lib/code-review-store.js"), "--record", report_path], cwd=self.cwd, env={**os.environ, "EDGE_AGENT_CODE_REVIEW_STATE_ROOT": str(self.run_dir / "code-review-state")}, text=True, capture_output=True, check=True)
+            return report["review_id"] + "::" + head
+        except (OSError, subprocess.CalledProcessError, TypeError, ValueError):
+            return None
+        finally:
+            if report_path:
+                try:
+                    Path(report_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def run_light(self, context: dict[str, Any]) -> dict[str, Any]:
         feedback = ""
         for round_number in range(1, self.max_rounds + 1):
@@ -664,9 +696,12 @@ class HostOrchestrator:
         if tests.get("status") not in ("passed", "not_run"):
             return {"passed": False, "tier": "full", "error": "tests_failed", "test_summary": tests}
 
+        previous_open: list[dict[str, Any]] = []
+        parent_report_key: str | None = None
         for round_number in range(1, self.max_rounds + 1):
-            claude_prompt = self.review_prompt(context, verification, tests, plan, "claude")
-            agy_prompt = self.review_prompt(context, verification, tests, plan, "antigravity")
+            delta_suffix = f"\n[DELTA REVIEW 이전 open finding]\n{delta_prompt_context(previous_open)}\n2라운드 이후 목록 밖 신규 이슈는 Critical 증거가 없으면 deferred로 기록하라." if round_number > 1 else ""
+            claude_prompt = self.review_prompt(context, verification, tests, plan, "claude") + delta_suffix
+            agy_prompt = self.review_prompt(context, verification, tests, plan, "antigravity") + delta_suffix
             with ThreadPoolExecutor(max_workers=2) as pool:
                 claude_future = pool.submit(self.claude_call, f"full-review-round-{round_number}", claude_prompt, True)
                 agy_future = pool.submit(self.dispatch, "agy", f"antigravity-review-round-{round_number}", agy_prompt, "review", context)
@@ -686,7 +721,18 @@ class HostOrchestrator:
             else:
                 issues.extend({**issue, "source": "antigravity"} for issue in agy_review.get("issues", []) if issue.get("blocking", False))
                 issues.extend({"description": f"Antigravity check failed: {check.get('name', 'unknown')}", "evidence": check.get("evidence", ""), "blocking": True, "source": "antigravity"} for check in agy_review.get("checks", []) if check.get("status") not in {"passed", "pass"})
-            if not issues and not claude_review.get("hasBlockingIssue") and not agy_review.get("hasBlockingIssue"):
+            deferred: list[dict[str, Any]] = []
+            if round_number > 1:
+                diff_text = str(verification.get("diff", verification.get("content", "")))
+                allowed = []
+                for issue in issues:
+                    location = str(issue.get("location") or issue.get("file") or "")
+                    if any(location and location in str(item.get("location") or item.get("anchor") or "") for item in previous_open) or is_critical_delta_issue(issue, diff_text, tests): allowed.append(issue)
+                    else: deferred.append({**issue, "blocking": False, "status": "deferred"})
+                issues = allowed
+            parent_report_key = self.record_delta_report(round_number, issues, deferred, parent_report_key)
+            previous_open = [*issues, *deferred]
+            if not issues:
                 return {"passed": True, "tier": "full", "round": round_number, "wasEscapeHatch": baseline}
             if round_number == self.max_rounds:
                 return {"passed": False, "tier": "full", "error": "changes_required", "round": round_number, "blocking_issues": issues}

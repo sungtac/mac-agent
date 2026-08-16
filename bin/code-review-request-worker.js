@@ -16,6 +16,7 @@ const {
 } = require('../workflows/lib/code-review-request-queue.js')
 const {
   DEFAULT_STATE_ROOT,
+  findLatestReviewByPr,
   recordReviewReport,
 } = require('../workflows/lib/code-review-store.js')
 
@@ -132,7 +133,7 @@ function prepareIsolatedWorktree(repositoryRoot, request) {
   }
 }
 
-function createPrompt(request, repositoryRoot, provider, evidence = null) {
+function createPrompt(request, repositoryRoot, provider, evidence = null, deltaContext = '') {
   const role = provider === 'codex' ? '1차 코드 리뷰어' : '독립 승인 검증자'
   const headlessContract = provider === 'agy'
     ? `
@@ -160,6 +161,11 @@ ${evidence.files}
 3. 정확성, 보안, 성능, 견고성, 유지보수성을 검토한다.
 4. 실제 근거가 있는 문제만 issues에 기록한다. 테스트를 실행하지 않았으면 통과했다고 말하지 않는다.
 5. 파일을 수정하거나 commit, merge, 외부 전송을 하지 않는다.`
+  const deltaText = deltaContext ? `
+[DELTA TRACKING 참고자료]
+이전 라운드 참고자료이며 신규 이슈를 억제하지 않는다.
+${deltaContext}
+` : ''
   return `너는 ${role}다. 실제 파일을 수정하지 말고 읽기 전용으로만 검토해.
 ${headlessContract}
 
@@ -173,6 +179,7 @@ ${headlessContract}
 ${procedure}
 
 ${evidenceText}
+${deltaText}
 
 응답은 반드시 JSON 객체 하나만 반환한다:
 {
@@ -261,7 +268,7 @@ function normalizeFinding(source, issue, index, headSha) {
   }
 }
 
-function buildReport(request, target, codex, antigravity) {
+function buildReport(request, target, codex, antigravity, delta = {}) {
   const findings = [
     ...(codex.issues || []).map((issue, index) => normalizeFinding('codex', issue, index, target.head)),
     ...(antigravity.issues || []).map((issue, index) => normalizeFinding('antigravity', issue, index, target.head)),
@@ -274,8 +281,13 @@ function buildReport(request, target, codex, antigravity) {
     target: {
       scope: request.target.scope,
       head_sha: target.head,
+      repository: request.target.repository,
+      pull_request: request.target.pull_request,
       paths: [],
     },
+    round: delta.round || 1,
+    parent_report_key: delta.parent_report_key || null,
+    pr_number: request.target.pull_request,
     findings,
     checks: [
       { name: 'target-head-sha', status: 'passed' },
@@ -317,9 +329,13 @@ async function runWorkerOnce(options = {}) {
     return { ok: true, outcome: 'dry_run', review_id: request.review_id, head_sha: target.head }
   }
 
+  const previous = findLatestReviewByPr(request.target.pull_request, request.target.repository, stateRoot)
+  const reviewEvidence = buildReviewEvidence(target.root, target.head)
+  const deltaContext = previous ? JSON.stringify({ round: previous.round || 1, findings: (previous.findings || []).map((finding) => ({ id: finding.id, location: finding.location, title: finding.title, status: reviewEvidence.diff.includes(finding.location) ? 'open' : 'fixed' })) }, null, 2) : ''
+
   const prompts = {
-    codex: writePrompt(createPrompt(request, target.root, 'codex')),
-    agy: writePrompt(createPrompt(request, target.root, 'agy', buildReviewEvidence(target.root, target.head))),
+    codex: writePrompt(createPrompt(request, target.root, 'codex', null, deltaContext)),
+    agy: writePrompt(createPrompt(request, target.root, 'agy', reviewEvidence, deltaContext)),
   }
   try {
     const [codexRaw, antigravityRaw] = await Promise.all([
@@ -328,7 +344,7 @@ async function runWorkerOnce(options = {}) {
     ])
     const codex = parseProviderResult(codexRaw, 'codex')
     const antigravity = parseProviderResult(antigravityRaw, 'antigravity')
-    const report = buildReport(request, target, codex, antigravity)
+    const report = buildReport(request, target, codex, antigravity, { round: previous ? (previous.round || 1) + 1 : 1, parent_report_key: previous ? `${previous.review_id}::${previous.target.head_sha}` : null })
     const persisted = recordReviewReport(report, stateRoot)
     completeReviewRequest(request.review_id, {
       status: report.status,

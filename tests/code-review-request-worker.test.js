@@ -92,6 +92,22 @@ test('execute runs Codex and Antigravity, persists the report, and completes the
   assert.equal(report.approval.reviewed_head_sha, headSha)
 })
 
+test('links later reviews by PR and includes fixed/open delta context', async () => {
+  const first = queueRequest()
+  recordReviewRequest(first, queueRoot)
+  await runWorkerOnce({ queueRoot, stateRoot, repositoryRoot: repo, repositoryName: 'acme/widget', execute: true, dispatch: fakeDispatch })
+  const second = queueRequest({ review_id: 'github-' + 'c'.repeat(64), target: { repository: 'acme/widget', pull_request: 9, head_sha: headSha, scope: 'diff' } })
+  recordReviewRequest(second, queueRoot)
+  let prompt = ''
+  const result = await runWorkerOnce({ queueRoot, stateRoot, repositoryRoot: repo, repositoryName: 'acme/widget', execute: true, dispatch: (tool, promptFile) => {
+    if (tool === 'agy') prompt = fs.readFileSync(promptFile, 'utf8')
+    return { hasBlockingIssue: false, issues: [], notes: '' }
+  } })
+  assert.equal(result.status, 'AI_APPROVED')
+  assert.match(prompt, /DELTA TRACKING 참고자료/)
+  assert.equal(findLatestReview(second.review_id, stateRoot).round, 2)
+})
+
 test('head SHA mismatch fails closed and leaves the request pending', async () => {
   const request = queueRequest({ target: { repository: 'acme/widget', pull_request: 9, head_sha: 'wrong-sha', scope: 'diff' } })
   recordReviewRequest(request, queueRoot)

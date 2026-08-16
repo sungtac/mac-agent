@@ -410,6 +410,61 @@ fi
 EXTRACTED="$(printf '%s' "$RAW_OUTPUT" | python3 -c '
 import sys, json
 
+INVALID = object()
+
+def parse_candidate(candidate):
+    """Return a parsed candidate, repairing only invalid escapes in strings."""
+    try:
+        return json.loads(candidate)
+    except Exception:
+        pass
+
+    try:
+        return json.loads(candidate, strict=False)
+    except Exception:
+        pass
+
+    # In a string, remove one backslash only when an odd-length run is
+    # followed by a non-standard JSON escape character.  Even-length runs
+    # already encode literal backslashes correctly and must remain unchanged.
+    standard_escapes = set("\"\\\\/bfnrtu")
+    sanitized = []
+    in_string = False
+    i = 0
+    while i < len(candidate):
+        ch = candidate[i]
+        if not in_string:
+            sanitized.append(ch)
+            if ch == "\"":
+                in_string = True
+            i += 1
+            continue
+
+        if ch != "\\":
+            sanitized.append(ch)
+            if ch == "\"":
+                in_string = False
+            i += 1
+            continue
+
+        run_start = i
+        while i < len(candidate) and candidate[i] == "\\":
+            i += 1
+        run_length = i - run_start
+        next_char = candidate[i] if i < len(candidate) else ""
+        if run_length % 2 == 1 and next_char not in standard_escapes:
+            sanitized.extend("\\" * (run_length - 1))
+        else:
+            sanitized.extend("\\" * run_length)
+        if next_char == "\"" and run_length % 2 == 1:
+            sanitized.append(next_char)
+            i += 1
+
+    try:
+        return json.loads("".join(sanitized), strict=False)
+    except Exception:
+        return INVALID
+
 def find_last_valid_json(text):
     # Tool CLIs (codex/agy) print banner/reasoning noise around the answer,
     # sometimes wrapped in markdown code fences, sometimes pretty-printed
@@ -469,11 +524,9 @@ def find_last_valid_json(text):
                     break
         if end_found is not None:
             candidate = text[start:end_found + 1]
-            try:
-                json.loads(candidate)
-                candidates.append(candidate)
-            except Exception:
-                pass
+            parsed = parse_candidate(candidate)
+            if parsed is not INVALID:
+                candidates.append(json.dumps(parsed, ensure_ascii=False))
             start = end_found + 1
         else:
             start += 1

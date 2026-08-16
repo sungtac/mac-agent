@@ -80,14 +80,16 @@ def safe_rel(path: str) -> str:
     return path.replace("\\", "/").lstrip("./")
 
 
-def status_files(cwd: Path) -> list[str]:
+def _status_files_and_untracked(cwd: Path) -> tuple[list[str], set[str]]:
     code, out, _ = git(cwd, "status", "--porcelain=v1", "-z")
     if code != 0:
-        return []
+        return [], set()
     result: list[str] = []
+    untracked: set[str] = set()
     for item in out.split("\0"):
         if not item:
             continue
+        status = item[:2]
         value = item[3:] if len(item) >= 3 else item
         if " -> " in value:
             value = value.rsplit(" -> ", 1)[-1]
@@ -116,7 +118,17 @@ def status_files(cwd: Path) -> list[str]:
         }:
             continue
         result.append(normalized)
-    return sorted(set(result))
+        if status == "??":
+            untracked.add(normalized)
+    return sorted(set(result)), untracked
+
+
+def status_files(cwd: Path) -> list[str]:
+    return _status_files_and_untracked(cwd)[0]
+
+
+def untracked_files(cwd: Path) -> set[str]:
+    return _status_files_and_untracked(cwd)[1]
 
 
 def head_state(cwd: Path) -> dict[str, Any]:
@@ -452,15 +464,40 @@ def snapshot(cwd: Path, task: str, run_dir: Path, explicit_full: bool) -> dict[s
     code, diff, err = git(cwd, "diff", "--binary", "HEAD", timeout=60)
     if code != 0:
         diff = f"git diff failed: {err}"
-    chunks = [diff]
-    for path in state["files_changed"]:
-        if not (cwd / path).is_file() or "diff --" in diff and path in diff:
-            continue
-        try:
-            content = (cwd / path).read_text(encoding="utf-8", errors="replace")[:MAX_FILE_CHARS]
-        except OSError:
-            continue
-        chunks.append(f"\n=== UNTRACKED OR UNDIFFED FILE: {path} ===\n{content}")
+    changed_untracked = untracked_files(cwd)
+    relevant_path_file = run_dir / "relevant-files.txt"
+    try:
+        relevant = [safe_rel(line.strip()) for line in relevant_path_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    except (OSError, UnicodeError):
+        relevant = task_paths(task)
+    if not relevant:
+        relevant = task_paths(task)
+    relevant = list(dict.fromkeys(relevant))
+
+    relevant_diff = ""
+    if relevant:
+        relevant_code, relevant_diff, relevant_err = git(cwd, "diff", "--binary", "HEAD", "--", *relevant, timeout=60)
+        if relevant_code != 0:
+            relevant_diff = f"git diff failed: {relevant_err}"
+
+    def untracked_chunks(paths: list[str]) -> list[str]:
+        chunks: list[str] = []
+        for path in paths:
+            if path not in changed_untracked or not (cwd / path).is_file():
+                continue
+            try:
+                content = (cwd / path).read_text(encoding="utf-8", errors="replace")[:MAX_FILE_CHARS]
+            except OSError:
+                continue
+            chunks.append(f"\n=== UNTRACKED OR UNDIFFED FILE: {path} ===\n{content}")
+        return chunks
+
+    chunks = []
+    if relevant_diff:
+        chunks.append(relevant_diff)
+    chunks.extend(untracked_chunks(relevant))
+    chunks.append(diff)
+    chunks.extend(untracked_chunks(state["files_changed"]))
     combined = "".join(chunks)
     truncated = len(combined) > MAX_DIFF_CHARS
     if truncated:

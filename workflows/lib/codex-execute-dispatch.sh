@@ -200,8 +200,8 @@ fi
 
 AUDIT_TAIL="$(printf '%s' "$RAW_OUTPUT" | tail -c 4000)"
 record_audit "provider_completed" 0 "$AUDIT_TAIL"
-python3 - "$RAW_OUTPUT" << 'PYEOF'
+printf '%s' "$RAW_OUTPUT" | python3 -c '
 import json, sys
-raw = sys.argv[1]
+raw = sys.stdin.read()
 print(json.dumps({"ok": True, "message": raw[-4000:]}, ensure_ascii=False))
-PYEOF
+'
