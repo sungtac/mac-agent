@@ -1521,6 +1521,68 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(events, [])
         self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "pending_antigravity_triage")
 
+    def test_watch_self_heal_merge_records_watch_entry(self):
+        state = {"self_heal_watch": {}}
+        health._watch_self_heal_merge(state, "fp1", "codex", "execution_error", "abc123", current=1000.0)
+        watch = state["self_heal_watch"]["fp1"]
+        self.assertEqual(watch["role"], "codex")
+        self.assertEqual(watch["code"], "execution_error")
+        self.assertEqual(watch["merge_commit"], "abc123")
+        self.assertEqual(watch["deadline"], 1000.0 + health.SELF_HEAL_RECURRENCE_WINDOW_SECONDS)
+
+    def test_check_self_heal_recurrence_matches_role_and_code_within_window(self):
+        state = {"self_heal_watch": {
+            "fp1": {"role": "codex", "code": "execution_error", "merge_commit": "abc123", "watched_at": 1000.0, "deadline": 1000.0 + 3600},
+        }}
+        self.assertEqual(health._check_self_heal_recurrence(state, "codex", "execution_error", current=1500.0), "fp1")
+        self.assertIsNone(health._check_self_heal_recurrence(state, "codex", "execution_error", current=1000.0 + 3600 + 1))
+        self.assertIsNone(health._check_self_heal_recurrence(state, "claude", "execution_error", current=1500.0))
+
+    def test_revert_self_heal_commit_success(self):
+        with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=0, stdout="", stderr="")):
+            result = health._revert_self_heal_commit("abc123")
+        self.assertEqual(result["status"], "reverted")
+
+    def test_revert_self_heal_commit_conflict_aborts_and_reports(self):
+        def run(command, **kwargs):
+            if "revert" in command and "--abort" not in command:
+                return mock.Mock(returncode=1, stdout="", stderr="conflict")
+            if "--abort" in command:
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            raise AssertionError(command)
+        with mock.patch.object(health.subprocess, "run", side_effect=run):
+            result = health._revert_self_heal_commit("abc123")
+        self.assertEqual(result["status"], "conflict")
+
+    def test_blacklist_fingerprint_and_check(self):
+        state = {"self_heal_blacklist": {}}
+        self.assertFalse(health._is_blacklisted(state, "fp1"))
+        health._blacklist_fingerprint(state, "fp1", "recurrence within 1h", current=2000.0)
+        self.assertTrue(health._is_blacklisted(state, "fp1"))
+        self.assertEqual(state["self_heal_blacklist"]["fp1"]["reason"], "recurrence within 1h")
+
+    def test_poll_once_detects_recurrence_and_blacklists_on_clean_revert(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "codex.log"
+            log.write_text("", encoding="utf-8")
+            original_targets = health.TARGETS
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            try:
+                state = {
+                    "initialized": True, "offsets": {"codex": 0}, "pending": {}, "alerted": {},
+                    "incidents": {}, "usage_watch": {},
+                    "self_heal_watch": {"fp1": {"role": "codex", "code": "execution_error", "merge_commit": "abc123", "watched_at": 1000.0, "deadline": 1000.0 + 3600}},
+                    "self_heal_blacklist": {},
+                }
+                log.write_text("[codex] 처리 실패 task=task-9 error=provider subprocess crashed\n", encoding="utf-8")
+                with mock.patch.object(health, "_revert_self_heal_commit", return_value={"status": "reverted", "detail": "ok"}):
+                    alerts = health.poll_once(state, now=1500)
+                self.assertTrue(health._is_blacklisted(state, "fp1"))
+                self.assertNotIn("fp1", state["self_heal_watch"])
+                self.assertTrue(any(a.get("code") == "self_heal_recurrence" for a in alerts))
+            finally:
+                health.TARGETS = original_targets
+
 
 if __name__ == "__main__":
     unittest.main()

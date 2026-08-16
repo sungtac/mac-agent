@@ -72,6 +72,7 @@ SELF_HEAL_FINGERPRINT_ATTEMPT_LIMIT = 2
 SELF_HEAL_FINGERPRINT_WINDOW_SECONDS = 86400
 SELF_HEAL_GLOBAL_MERGE_LIMIT = 3
 SELF_HEAL_GLOBAL_MERGE_WINDOW_SECONDS = 86400
+SELF_HEAL_RECURRENCE_WINDOW_SECONDS = 3600
 ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
@@ -1961,6 +1962,47 @@ def _record_self_heal_merge(state: dict, current: float) -> None:
     ]
 
 
+def _watch_self_heal_merge(state: dict, fingerprint: str, role: str, code: str, merge_commit: str, current: float) -> None:
+    state.setdefault("self_heal_watch", {})[fingerprint] = {
+        "role": role, "code": code, "merge_commit": merge_commit,
+        "watched_at": current, "deadline": current + SELF_HEAL_RECURRENCE_WINDOW_SECONDS,
+    }
+
+
+def _check_self_heal_recurrence(state: dict, role: str, code: str, current: float) -> str | None:
+    for fingerprint, watch in state.get("self_heal_watch", {}).items():
+        if watch.get("role") != role or watch.get("code") != code:
+            continue
+        if current <= float(watch.get("deadline", 0)):
+            return fingerprint
+    return None
+
+
+def _revert_self_heal_commit(commit: str) -> dict:
+    revert = subprocess.run(
+        ["/usr/bin/git", "-C", str(SOURCE_REPO), "revert", "--no-edit", commit],
+        capture_output=True, text=True, check=False,
+    )
+    if revert.returncode == 0:
+        return {"status": "reverted", "detail": "revert succeeded"}
+    abort = subprocess.run(
+        ["/usr/bin/git", "-C", str(SOURCE_REPO), "revert", "--abort"],
+        capture_output=True, text=True, check=False,
+    )
+    detail = (revert.stderr or "")[-500:]
+    if abort.returncode != 0:
+        return {"status": "error", "detail": f"revert failed and abort also failed: {detail}"}
+    return {"status": "conflict", "detail": detail}
+
+
+def _blacklist_fingerprint(state: dict, fingerprint: str, reason: str, current: float) -> None:
+    state.setdefault("self_heal_blacklist", {})[fingerprint] = {"reason": reason, "blacklisted_at": current}
+
+
+def _is_blacklisted(state: dict, fingerprint: str) -> bool:
+    return fingerprint in state.get("self_heal_blacklist", {})
+
+
 def _enter_manual_mode(state: dict, current: float) -> None:
     state["self_heal_manual_mode"] = {"active": True, "since": current}
 
@@ -2036,6 +2078,24 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
             code = classify_line(line, role=role)
             _record_diagnostic_observation(state, line, role, code)
             if code:
+                recurrence_fingerprint = _check_self_heal_recurrence(state, role, code, current)
+                if recurrence_fingerprint is not None:
+                    watch = state["self_heal_watch"].get(recurrence_fingerprint, {})
+                    revert_result = _revert_self_heal_commit(str(watch.get("merge_commit", "")))
+                    if revert_result["status"] == "reverted":
+                        _blacklist_fingerprint(state, recurrence_fingerprint, "recurrence within 1h post-merge", current)
+                    state["self_heal_watch"].pop(recurrence_fingerprint, None)
+                    alerts.append({
+                        "kind": "escalation_notice",
+                        "role": role, "code": "self_heal_recurrence",
+                        "fingerprint": f"recurrence:{recurrence_fingerprint}:{int(current)}",
+                        "message": (
+                            f"[Roda 재발 감지] incident={recurrence_fingerprint}의 자동치유 병합 이후 "
+                            f"같은 문제(role={role}, code={code})가 다시 발생했습니다. "
+                            f"revert 결과: {revert_result['status']}."
+                        ),
+                        "detail": revert_result["detail"],
+                    })
                 _record_metric(state, code, current)
                 event = _usage_event(role, code, line, now=current) if code in RESOURCE_RECOVERY_CODES else {
                     "provider": role,
