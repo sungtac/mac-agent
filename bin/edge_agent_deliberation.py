@@ -407,6 +407,57 @@ class DeliberationStore:
         notes = payload.get("human_notes") or []
         return max((int(note.get("seq", 0)) for note in notes), default=0)
 
+    def _chat_index_id(self, chat_id: object) -> str:
+        digest = hashlib.sha256(str(chat_id).encode("utf-8")).hexdigest()[:32]
+        return f"chat-index-{digest}"
+
+    def record_active_chat_session(self, chat_id: object, session_id: str) -> None:
+        session_id = _safe_session(session_id)
+        index_id = self._chat_index_id(chat_id)
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            self._write(index_id, {
+                "schema": "edge_agent.deliberation_chat_index.v1",
+                "session_id": session_id,
+                "updated_epoch": time.time(),
+            })
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def active_session_for_chat(self, chat_id: object) -> str | None:
+        index_id = self._chat_index_id(chat_id)
+        pointer = self._read(index_id)
+        if not pointer:
+            return None
+        session_id = str(pointer.get("session_id") or "")
+        if not session_id:
+            return None
+        payload = self._read(session_id)
+        if payload is None:
+            return None
+        if payload.get("human_notes_closed") is True:
+            return None
+        if payload.get("status") in {"barrier_ready", "failed"}:
+            return None
+        return session_id
+
+    def close_human_notes(self, session_id: str) -> dict[str, Any]:
+        session_id = _safe_session(session_id)
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                return {}
+            payload["human_notes_closed"] = True
+            self._write(session_id, payload)
+            return payload
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._read(_safe_session(session_id))
 

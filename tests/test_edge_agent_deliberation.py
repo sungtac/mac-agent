@@ -151,6 +151,39 @@ class DeliberationStoreTests(unittest.TestCase):
                 self.assertEqual(store.snapshot(session_id)["results"]["codex"]["observed_human_seq"], 0)
                 self.assertEqual(store.latest_human_seq("delib-does-not-exist"), 0)
 
+    def test_active_session_for_chat_tracks_pointer_and_closes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                chat_id = -1003952617795
+                session_id = session_id_for_telegram(chat_id, 220)
+                self.assertIsNone(store.active_session_for_chat(chat_id))
+                store.start(session_id, "회의")
+                store.record_active_chat_session(chat_id, session_id)
+                self.assertEqual(store.active_session_for_chat(chat_id), session_id)
+                store.close_human_notes(session_id)
+                self.assertIsNone(store.active_session_for_chat(chat_id))
+
+    def test_active_session_for_chat_is_none_once_barrier_ready(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                chat_id = -1003952617795
+                session_id = session_id_for_telegram(chat_id, 221)
+                store.start(session_id, "회의", mode="conversation")
+                store.record_active_chat_session(chat_id, session_id)
+                self.assertEqual(store.active_session_for_chat(chat_id), session_id)
+                for role in ("claude", "codex", "antigravity", "roda"):
+                    store.record(session_id, role, status="completed", summary=f"{role} 의견")
+                self.assertEqual(store.snapshot(session_id)["status"], "barrier_ready")
+                self.assertIsNone(store.active_session_for_chat(chat_id))
+
     def test_render_includes_unreflected_human_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
