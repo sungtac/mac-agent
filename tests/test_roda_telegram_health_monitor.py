@@ -294,6 +294,67 @@ class RodaHealthMonitorTests(unittest.TestCase):
         }}
         self.assertEqual(health._check_ack_timeouts(state, current=1299.0), [])
 
+    def test_resolve_incident_ack_completion_flips_acked_to_completed(self):
+        state = {"incidents": {
+            "fp1": {
+                "role": "codex", "escalation_stage": "acked",
+                "routed_role": "codex", "ack_task_id": "task-1",
+                "completion_deadline": 90000.0,
+            },
+        }}
+        health._resolve_incident_ack_completion(state, "codex", "task-1", current=2000.0)
+        incident = state["incidents"]["fp1"]
+        self.assertEqual(incident["escalation_stage"], "completed")
+        self.assertEqual(incident["completed_at"], 2000.0)
+
+    def test_resolve_incident_ack_completion_ignores_unrelated_task_id(self):
+        state = {"incidents": {
+            "fp1": {
+                "role": "codex", "escalation_stage": "acked",
+                "routed_role": "codex", "ack_task_id": "task-1",
+                "completion_deadline": 90000.0,
+            },
+        }}
+        health._resolve_incident_ack_completion(state, "codex", "task-OTHER", current=2000.0)
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "acked")
+
+    def test_poll_once_completes_incident_when_ack_task_finishes(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "codex.log"
+            log.write_text("", encoding="utf-8")
+            original_targets = health.TARGETS
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            try:
+                state = {
+                    "initialized": True, "offsets": {"codex": 0}, "pending": {},
+                    "alerted": {}, "incidents": {
+                        "fp1": {
+                            "role": "codex", "escalation_stage": "acked",
+                            "routed_role": "codex", "ack_task_id": "task-1",
+                            "completion_deadline": 90000.0,
+                        },
+                    },
+                }
+                log.write_text("[codex] 처리 완료 task=task-1\n", encoding="utf-8")
+                health.poll_once(state, now=2000)
+                self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "completed")
+            finally:
+                health.TARGETS = original_targets
+
+    def test_check_completion_timeouts_dispatches_antigravity_escalation(self):
+        state = {"incidents": {
+            "fp1": {
+                "role": "codex", "code": "execution_error", "escalation_stage": "acked",
+                "routed_role": "codex", "ack_task_id": "task-1",
+                "completion_deadline": 90000.0, "detail": "boom",
+            },
+        }}
+        events = health._check_completion_timeouts(state, current=90001.0)
+        self.assertEqual(len(events), 1)
+        incident = state["incidents"]["fp1"]
+        self.assertEqual(incident["escalation_stage"], "pending_antigravity_triage")
+        self.assertEqual(incident["escalation_reason"], "no_completion")
+
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
         self.assertEqual(health.classify_line("[claude] You've hit your session limit · resets 7pm"), "session_limited")
@@ -627,14 +688,14 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 self.assertEqual(health.poll_once(state, now=2), [])
                 self.assertEqual(len([item for item in state["usage_watch"].values() if item["status"] == "waiting_for_probe"]), 1)
                 with log.open("a", encoding="utf-8") as handle:
-                    handle.write("처리 시작 chat=test\n처리 완료 chat=test duration=1s\n")
+                    handle.write("처리 시작 task=usage-recovery-1 chat=test\n처리 완료 task=usage-recovery-1 chat=test duration=1s\n")
                 self.assertEqual([event["code"] for event in health.poll_once(state, now=3)], ["usage_recovered"])
                 self.assertEqual(state["metrics"]["classified"]["usage_limited"], 2)
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write("provider error quota exhausted; weekly window\n")
                 health.poll_once(state, now=4)
                 with log.open("a", encoding="utf-8") as handle:
-                    handle.write("처리 시작 chat=stale\n처리 완료 chat=stale duration=1s\n")
+                    handle.write("처리 시작 task=usage-recovery-2 chat=stale\n처리 완료 task=usage-recovery-2 chat=stale duration=1s\n")
                 self.assertEqual(health.poll_once(state, now=4 + health.USAGE_WATCH_TTL_SECONDS + 1), [])
                 self.assertTrue(any(item["status"] == "expired" for item in state["usage_watch"].values()))
             finally:

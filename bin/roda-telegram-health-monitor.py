@@ -1586,6 +1586,33 @@ def _check_ack_timeouts(state: dict, current: float) -> list[dict]:
     return events
 
 
+def _resolve_incident_ack_completion(state: dict, role: str, task_id: str, current: float) -> None:
+    if not task_id:
+        return
+    for incident in state.get("incidents", {}).values():
+        if (
+            incident.get("routed_role") == role
+            and incident.get("escalation_stage") == "acked"
+            and incident.get("ack_task_id") == task_id
+        ):
+            incident["escalation_stage"] = "completed"
+            incident["completed_at"] = current
+
+
+def _check_completion_timeouts(state: dict, current: float) -> list[dict]:
+    events = []
+    for fingerprint, incident in state.get("incidents", {}).items():
+        if incident.get("escalation_stage") != "acked":
+            continue
+        try:
+            deadline = float(incident.get("completion_deadline", 0))
+        except (TypeError, ValueError):
+            continue
+        if current >= deadline:
+            events.append(_dispatch_antigravity_escalation(state, fingerprint, incident, "no_completion", current))
+    return events
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -1603,6 +1630,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     _prune_alerted(state, current)
     _expire_usage_watches(state, current)
     alerts.extend(_check_ack_timeouts(state, current))
+    alerts.extend(_check_completion_timeouts(state, current))
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
     alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
@@ -1640,6 +1668,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
                 if task_id:
                     role_pending.pop(task_id, None)
                     _resolve_task_incidents(state, role, task_id, current)
+                    _resolve_incident_ack_completion(state, role, task_id, current)
                 else:
                     # Compatibility for logs written before task correlation:
                     # an unkeyed terminal line may close only an unkeyed start.
