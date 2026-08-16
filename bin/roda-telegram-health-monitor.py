@@ -2098,7 +2098,7 @@ def _attempt_self_heal(event: dict, state: dict) -> bool:
         remaining_budget = SELF_HEAL_TOTAL_TIMEOUT_SECONDS - elapsed
         if remaining_budget <= 0:
             break
-        if not worktree.exists():
+        if not _self_heal_worktree_in_progress(worktree):
             REPAIR_ROOT.mkdir(parents=True, exist_ok=True)
             subprocess.run(
                 ["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "add", "--detach", str(worktree), "HEAD"],
@@ -2115,6 +2115,11 @@ def _attempt_self_heal(event: dict, state: dict) -> bool:
             break
         cli_result = _run_implementer_cli(implementer_role, prompt, worktree, timeout=per_attempt_timeout)
         if cli_result["status"] != "success":
+            incident.setdefault("self_heal_attempts_log", []).append({
+                "role": implementer_role, "status": cli_result["status"],
+                "changed_files": cli_result["changed_files"], "review_count": 0,
+                "tests_passed": None, "merge_commit": None,
+            })
             continue
 
         post_implement_remaining = SELF_HEAL_TOTAL_TIMEOUT_SECONDS - (time.time() - started_at)
@@ -2175,6 +2180,10 @@ def _attempt_self_heal(event: dict, state: dict) -> bool:
         return True
 
     return _fall_back_to_escalation()
+
+
+def _self_heal_worktree_in_progress(worktree: Path) -> bool:
+    return worktree.exists()
 
 
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:

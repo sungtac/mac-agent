@@ -656,6 +656,35 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(incident["routed_at"], 1000.0)
         self.assertEqual(incident["ack_deadline"], 1000.0 + health.ROUTING_ACK_TIMEOUT_SECONDS)
 
+    def test_attempt_self_heal_logs_every_implementer_attempt_not_just_success(self):
+        state = {
+            "self_heal_blacklist": {}, "self_heal_manual_mode": {"active": False, "since": None},
+            "self_heal_attempts": {}, "self_heal_merges": [], "self_heal_watch": {}, "usage_watch": {},
+            "incidents": {"fp1": {"escalation_stage": "auto_repairing"}},
+        }
+        event = {"fingerprint": "fp1", "role": "codex", "code": "execution_error", "detail": "boom"}
+        results_by_role = {
+            "codex": {"status": "no_change", "diff": None, "changed_files": [], "exit_code": 0, "timed_out": False, "stderr_tail": ""},
+            "claude": {"status": "apply_failed", "diff": None, "changed_files": [], "exit_code": 1, "timed_out": False, "stderr_tail": "bad patch"},
+            "antigravity": {"status": "timeout", "diff": None, "changed_files": [], "exit_code": None, "timed_out": True, "stderr_tail": ""},
+        }
+        def fake_cli(role, prompt, worktree, **kwargs):
+            return results_by_role[role]
+        with mock.patch.object(health, "_run_implementer_cli", side_effect=fake_cli), \
+                mock.patch.object(health.time, "time", return_value=1000.0):
+            result = health._attempt_self_heal(event, state)
+        self.assertFalse(result)
+        log = state["incidents"]["fp1"]["self_heal_attempts_log"]
+        self.assertEqual([entry["role"] for entry in log], ["codex", "claude", "antigravity"])
+        self.assertEqual([entry["status"] for entry in log], ["no_change", "apply_failed", "timeout"])
+
+    def test_self_heal_worktree_in_progress_detects_existing_worktree(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td) / "fp1"
+            self.assertFalse(health._self_heal_worktree_in_progress(worktree))
+            worktree.mkdir()
+            self.assertTrue(health._self_heal_worktree_in_progress(worktree))
+
     def test_attempt_self_heal_resets_worktree_between_failed_and_next_implementer(self):
         state = {
             "self_heal_blacklist": {}, "self_heal_manual_mode": {"active": False, "since": None},
