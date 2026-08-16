@@ -116,7 +116,9 @@ Codex·Antigravity 합의: ①은 AI가 스스로 도는 자동 재시도 루프
 
 ### 범위 밖 (하지 말 것)
 
-- PR 코멘트 자동 게시 UI, 기준선 실측 자동화, 롤백 트리거 자동화는 이번 구현에 포함하지 않는다.
+- 기준선 실측 자동화, 롤백 트리거 자동화는 이번 구현에 포함하지 않는다. (PR 코멘트 자동 게시 UI는
+  2026-08-17 커밋 0146e8e로 별도 구현 완료 — `formatDeltaSummaryComment()` + sticky 댓글 게시,
+  `gh pr comment --edit-last --create-if-none` 사용.)
 - 기존 REQUIRED_FINDING_FIELDS나 상태기계(REQUESTED→...→SUPERSEDED)의 의미 자체를 바꾸지 않는다.
 
 ### 완료 기준
