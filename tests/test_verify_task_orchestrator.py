@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -484,9 +484,9 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 result = runner.run_full({}, verification)
 
             self.assertTrue(result["passed"])
-            self.assertEqual(dispatch.call_count, 1)
-            self.assertEqual(dispatch.call_args.args[:2], ("agy", "antigravity-review-round-1"))
-            claude_call.assert_called_once()
+            self.assertEqual(dispatch.call_count, 5)
+            self.assertTrue(all(call.args[0] == "agy" for call in dispatch.call_args_list))
+            self.assertEqual(claude_call.call_count, 2)
 
     def test_run_full_enters_independent_reviews_without_codex_self_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -500,8 +500,120 @@ class VerifyTaskOrchestratorTests(unittest.TestCase):
                 result = runner.run_full({}, verification)
 
             self.assertTrue(result["passed"])
-            self.assertEqual(dispatch.call_count, 1)
-            self.assertEqual(dispatch.call_args.args[:2], ("agy", "antigravity-review-round-1"))
+            self.assertEqual(dispatch.call_count, 5)
+            self.assertTrue(all(call.args[0] == "agy" for call in dispatch.call_args_list))
+
+    def test_normalize_issue_supports_antigravity_and_claude_fields(self):
+        agy = MODULE.normalize_issue({
+            "file": "a.py", "anchor": "a.py:parse", "symbol": "parse",
+            "issue": "bad parse", "evidence": "e" * 20, "required_fix": "fix",
+            "required_test": "test_parse", "blocking": True, "confidence": 91,
+        }, "antigravity:shallow-bugs")
+        claude = MODULE.normalize_issue({"file": "a.py", "location": "a.py:parse", "description": "bad parse", "confidence": 88}, "claude:reverify")
+        self.assertEqual(agy["source"], "antigravity:shallow-bugs")
+        self.assertEqual(agy["angle"], "shallow-bugs")
+        self.assertEqual(agy["location"], "a.py:parse")
+        self.assertEqual(claude["issue"], "bad parse")
+        self.assertIn("claude:reverify", claude["origin_sources"])
+
+    def test_run_full_fallback_issues_use_normalized_schema(self):
+        required_keys = {
+            "source", "file", "location", "symbol", "line_start", "line_end",
+            "issue", "description", "evidence", "required_fix", "required_test",
+            "blocking", "confidence", "origin_sources",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            verification = {"test_summary": {"status": "passed"}}
+            failed_reviews = [{"dispatchFailed": True, "dispatchFailureReason": "simulated"}] * 5
+            with patch.object(runner, "dispatch", side_effect=failed_reviews), patch.object(
+                runner, "claude_call", side_effect=[{"ok": True}, {"ok": False}]
+            ), patch.object(runner, "record_delta_report", return_value=None):
+                result = runner.run_full({}, verification)
+            self.assertFalse(result["passed"])
+            self.assertEqual(len(result["blocking_issues"]), 2)
+            for issue in result["blocking_issues"]:
+                self.assertTrue(required_keys.issubset(issue))
+
+    def test_run_full_ignores_failed_angle_and_low_confidence_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            review = {"hasBlockingIssue": False, "issues": [], "checks": []}
+            def dispatch(tool, role, prompt, schema, context=None):
+                if "shallow-bugs" in role:
+                    return {"dispatchFailed": True, "dispatchFailureReason": "simulated"}
+                return {"hasBlockingIssue": True, "issues": [{"file": "a.py", "symbol": "f", "issue": "low", "confidence": 79}], "checks": []}
+            with patch.object(runner, "dispatch", side_effect=dispatch), patch.object(
+                runner, "claude_call", side_effect=[{"ok": True, **review}, {"ok": True, **review}]
+            ), patch.object(runner, "record_delta_report", return_value=None):
+                result = runner.run_full({}, {"test_summary": {"status": "passed"}})
+            self.assertTrue(result["passed"])
+            self.assertEqual(len(runner.history[0]["failed_angles"]), 1)
+
+    def test_merge_candidates_deduplicates_and_limits_to_twenty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = MODULE.HostOrchestrator("task", Path(directory), Path(directory) / ".verify", 1, False)
+            candidates = []
+            for index in range(25):
+                candidates.append(MODULE.normalize_issue({"file": "same.py", "symbol": "f" if index < 2 else str(index), "issue": "same" if index < 2 else str(index), "confidence": 100}, "antigravity:shallow-bugs"))
+            selected, omitted = runner.merge_candidates(candidates)
+            self.assertEqual(len(selected), 20)
+            self.assertEqual(omitted, 4)
+            self.assertEqual(len(selected[0]["origin_sources"]), 1)
+
+    def test_merge_candidates_keeps_claude_exploration_without_confidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = MODULE.HostOrchestrator("task", Path(directory), Path(directory) / ".verify", 1, False)
+            claude = MODULE.normalize_issue({"file": "a.py", "symbol": "f", "issue": "candidate"}, "claude:explore")
+            selected, omitted = runner.merge_candidates([claude])
+            self.assertEqual(omitted, 0)
+            self.assertEqual(selected[0]["source"], "claude:explore")
+
+    def test_merge_candidates_preserves_sources_and_reverify_bounds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = MODULE.HostOrchestrator("task", Path(directory), Path(directory) / ".verify", 1, False)
+            duplicate_a = MODULE.normalize_issue({"file": "a.py", "symbol": "f", "issue": "same", "confidence": 90, "evidence": "a"}, "antigravity:shallow-bugs")
+            duplicate_b = MODULE.normalize_issue({"file": "a.py", "symbol": "f", "issue": "same", "confidence": 95, "evidence": "b"}, "antigravity:doc-comment-sync")
+            candidates, omitted = runner.merge_candidates([duplicate_a, duplicate_b] + [
+                MODULE.normalize_issue({"file": f"{index}.py", "symbol": "f", "issue": str(index), "confidence": 80}, "claude:explore")
+                for index in range(25)
+            ])
+            self.assertEqual(len(candidates), 20)
+            self.assertEqual(omitted, 6)
+            self.assertEqual(candidates[0]["origin_sources"], ["antigravity:shallow-bugs", "antigravity:doc-comment-sync"])
+            prompt = runner.reverify_prompt({}, {}, {}, "", candidates, omitted, "")
+            self.assertIn("26개 후보 중 상위 20개만 재검증 대상", prompt)
+
+            long_evidence = MODULE.normalize_issue({"file": "long.py", "symbol": "f", "issue": "long", "confidence": 99, "evidence": "x" * 2000}, "claude:explore")
+            bounded_prompt = runner.reverify_prompt({}, {}, {}, "", [long_evidence], 0, "")
+            self.assertNotIn("x" * 1001, bounded_prompt)
+
+    def test_angle_review_converts_unexpected_dispatch_exception_to_partial_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            with patch.object(runner, "dispatch", side_effect=RuntimeError("provider crashed")):
+                result = runner.run_angle_review({}, {}, {}, "", "shallow-bugs", "", 1)
+            self.assertTrue(result["dispatchFailed"])
+            self.assertIn("provider crashed", result["dispatchFailureReason"])
+
+    def test_process_replaces_invalid_utf8_from_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            runner = MODULE.HostOrchestrator("task", repo, repo / ".verify", 1, False)
+            process = MagicMock()
+            process.communicate.return_value = ("safe output", None)
+            process.returncode = 0
+            with patch.object(MODULE.subprocess, "Popen", return_value=process) as popen:
+                code, output = runner.process(["provider"], "review", 10, "provider")
+            self.assertEqual((code, output), (0, "safe output"))
+            self.assertEqual(popen.call_args.kwargs["errors"], "replace")
 
 
 if __name__ == "__main__":

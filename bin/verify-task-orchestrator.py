@@ -42,6 +42,46 @@ HEADLESS_RULE_CHARS = 6000
 CRITICAL_SECURITY_RE = re.compile(r"security|secret|credential|token|auth|permission|injection|xss|csrf|취약|보안", re.I)
 CRITICAL_MIGRATION_RE = re.compile(r"migration|migrations|schema|database|db/|\.sql$|마이그레이션|스키마", re.I)
 TEST_FAILURE_RE = re.compile(r"test.*fail|failed.*test|regression|회귀|실패 로그|assert", re.I)
+AGY_REVIEW_ANGLES = (
+    "rules-compliance",
+    "shallow-bugs",
+    "git-history-scope",
+    "historical-regression",
+    "doc-comment-sync",
+)
+
+
+def normalize_issue(raw_issue: dict[str, Any], source: str) -> dict[str, Any]:
+    """Normalize provider findings without changing the Delta Review schema."""
+    raw = raw_issue if isinstance(raw_issue, dict) else {}
+    description = str(raw.get("description") or raw.get("issue") or raw.get("title") or "").strip()
+    evidence = str(raw.get("evidence") or raw.get("snippet") or "").strip()
+    confidence = raw.get("confidence", 0)
+    try:
+        confidence = max(0, min(100, int(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0
+    normalized: dict[str, Any] = {
+        "source": source,
+        "file": raw.get("file") or "",
+        "location": raw.get("location") or raw.get("anchor") or "",
+        "symbol": raw.get("symbol") or "",
+        "line_start": raw.get("line_start", raw.get("lineStart")),
+        "line_end": raw.get("line_end", raw.get("lineEnd")),
+        "issue": description,
+        "description": description,
+        "evidence": evidence,
+        "required_fix": raw.get("required_fix") or raw.get("remediation") or "",
+        "required_test": raw.get("required_test") or raw.get("requiredTest") or raw.get("test") or "",
+        "blocking": bool(raw.get("blocking", raw.get("hasBlockingIssue", False))),
+        "confidence": confidence,
+        "origin_sources": list(raw.get("origin_sources", [])) if isinstance(raw.get("origin_sources"), list) else [source],
+    }
+    if source.startswith("antigravity:"):
+        normalized["angle"] = source.split(":", 1)[1]
+    if source not in normalized["origin_sources"]:
+        normalized["origin_sources"].append(source)
+    return normalized
 
 
 def detect_scope_violation(diff: dict[str, Any], context: dict[str, Any]) -> list[str]:
@@ -463,6 +503,7 @@ class HostOrchestrator:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
+                errors="replace",
                 start_new_session=True,
             )
             try:
@@ -727,6 +768,93 @@ class HostOrchestrator:
 5. 지시한 변경 내용과 실제 diff가 대응하는가? 지시서가 말한 파일이 그대로고 엉뚱한 파일만 바뀌어 있으면 blocking이다."""
         return f"""[agent profile v1.0.0]\n영구 역할: {identity}\n현재 persona: {persona}\n{scope_notice}\n{checklist}\n\n너는 독립 코드 리뷰어다. 점수는 매기지 않는다. 다른 리뷰어의 의견을 전제로 삼지 말고 제공된 패키지만 검토한다. 테스트를 다시 실행하지 마라.\n\n[원 작업]\n{self.task}\n[최종 계획]\n{plan or '(계획 없음)'}\n[허용 파일/적용 규칙]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\n문제가 있으면 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test, blocking을 포함한다.\nJSON으로만 답해: {{\"hasBlockingIssue\":false,\"issues\":[],\"checks\":[{{\"name\":\"test-summary\",\"status\":\"passed\",\"evidence\":\"하네스 요약 확인\"}}]}}"""
 
+    def historical_regression_context(self) -> str:
+        """Read recent reports from the global store without touching the per-run store."""
+        state_root = os.environ.get("EDGE_AGENT_CODE_REVIEW_STATE_ROOT")
+        if not state_root:
+            if os.environ.get("EDGE_AGENT_STATE_ROOT"):
+                state_root = str(Path(os.environ["EDGE_AGENT_STATE_ROOT"]) / "code-review")
+            elif os.environ.get("EDGE_AGENT_RUNTIME_ROOT"):
+                state_root = str(Path(os.environ["EDGE_AGENT_RUNTIME_ROOT"]) / "state" / "code-review")
+            else:
+                state_root = str(Path.home() / ".edge-agent" / "state" / "code-review")
+        try:
+            reports = []
+            for path in (Path(state_root) / "reports").glob("*.json"):
+                report = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(report, dict) and report.get("target", {}).get("repository") == str(self.cwd):
+                    reports.append((path.stat().st_mtime, report))
+            reports.sort(key=lambda item: item[0], reverse=True)
+            summaries = [json.dumps({"review_id": r.get("review_id"), "round": r.get("round"), "status": r.get("status"), "findings": r.get("findings", [])}, ensure_ascii=False)[:2000] for _, r in reports[:5]]
+            return "\n".join(summaries) if summaries else "과거 리포트 없음"
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return "과거 리포트 없음"
+
+    def angle_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, angle: str, delta_suffix: str) -> str:
+        focus = {
+            "rules-compliance": "CLAUDE.md/저장소 규칙, config/agent-profile-contract.json, 허용 파일 범위를 검사하라.",
+            "shallow-bugs": "correctness/security/robustness 관점의 얕은 버그를 검사하라.",
+            "git-history-scope": "git 이력과 기존 구현 의도를 고려해 범위 밖 변경을 검사하라.",
+            "historical-regression": "과거 code-review-store 리포트와 현재 diff를 비교해 회귀를 검사하라.",
+            "doc-comment-sync": "주석·문서·기존 계약과 실제 구현의 불일치를 검사하라.",
+        }[angle]
+        history = self.historical_regression_context() if angle == "historical-regression" else ""
+        history_section = "[전역 과거 리포트(읽기 전용)]\n" + history if history else ""
+        return self.review_prompt(context, diff, test_summary, plan, "antigravity") + f"""
+[Antigravity 고정 관점: {angle}]
+{focus}
+{history_section}
+각 issue에는 반드시 confidence(0~100 정수)를 포함하라. confidence가 80 미만인 issue는 후보에서 제외된다.
+JSON으로만 답해: {{"hasBlockingIssue":false,"issues":[{{"file":"","location":"","symbol":"","line_start":0,"line_end":0,"issue":"","evidence":"","required_fix":"","required_test":"","blocking":false,"confidence":0}}],"checks":[]}}
+{delta_suffix}"""
+
+    def run_angle_review(self, context: dict[str, Any], verification: dict[str, Any], tests: dict[str, Any], plan: str, angle: str, delta_suffix: str, round_number: int) -> dict[str, Any]:
+        try:
+            return self.dispatch(
+                "agy",
+                f"antigravity-{angle}-round-{round_number}",
+                self.angle_review_prompt(context, verification, tests, plan, angle, delta_suffix),
+                "review",
+                context,
+            )
+        except Exception as exc:
+            return {
+                "dispatchFailed": True,
+                "dispatchFailureReason": f"{type(exc).__name__}: {exc}",
+            }
+
+    @staticmethod
+    def _candidate_key(issue: dict[str, Any]) -> tuple[str, str, str]:
+        description = re.sub(r"\s+", " ", str(issue.get("description") or issue.get("issue") or "").strip().lower())
+        return (str(issue.get("file") or ""), str(issue.get("symbol") or ""), description)
+
+    def merge_candidates(self, candidates: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+        merged: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for candidate in candidates:
+            key = self._candidate_key(candidate)
+            if key not in merged:
+                merged[key] = {**candidate, "origin_sources": list(candidate.get("origin_sources", [candidate.get("source")]))}
+                continue
+            current = merged[key]
+            current["confidence"] = max(current.get("confidence", 0), candidate.get("confidence", 0))
+            current["origin_sources"] = list(dict.fromkeys(current.get("origin_sources", []) + candidate.get("origin_sources", [])))
+            if len(str(candidate.get("evidence", ""))) > len(str(current.get("evidence", ""))):
+                current["evidence"] = candidate.get("evidence", "")
+        ordered = sorted(merged.values(), key=lambda item: item.get("confidence", 0), reverse=True)
+        return ordered[:20], max(0, len(ordered) - 20)
+
+    def reverify_prompt(self, context: dict[str, Any], diff: dict[str, Any], tests: dict[str, Any], plan: str, candidates: list[dict[str, Any]], omitted: int, delta_suffix: str) -> str:
+        candidate_text = json.dumps([{**item, "evidence": str(item.get("evidence", ""))[:1000]} for item in candidates], ensure_ascii=False)
+        limit_note = f"{len(candidates) + omitted}개 후보 중 상위 20개만 재검증 대상" if omitted else "모든 후보가 재검증 대상"
+        return f"""{self.review_prompt(context, diff, tests, plan, 'claude')}
+[Claude 2차 재검증]
+1차 Claude와 Antigravity 후보를 실제 diff/관련 코드/테스트 요약과 대조해 실제 blocking인지 최종 판정하라.
+{limit_note}
+[후보 목록]
+{candidate_text}
+최종 JSON의 issues에는 실제로 blocking이라고 판정한 항목만 blocking=true로 반환하라. Antigravity 후보를 승격하면 origin_sources를 보존하라.
+{delta_suffix}"""
+
     def research_prompt(self, context: dict[str, Any], focus: str, instruction: str) -> str:
         persona = "red-team" if focus == "risks-tests" else "researcher"
         return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: {persona}\n\n코드를 수정하거나 계획을 확정하지 말고 아래 초점만 조사한다. 저장소 컨텍스트에 없는 사실은 추측하지 않는다. 구성·자격·기능이 없다고 판단할 때는 반드시 하네스의 discovery_evidence 또는 searched_scopes를 결과에 포함한다.\n[작업]\n{self.task}\n[컨텍스트]\n{self.context_text(context)}\n[조사 초점]\n{instruction}\n\nJSON으로만 답해: {{"focus":"{focus}","findings":"","evidence":[{{"source":"","fact":"","relevance":""}}],"discovery_evidence":[],"risks":[],"testImplications":[]}}"""
@@ -829,26 +957,36 @@ class HostOrchestrator:
         for round_number in range(1, self.max_rounds + 1):
             delta_suffix = f"\n[DELTA REVIEW 이전 open finding]\n{delta_prompt_context(previous_open)}\n2라운드 이후 목록 밖 신규 이슈는 Critical 증거가 없으면 deferred로 기록하라." if round_number > 1 else ""
             claude_prompt = self.review_prompt(context, verification, tests, plan, "claude") + delta_suffix
-            agy_prompt = self.review_prompt(context, verification, tests, plan, "antigravity") + delta_suffix
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                claude_future = pool.submit(self.claude_call, f"full-review-round-{round_number}", claude_prompt, True)
-                agy_future = pool.submit(self.dispatch, "agy", f"antigravity-review-round-{round_number}", agy_prompt, "review", context)
-                claude_review = claude_future.result()
-                agy_review = agy_future.result()
-            HARNESS.write_json(self.run_dir / "review-claude.json", claude_review)
-            HARNESS.write_json(self.run_dir / "review-antigravity.json", agy_review)
-            self.history.append({"tier": "full", "round": round_number, "claude_review": claude_review, "antigravity_review": agy_review, "test_summary": tests})
-            issues: list[dict[str, Any]] = []
-            if not claude_review.get("ok") or "hasBlockingIssue" not in claude_review:
-                issues.append({"description": "Claude 독립 리뷰 결과를 받지 못함", "blocking": True, "source": "claude"})
-            else:
-                issues.extend({**issue, "source": "claude"} for issue in claude_review.get("issues", []) if issue.get("blocking", False))
-                issues.extend({"description": f"Claude check failed: {check.get('name', 'unknown')}", "evidence": check.get("evidence", ""), "blocking": True, "source": "claude"} for check in claude_review.get("checks", []) if check.get("status") not in {"passed", "pass"})
-            if agy_review.get("dispatchFailed") or "hasBlockingIssue" not in agy_review:
-                issues.append({"description": "Antigravity 독립 리뷰 결과를 받지 못함", "blocking": True, "source": "antigravity"})
-            else:
-                issues.extend({**issue, "source": "antigravity"} for issue in agy_review.get("issues", []) if issue.get("blocking", False))
-                issues.extend({"description": f"Antigravity check failed: {check.get('name', 'unknown')}", "evidence": check.get("evidence", ""), "blocking": True, "source": "antigravity"} for check in agy_review.get("checks", []) if check.get("status") not in {"passed", "pass"})
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                claude_future = pool.submit(self.claude_call, f"full-review-round-{round_number}-explore", claude_prompt, True)
+                agy_futures = {
+                    angle: pool.submit(self.run_angle_review, context, verification, tests, plan, angle, delta_suffix, round_number)
+                    for angle in AGY_REVIEW_ANGLES
+                }
+                claude_explore = claude_future.result()
+                agy_reviews = {angle: future.result() for angle, future in agy_futures.items()}
+            HARNESS.write_json(self.run_dir / "review-claude-explore.json", claude_explore)
+            HARNESS.write_json(self.run_dir / "review-antigravity.json", agy_reviews)
+            failed_angles = {angle: review.get("dispatchFailureReason", "invalid agy_review response") for angle, review in agy_reviews.items() if review.get("dispatchFailed") or "hasBlockingIssue" not in review or not isinstance(review.get("issues", []), list)}
+            agy_candidates = [normalize_issue(issue, f"antigravity:{angle}") for angle, review in agy_reviews.items() if angle not in failed_angles for issue in review.get("issues", []) if isinstance(issue, dict) and normalize_issue(issue, f"antigravity:{angle}").get("confidence", 0) >= 80]
+            claude_candidates = []
+            if claude_explore.get("ok") and isinstance(claude_explore.get("issues"), list):
+                claude_candidates = [normalize_issue(issue, "claude:explore") for issue in claude_explore.get("issues", []) if isinstance(issue, dict)]
+            candidates, omitted = self.merge_candidates([*claude_candidates, *agy_candidates])
+            reverify = self.claude_call(f"full-review-round-{round_number}-reverify", self.reverify_prompt(context, verification, tests, plan, candidates, omitted, delta_suffix), True)
+            HARNESS.write_json(self.run_dir / "review-claude.json", reverify)
+            HARNESS.write_json(self.run_dir / "review-claude-reverify.json", reverify)
+            self.history.append({"tier": "full", "round": round_number, "claude_explore": claude_explore, "claude_reverify": reverify, "antigravity_reviews": agy_reviews, "failed_angles": failed_angles, "test_summary": tests})
+            issues: list[dict[str, Any]] = [normalize_issue(issue, "claude:reverify") for issue in reverify.get("issues", []) if isinstance(issue, dict) and issue.get("blocking", False)] if reverify.get("ok") and isinstance(reverify.get("issues"), list) else [normalize_issue({"description": "Claude 2차 재검증 결과를 받지 못함", "blocking": True}, "claude:reverify")]
+            for issue in issues:
+                source_candidates = [candidate for candidate in candidates if self._candidate_key(candidate) == self._candidate_key(issue)]
+                if source_candidates:
+                    issue["origin_sources"] = list(dict.fromkeys([*issue.get("origin_sources", []), *(source for candidate in source_candidates for source in candidate.get("origin_sources", []))]))
+                issue["evidence"] = str(issue.get("evidence", ""))[:1000]
+            if reverify.get("ok") and isinstance(reverify.get("checks"), list):
+                issues.extend(normalize_issue({"description": f"Claude check failed: {check.get('name', 'unknown')}", "evidence": check.get("evidence", ""), "blocking": True}, "claude:reverify") for check in reverify["checks"] if isinstance(check, dict) and check.get("status") not in {"passed", "pass"})
+            if not any(angle not in failed_angles for angle in AGY_REVIEW_ANGLES):
+                issues.append(normalize_issue({"description": "Antigravity 독립 리뷰 결과를 받지 못함", "blocking": True}, "antigravity"))
             deferred: list[dict[str, Any]] = []
             if round_number > 1:
                 diff_text = str(verification.get("diff", verification.get("content", "")))
