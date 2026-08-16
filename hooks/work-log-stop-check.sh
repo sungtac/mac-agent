@@ -98,7 +98,8 @@ EDIT_WRITE_COUNT="$(jq -r '
   select(.type=="assistant") | .message.content[]? | select(.type=="tool_use") |
   select(.name == "Edit" or .name == "Write") | .name
 ' "$TRANSCRIPT_PATH" 2>/dev/null | wc -l | tr -d ' ')"
-[ "${EDIT_WRITE_COUNT:-0}" -lt 1 ] && exit 0
+VERIFY_GATE_PASS_COUNT="$(grep -cE 'finalVerdict.{0,8}passed.{0,8}true' "$TRANSCRIPT_PATH" 2>/dev/null || true)"
+[ "${EDIT_WRITE_COUNT:-0}" -lt 1 ] && [ "${VERIFY_GATE_PASS_COUNT:-0}" -lt 1 ] && exit 0
 
 mkdir -p "$STATE_DIR"
 find "$STATE_DIR" -type f -mtime +14 -delete 2>/dev/null || true
