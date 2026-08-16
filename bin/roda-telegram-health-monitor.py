@@ -44,7 +44,7 @@ USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SEC
 # docs/roda-parallel-recovery-improvement-plan.md P2.
 PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SECONDS", str(24 * 60 * 60)))
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
-STATE_SCHEMA_VERSION = 6
+STATE_SCHEMA_VERSION = 7
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 # Stage-1..3 escalation reuses the existing timing constants verbatim (design
 # doc 2026-08-16-roda-role-escalation-design.md, 확정 사항 1-3) — these are
@@ -68,6 +68,10 @@ PROTECTED_PATH_SUBSTRINGS = (
 )
 SELF_HEAL_LOW_RISK_MAX_LINES = 30
 SELF_HEAL_LOW_RISK_MAX_FILES = 3
+SELF_HEAL_FINGERPRINT_ATTEMPT_LIMIT = 2
+SELF_HEAL_FINGERPRINT_WINDOW_SECONDS = 86400
+SELF_HEAL_GLOBAL_MERGE_LIMIT = 3
+SELF_HEAL_GLOBAL_MERGE_WINDOW_SECONDS = 86400
 ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
@@ -272,6 +276,11 @@ def _default_state() -> dict:
         "pending_merges": {},
         "incidents": {},
         "deliberation_history": [],
+        "self_heal_attempts": {},
+        "self_heal_merges": [],
+        "self_heal_manual_mode": {"active": False, "since": None},
+        "self_heal_watch": {},
+        "self_heal_blacklist": {},
         "main_dirty_alerted_at": 0,
         "metrics": {
             "classified": {},
@@ -364,6 +373,11 @@ def _migrate_state(payload: object) -> dict:
             state["metrics"][key] = 0
     for incident in state.get("incidents", {}).values():
         incident.setdefault("escalation_stage", None)
+    state.setdefault("self_heal_attempts", {})
+    state.setdefault("self_heal_merges", [])
+    state.setdefault("self_heal_manual_mode", {"active": False, "since": None})
+    state.setdefault("self_heal_watch", {})
+    state.setdefault("self_heal_blacklist", {})
     _coalesce_specific_incidents(state)
     return state
 
@@ -1917,6 +1931,42 @@ def _merge_allowed(review_count: int, low_risk: bool, tests_passed: bool) -> boo
     if review_count >= 2:
         return True
     return review_count >= 1 and low_risk
+
+
+def _check_fingerprint_attempt_budget(state: dict, fingerprint: str, current: float) -> bool:
+    attempts = state.setdefault("self_heal_attempts", {}).get(fingerprint, [])
+    recent = [t for t in attempts if current - float(t) <= SELF_HEAL_FINGERPRINT_WINDOW_SECONDS]
+    return len(recent) < SELF_HEAL_FINGERPRINT_ATTEMPT_LIMIT
+
+
+def _record_self_heal_attempt(state: dict, fingerprint: str, current: float) -> None:
+    attempts = state.setdefault("self_heal_attempts", {}).setdefault(fingerprint, [])
+    attempts.append(current)
+    state["self_heal_attempts"][fingerprint] = [
+        t for t in attempts if current - float(t) <= SELF_HEAL_FINGERPRINT_WINDOW_SECONDS
+    ]
+
+
+def _check_global_merge_budget(state: dict, current: float) -> bool:
+    merges = state.setdefault("self_heal_merges", [])
+    recent = [t for t in merges if current - float(t) <= SELF_HEAL_GLOBAL_MERGE_WINDOW_SECONDS]
+    return len(recent) < SELF_HEAL_GLOBAL_MERGE_LIMIT
+
+
+def _record_self_heal_merge(state: dict, current: float) -> None:
+    merges = state.setdefault("self_heal_merges", [])
+    merges.append(current)
+    state["self_heal_merges"] = [
+        t for t in merges if current - float(t) <= SELF_HEAL_GLOBAL_MERGE_WINDOW_SECONDS
+    ]
+
+
+def _enter_manual_mode(state: dict, current: float) -> None:
+    state["self_heal_manual_mode"] = {"active": True, "since": current}
+
+
+def _manual_mode_active(state: dict) -> bool:
+    return bool(state.get("self_heal_manual_mode", {}).get("active"))
 
 
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:

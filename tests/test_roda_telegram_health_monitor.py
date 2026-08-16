@@ -85,7 +85,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
             },
         })
         canonical = health._fingerprint("claude", "auth_error", "")
-        self.assertEqual(state["schema_version"], 6)
+        self.assertEqual(state["schema_version"], 7)
         self.assertEqual(state["incidents"][canonical]["status"], "open")
         self.assertEqual(state["incidents"][canonical]["detail"], "latest")
         self.assertEqual(state["alerted"][canonical], 121)
@@ -106,12 +106,50 @@ class RodaHealthMonitorTests(unittest.TestCase):
                 },
             },
         })
-        self.assertEqual(state["schema_version"], 6)
+        self.assertEqual(state["schema_version"], 7)
         self.assertEqual(state["deliberation_history"], [])
         self.assertIsNone(state["incidents"]["f1"]["escalation_stage"])
 
     def test_default_state_has_empty_deliberation_history(self):
         self.assertEqual(health._default_state()["deliberation_history"], [])
+
+    def test_migration_adds_self_heal_state_fields_and_bumps_schema_v7(self):
+        state = health._migrate_state({"schema_version": 6})
+        self.assertEqual(state["schema_version"], 7)
+        self.assertEqual(state["self_heal_attempts"], {})
+        self.assertEqual(state["self_heal_merges"], [])
+        self.assertEqual(state["self_heal_manual_mode"], {"active": False, "since": None})
+        self.assertEqual(state["self_heal_watch"], {})
+        self.assertEqual(state["self_heal_blacklist"], {})
+
+    def test_fingerprint_attempt_budget_allows_two_then_blocks(self):
+        state = {"self_heal_attempts": {}}
+        self.assertTrue(health._check_fingerprint_attempt_budget(state, "fp1", current=1000.0))
+        health._record_self_heal_attempt(state, "fp1", current=1000.0)
+        self.assertTrue(health._check_fingerprint_attempt_budget(state, "fp1", current=1001.0))
+        health._record_self_heal_attempt(state, "fp1", current=1001.0)
+        self.assertFalse(health._check_fingerprint_attempt_budget(state, "fp1", current=1002.0))
+
+    def test_fingerprint_attempt_budget_resets_after_24h_window(self):
+        state = {"self_heal_attempts": {"fp1": [1000.0, 1001.0]}}
+        self.assertFalse(health._check_fingerprint_attempt_budget(state, "fp1", current=1002.0))
+        self.assertTrue(health._check_fingerprint_attempt_budget(state, "fp1", current=1000.0 + 86400 + 1))
+
+    def test_global_merge_budget_allows_three_then_blocks(self):
+        state = {"self_heal_merges": []}
+        for _ in range(3):
+            self.assertTrue(health._check_global_merge_budget(state, current=1000.0))
+            health._record_self_heal_merge(state, current=1000.0)
+        self.assertFalse(health._check_global_merge_budget(state, current=1000.0))
+
+    def test_manual_mode_enters_and_stays_active_until_explicit_clear(self):
+        state = {"self_heal_manual_mode": {"active": False, "since": None}}
+        self.assertFalse(health._manual_mode_active(state))
+        health._enter_manual_mode(state, current=5000.0)
+        self.assertTrue(health._manual_mode_active(state))
+        self.assertEqual(state["self_heal_manual_mode"]["since"], 5000.0)
+        # No auto-expiry: still active far in the future.
+        self.assertTrue(health._manual_mode_active(state))
 
     def test_route_incident_sends_main_dirty_to_codex_and_others_to_their_own_role(self):
         self.assertEqual(health._route_incident("claude", "main_dirty"), "codex")
