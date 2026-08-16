@@ -1613,6 +1613,45 @@ def _check_completion_timeouts(state: dict, current: float) -> list[dict]:
     return events
 
 
+_TRIAGE_VERDICT_RE = re.compile(r"VERDICT:\s*(OWNER_DOWN|MISROUTED|JUDGMENT_HARD)", re.I)
+_TRIAGE_OWNER_RE = re.compile(r"OWNER:\s*(claude|codex|antigravity)", re.I)
+_TRIAGE_VALID_OWNERS = frozenset({"claude", "codex", "antigravity"})
+
+
+def _build_triage_prompt(incident: dict) -> str:
+    return (
+        "다음 인시던트를 감별하라. 정확히 아래 세 가지 중 하나로만 판정하고, "
+        "반드시 첫 줄에 `VERDICT: <값>` 형식으로 답하라 (값은 OWNER_DOWN, MISROUTED, "
+        "JUDGMENT_HARD 중 하나). MISROUTED인 경우 두 번째 줄에 반드시 "
+        "`OWNER: <claude|codex|antigravity>` 형식으로 실제 담당자를 지정하라.\n\n"
+        "- OWNER_DOWN: 라우팅된 담당자 자체가 다운/에러 상태라 응답할 수 없는 경우\n"
+        "- MISROUTED: 매핑이 틀렸고 실제 책임자가 다른 경우 (OWNER 지정 필수)\n"
+        "- JUDGMENT_HARD: 담당자는 멀쩡하지만 원인 판단이 어려운 경우\n\n"
+        f"인시던트 role: {incident.get('role')}\n"
+        f"감지 코드: {incident.get('code')}\n"
+        f"라우팅된 담당자: {incident.get('routed_role')}\n"
+        f"에스컬레이션 사유: {incident.get('escalation_reason')}\n"
+        f"재라우팅 횟수: {incident.get('reroute_count', 0)}\n"
+        f"세부: {incident.get('detail', '')}\n"
+    )
+
+
+def _parse_triage_verdict(text: str) -> dict:
+    match = _TRIAGE_VERDICT_RE.search(text or "")
+    if not match:
+        return {"verdict": "JUDGMENT_HARD", "owner": None}
+    verdict = match.group(1).upper()
+    if verdict != "MISROUTED":
+        return {"verdict": verdict, "owner": None}
+    owner_match = _TRIAGE_OWNER_RE.search(text or "")
+    if not owner_match:
+        return {"verdict": "JUDGMENT_HARD", "owner": None}
+    owner = owner_match.group(1).lower()
+    if owner not in _TRIAGE_VALID_OWNERS:
+        return {"verdict": "JUDGMENT_HARD", "owner": None}
+    return {"verdict": "MISROUTED", "owner": owner}
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []

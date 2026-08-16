@@ -1170,6 +1170,44 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertIsNone(suppressed)
         self.assertEqual(boundary["code"], "main_dirty")
 
+    def test_build_triage_prompt_includes_incident_context(self):
+        incident = {
+            "role": "codex", "code": "execution_error", "routed_role": "codex",
+            "escalation_reason": "no_ack", "detail": "boom", "reroute_count": 0,
+        }
+        prompt = health._build_triage_prompt(incident)
+        self.assertIn("codex", prompt)
+        self.assertIn("execution_error", prompt)
+        self.assertIn("no_ack", prompt)
+        self.assertIn("VERDICT:", prompt)
+        self.assertIn("OWNER_DOWN", prompt)
+        self.assertIn("MISROUTED", prompt)
+        self.assertIn("JUDGMENT_HARD", prompt)
+
+    def test_parse_triage_verdict_owner_down(self):
+        result = health._parse_triage_verdict("분석 결과\nVERDICT: OWNER_DOWN\n이유: codex 프로세스가 죽어있음")
+        self.assertEqual(result, {"verdict": "OWNER_DOWN", "owner": None})
+
+    def test_parse_triage_verdict_misrouted_with_owner(self):
+        result = health._parse_triage_verdict("VERDICT: MISROUTED\nOWNER: claude\n이유: 실제로는 claude 담당")
+        self.assertEqual(result, {"verdict": "MISROUTED", "owner": "claude"})
+
+    def test_parse_triage_verdict_judgment_hard(self):
+        result = health._parse_triage_verdict("VERDICT: JUDGMENT_HARD\n이유: 애매함")
+        self.assertEqual(result, {"verdict": "JUDGMENT_HARD", "owner": None})
+
+    def test_parse_triage_verdict_misrouted_without_owner_falls_back_to_judgment_hard(self):
+        result = health._parse_triage_verdict("VERDICT: MISROUTED\n이유: 담당자 불명")
+        self.assertEqual(result, {"verdict": "JUDGMENT_HARD", "owner": None})
+
+    def test_parse_triage_verdict_misrouted_with_invalid_owner_falls_back_to_judgment_hard(self):
+        result = health._parse_triage_verdict("VERDICT: MISROUTED\nOWNER: nobody\n이유: ?")
+        self.assertEqual(result, {"verdict": "JUDGMENT_HARD", "owner": None})
+
+    def test_parse_triage_verdict_unparseable_falls_back_to_judgment_hard(self):
+        self.assertEqual(health._parse_triage_verdict(""), {"verdict": "JUDGMENT_HARD", "owner": None})
+        self.assertEqual(health._parse_triage_verdict("정체불명의 응답"), {"verdict": "JUDGMENT_HARD", "owner": None})
+
 
 if __name__ == "__main__":
     unittest.main()
