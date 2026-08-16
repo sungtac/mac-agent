@@ -1360,6 +1360,40 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(result["status"], "provider_error")
         self.assertIn("boom", result["stderr_tail"])
 
+    def test_protected_files_block_low_risk_exception(self):
+        self.assertTrue(health._diff_touches_protected_files(["requirements.txt"]))
+        self.assertTrue(health._diff_touches_protected_files([".github/workflows/ci.yml"]))
+        self.assertTrue(health._diff_touches_protected_files(["bin/verify-task-orchestrator.py"]))
+        self.assertTrue(health._diff_touches_protected_files(["config/secrets/token.json"]))
+        self.assertTrue(health._diff_touches_protected_files(["deploy/launchd/com.macagent.plist"]))
+        self.assertFalse(health._diff_touches_protected_files(["bin/some-unrelated-helper.py"]))
+
+    def test_is_low_risk_diff_requires_small_size_and_no_protected_files(self):
+        small_diff = "\n".join(f"+line{i}" for i in range(10))
+        self.assertTrue(health._is_low_risk_diff(["bin/x.py", "tests/test_x.py"], small_diff))
+        big_diff = "\n".join(f"+line{i}" for i in range(40))
+        self.assertFalse(health._is_low_risk_diff(["bin/x.py"], big_diff))
+        self.assertFalse(health._is_low_risk_diff(["requirements.txt"], "+one line"))
+        self.assertFalse(health._is_low_risk_diff(["a.py", "b.py", "c.py", "d.py"], "+one line"))
+
+    def test_run_full_test_suite_reports_pass_and_fail(self):
+        with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=0)):
+            self.assertTrue(health._run_full_test_suite())
+        with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=1)):
+            self.assertFalse(health._run_full_test_suite())
+
+    def test_merge_allowed_requires_tests_passed_regardless_of_track(self):
+        self.assertFalse(health._merge_allowed(review_count=2, low_risk=False, tests_passed=False))
+        self.assertFalse(health._merge_allowed(review_count=1, low_risk=True, tests_passed=False))
+
+    def test_merge_allowed_default_track_needs_two_reviewers(self):
+        self.assertFalse(health._merge_allowed(review_count=1, low_risk=False, tests_passed=True))
+        self.assertTrue(health._merge_allowed(review_count=2, low_risk=False, tests_passed=True))
+
+    def test_merge_allowed_low_risk_track_permits_one_reviewer(self):
+        self.assertTrue(health._merge_allowed(review_count=1, low_risk=True, tests_passed=True))
+        self.assertFalse(health._merge_allowed(review_count=0, low_risk=True, tests_passed=True))
+
     def test_apply_triage_verdict_owner_down_notifies_human(self):
         state = {"incidents": {}, "deliberation_history": []}
         incident = {"role": "codex", "code": "execution_error", "reroute_count": 0}

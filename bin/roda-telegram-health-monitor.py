@@ -59,6 +59,15 @@ CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "
 # — it defaults on, matching CODEX_DIAGNOSIS_ENABLED's default.
 AGY_BIN = Path(os.environ.get("AGY_BIN", str(HOME / ".local" / "bin" / "agy")))
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
+PROTECTED_FILE_PATTERNS = frozenset({
+    "requirements.txt", "package.json", "Dockerfile", "go.mod", "Gemfile", "pyproject.toml",
+})
+PROTECTED_PATH_SUBSTRINGS = (
+    ".github/workflows/", "secret", "token", "credential", ".pem", ".key", "launchd",
+    "verify-task-orchestrator.py",
+)
+SELF_HEAL_LOW_RISK_MAX_LINES = 30
+SELF_HEAL_LOW_RISK_MAX_FILES = 3
 ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
@@ -1870,6 +1879,44 @@ def _run_implementer_cli(role: str, prompt: str, worktree: Path, *, timeout: int
         result_template["diff"] = diff_result.stdout
     result_template["status"] = "success"
     return result_template
+
+
+def _diff_touches_protected_files(changed_files: list[str]) -> bool:
+    for path in changed_files:
+        name = path.rsplit("/", 1)[-1]
+        if name in PROTECTED_FILE_PATTERNS:
+            return True
+        lowered = path.lower()
+        if any(substring in lowered for substring in PROTECTED_PATH_SUBSTRINGS):
+            return True
+    return False
+
+
+def _is_low_risk_diff(changed_files: list[str], diff_text: str | None) -> bool:
+    if _diff_touches_protected_files(changed_files):
+        return False
+    if len(changed_files) > SELF_HEAL_LOW_RISK_MAX_FILES:
+        return False
+    if diff_text is None:
+        return False
+    changed_lines = sum(1 for line in diff_text.splitlines() if line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
+    return changed_lines <= SELF_HEAL_LOW_RISK_MAX_LINES
+
+
+def _run_full_test_suite() -> bool:
+    result = subprocess.run(
+        [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-p", "test_*.py"],
+        capture_output=True, text=True, cwd=str(SOURCE_REPO), check=False,
+    )
+    return result.returncode == 0
+
+
+def _merge_allowed(review_count: int, low_risk: bool, tests_passed: bool) -> bool:
+    if not tests_passed:
+        return False
+    if review_count >= 2:
+        return True
+    return review_count >= 1 and low_risk
 
 
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
