@@ -1533,6 +1533,59 @@ def _route_incident_event(state: dict, event: dict, current: float) -> None:
     event["message"] += f"\n\n@{BOT_USERNAMES.get(routed_role, routed_role)} 확인 요망 — 이 인시던트의 담당자입니다."
 
 
+def _record_incident_ack(state: dict, role: str, pending_id: str, current: float) -> None:
+    """Any new pending task for the routed role counts as an ack.
+
+    The exact task_id the routed bot will use to answer an incident mention
+    cannot be predicted in advance (it is assigned by that bot's own bridge
+    when it starts handling the message), so ack detection is deliberately
+    coarse: activity from the routed role after ``routed_at`` and before
+    ``ack_deadline`` is treated as acknowledgement. Completion (Task 4) is
+    then tracked precisely against this specific ``pending_id``.
+    """
+    for incident in state.get("incidents", {}).values():
+        if incident.get("routed_role") != role or incident.get("escalation_stage") != "awaiting_ack":
+            continue
+        incident["escalation_stage"] = "acked"
+        incident["ack_task_id"] = pending_id
+        incident["acked_at"] = current
+        incident["completion_deadline"] = current + ROUTING_COMPLETION_TIMEOUT_SECONDS
+
+
+def _dispatch_antigravity_escalation(state: dict, fingerprint: str, incident: dict, reason: str, current: float) -> dict:
+    incident["escalation_stage"] = "pending_antigravity_triage"
+    incident["escalation_reason"] = reason
+    incident["escalated_at"] = current
+    reason_label = {"no_ack": "5분 내 담당자 응답 없음", "no_completion": "24시간 내 처리 완료 확인 없음"}.get(reason, reason)
+    return {
+        "kind": "escalation_notice",
+        "role": incident.get("role", "unknown"),
+        "code": "escalation",
+        "fingerprint": f"escalation:{fingerprint}:{reason}:{int(current)}",
+        "message": (
+            f"[Roda 에스컬레이션] incident={fingerprint} (role={incident.get('role')}, code={incident.get('code')})\n"
+            f"사유: {reason_label}\n세부: {incident.get('detail', '')}\n\n"
+            f"@{BOT_USERNAMES.get('antigravity', 'antigravity')} 판단 요청 — "
+            "담당자 다운/매핑 오류/판단 어려움 중 하나로 감별해 주세요."
+        ),
+        "detail": f"incident={fingerprint}; reason={reason}",
+    }
+
+
+def _check_ack_timeouts(state: dict, current: float) -> list[dict]:
+    events = []
+    for fingerprint, incident in state.get("incidents", {}).items():
+        if incident.get("escalation_stage") != "awaiting_ack":
+            continue
+        try:
+            deadline = float(incident.get("ack_deadline", 0))
+        except (TypeError, ValueError):
+            continue
+        if current >= deadline:
+            events.append(_dispatch_antigravity_escalation(state, fingerprint, incident, "no_ack", current))
+    return events
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -1549,6 +1602,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     state.setdefault("main_dirty_alerted_at", 0)
     _prune_alerted(state, current)
     _expire_usage_watches(state, current)
+    alerts.extend(_check_ack_timeouts(state, current))
     retry_events = list(state["delivery_retry"])
     state["delivery_retry"] = []
     alerts.extend(event for event in retry_events if event.get("code") not in IGNORED_RETRY_CODES)
@@ -1581,6 +1635,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
             if START_RE.search(line):
                 pending_id = task_id or f"legacy-{role}-{int(current)}-{line_index}"
                 role_pending[pending_id] = current
+                _record_incident_ack(state, role, pending_id, current)
             if DONE_RE.search(line):
                 if task_id:
                     role_pending.pop(task_id, None)

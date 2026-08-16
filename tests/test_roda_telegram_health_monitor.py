@@ -218,6 +218,82 @@ class RodaHealthMonitorTests(unittest.TestCase):
         health._route_incident_event(state, event, current=current)
         self.assertEqual(state["incidents"]["fp3"]["escalation_stage"], "awaiting_ack")
 
+    def test_record_incident_ack_flips_awaiting_ack_to_acked(self):
+        state = {"incidents": {
+            "fp1": {
+                "incident_id": "fp1", "role": "codex", "code": "execution_error",
+                "status": "open", "escalation_stage": "awaiting_ack",
+                "routed_role": "codex", "routed_at": 1000.0, "ack_deadline": 1300.0,
+            },
+        }}
+        health._record_incident_ack(state, "codex", "task-99", current=1050.0)
+        incident = state["incidents"]["fp1"]
+        self.assertEqual(incident["escalation_stage"], "acked")
+        self.assertEqual(incident["ack_task_id"], "task-99")
+        self.assertEqual(incident["acked_at"], 1050.0)
+        self.assertEqual(incident["completion_deadline"], 1050.0 + health.ROUTING_COMPLETION_TIMEOUT_SECONDS)
+
+    def test_record_incident_ack_ignores_unrelated_role_and_stage(self):
+        state = {"incidents": {
+            "fp1": {"role": "codex", "escalation_stage": "awaiting_ack", "routed_role": "claude"},
+            "fp2": {"role": "codex", "escalation_stage": "acked", "routed_role": "codex"},
+        }}
+        health._record_incident_ack(state, "codex", "task-99", current=1050.0)
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "awaiting_ack")
+        self.assertEqual(state["incidents"]["fp2"]["escalation_stage"], "acked")
+        self.assertNotIn("ack_task_id", state["incidents"]["fp2"])
+
+    def test_poll_once_acks_incident_when_routed_role_starts_new_task(self):
+        with tempfile.TemporaryDirectory() as td:
+            log = Path(td) / "codex.log"
+            log.write_text("", encoding="utf-8")
+            original_targets = health.TARGETS
+            health.TARGETS = {"codex": {"label": "present", "log": log}}
+            try:
+                state = {
+                    "initialized": True, "offsets": {"codex": 0}, "pending": {},
+                    "alerted": {}, "incidents": {
+                        "fp1": {
+                            "incident_id": "fp1", "role": "codex", "code": "execution_error",
+                            "status": "open", "escalation_stage": "awaiting_ack",
+                            "routed_role": "codex", "routed_at": 1000.0, "ack_deadline": 1300.0,
+                        },
+                    },
+                }
+                log.write_text("[codex] 처리 시작 task=task-1\n", encoding="utf-8")
+                health.poll_once(state, now=1050)
+                self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "acked")
+                self.assertEqual(state["incidents"]["fp1"]["ack_task_id"], "task-1")
+            finally:
+                health.TARGETS = original_targets
+
+    def test_check_ack_timeouts_dispatches_antigravity_escalation(self):
+        state = {"incidents": {
+            "fp1": {
+                "incident_id": "fp1", "role": "codex", "code": "execution_error",
+                "status": "open", "escalation_stage": "awaiting_ack",
+                "routed_role": "codex", "routed_at": 1000.0, "ack_deadline": 1300.0,
+                "detail": "boom",
+            },
+        }}
+        events = health._check_ack_timeouts(state, current=1301.0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["kind"], "escalation_notice")
+        self.assertIn(f"@{health.BOT_USERNAMES['antigravity']}", events[0]["message"])
+        incident = state["incidents"]["fp1"]
+        self.assertEqual(incident["escalation_stage"], "pending_antigravity_triage")
+        self.assertEqual(incident["escalation_reason"], "no_ack")
+        self.assertEqual(incident["escalated_at"], 1301.0)
+
+    def test_check_ack_timeouts_ignores_incidents_before_deadline(self):
+        state = {"incidents": {
+            "fp1": {
+                "role": "codex", "escalation_stage": "awaiting_ack",
+                "routed_role": "codex", "routed_at": 1000.0, "ack_deadline": 1300.0,
+            },
+        }}
+        self.assertEqual(health._check_ack_timeouts(state, current=1299.0), [])
+
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
         self.assertEqual(health.classify_line("[claude] You've hit your session limit · resets 7pm"), "session_limited")
