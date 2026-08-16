@@ -260,7 +260,7 @@ class DeliberationStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
-    def record(self, session_id: str, role: str, *, status: str, summary: str, evidence_refs: tuple[str, ...] = (), round_number: int | None = None) -> dict[str, Any]:
+    def record(self, session_id: str, role: str, *, status: str, summary: str, evidence_refs: tuple[str, ...] = (), round_number: int | None = None, observed_human_seq: int = 0) -> dict[str, Any]:
         if role == "gemma":
             role = "roda"
         if role not in EXPECTED_ROLES or status not in TERMINAL_STATUSES:
@@ -296,6 +296,7 @@ class DeliberationStore:
                 "evidence_refs": list(effective_evidence_refs),
                 "recorded_epoch": time.time(),
                 "round": current_round,
+                "observed_human_seq": max(0, int(observed_human_seq)),
             }
             signing_key = self._message_key()
             if signing_key is None:
@@ -401,6 +402,11 @@ class DeliberationStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def latest_human_seq(self, session_id: str) -> int:
+        payload = self.snapshot(session_id) or {}
+        notes = payload.get("human_notes") or []
+        return max((int(note.get("seq", 0)) for note in notes), default=0)
+
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._read(_safe_session(session_id))
 
@@ -492,6 +498,11 @@ class DeliberationStore:
                     f"- {message.from_role} -> {','.join(message.to)}; round={message.round}; "
                     f"purpose={message.purpose}; summary={_bounded(message.summary)}"
                 )
+        notes = payload.get("human_notes") or []
+        if notes:
+            lines.append("[사람 발언 — 아직 반영되지 않았을 수 있음]")
+            for note in notes:
+                lines.append(f"- seq={note.get('seq')}: {_bounded(note.get('text', ''))}")
         lines.append(f"bus_delivery={bus_ack_status}")
         lines.append(f"barrier_status={payload.get('status', 'not_observed')}; round={payload.get('round', 1)}")
         return "\n".join(lines)[:7200]

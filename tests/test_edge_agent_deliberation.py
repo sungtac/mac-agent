@@ -134,6 +134,37 @@ class DeliberationStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 store.append_human_note("delib-missing", "발언", telegram_message_id=1)
 
+    def test_record_stores_observed_human_seq_and_defaults_to_zero(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 210)
+                store.start(session_id, "회의")
+                store.append_human_note(session_id, "발언1", telegram_message_id=1)
+                self.assertEqual(store.latest_human_seq(session_id), 1)
+                store.record(session_id, "roda", status="completed", summary="roda 의견", observed_human_seq=store.latest_human_seq(session_id))
+                self.assertEqual(store.snapshot(session_id)["results"]["roda"]["observed_human_seq"], 1)
+                store.record(session_id, "codex", status="completed", summary="codex 의견")
+                self.assertEqual(store.snapshot(session_id)["results"]["codex"]["observed_human_seq"], 0)
+                self.assertEqual(store.latest_human_seq("delib-does-not-exist"), 0)
+
+    def test_render_includes_unreflected_human_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 211)
+                store.start(session_id, "회의")
+                store.append_human_note(session_id, "중간에 끼어든 발언", telegram_message_id=5)
+                rendered = store.render(session_id)
+                self.assertIn("seq=1", rendered)
+                self.assertIn("중간에 끼어든 발언", rendered)
+
     def test_runtime_result_is_signed_when_key_file_is_configured(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
