@@ -1563,6 +1563,68 @@ def _route_incident_event(state: dict, event: dict, current: float) -> None:
     event["message"] += f"\n\n@{BOT_USERNAMES.get(routed_role, routed_role)} 확인 요망 — 이 인시던트의 담당자입니다."
 
 
+def _backfill_legacy_incidents(state: dict, current: float) -> list[dict]:
+    candidates = [
+        incident for incident in state.get("incidents", {}).values()
+        if incident.get("status") in {"open", "reopened"}
+        and incident.get("escalation_stage") is None
+    ]
+    candidates.sort(key=lambda incident: float(incident.get("first_seen_at", 0)))
+    alerts = []
+    for incident in candidates:
+        role = incident.get("role", "unknown")
+        code = incident.get("code", "unknown")
+        fingerprint = incident["incident_id"]
+        detail = incident.get("detail", "")
+        header = (
+            "[Roda 백필] 담당자 라우팅 도입 이전에 생성된 미해결 인시던트를 재점검합니다.\n"
+            f"역할={role}, 코드={code}\n"
+            f"세부: {detail}"
+        )
+        if _check_repeat_failure(state, role, code, current):
+            incident["escalation_stage"] = "human_notified"
+            incident["escalation_reason"] = "repeat_failure"
+            incident["escalated_at"] = current
+            alerts.append({
+                "role": role,
+                "code": code,
+                "fingerprint": fingerprint,
+                "message": (
+                    f"{header}\n\n⚠️ 같은 문제({role}/{code})가 {REPEAT_FAILURE_WINDOW_SECONDS // 86400}일 내 "
+                    "전체 디벨리버레이션까지 갔다가 반복되었습니다. 에이전트 체인을 건너뛰고 사람 확인이 필요합니다."
+                ),
+                "detail": detail,
+            })
+            continue
+        merge_target = _find_mergeable_incident(state, role, current)
+        if merge_target is not None:
+            incident["escalation_stage"] = "attached"
+            incident["attached_to"] = merge_target
+            primary = state["incidents"][merge_target]
+            related_incidents = primary.setdefault("related_incidents", [])
+            if fingerprint not in related_incidents:
+                related_incidents.append(fingerprint)
+            continue
+        routed_role = _route_incident(role, code)
+        incident["escalation_stage"] = "awaiting_ack"
+        incident["routed_role"] = routed_role
+        incident["routed_at"] = current
+        incident["ack_deadline"] = current + ROUTING_ACK_TIMEOUT_SECONDS
+        incident["reroute_count"] = 0
+        incident["related_incidents"] = []
+        alerts.append({
+            "role": role,
+            "code": code,
+            "fingerprint": fingerprint,
+            "message": (
+                f"{header}\n\n@{BOT_USERNAMES.get(routed_role, routed_role)} 확인 요망 — "
+                "이 인시던트의 담당자입니다."
+            ),
+            "detail": detail,
+        })
+    return alerts
+
+
 def _record_incident_ack(state: dict, role: str, pending_id: str, current: float) -> None:
     """Any new pending task for the routed role counts as an ack.
 
@@ -2190,6 +2252,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
     _migrate_state(state)
+    alerts.extend(_backfill_legacy_incidents(state, current))
     state.setdefault("offsets", {})
     state.setdefault("pending", {})
     state.setdefault("alerted", {})

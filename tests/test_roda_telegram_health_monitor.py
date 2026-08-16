@@ -219,6 +219,77 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(state["incidents"]["fp1"]["routed_at"], 1000)
         self.assertEqual(event["message"], "재발")
 
+    def test_poll_once_backfills_legacy_incident_and_remaps_main_dirty(self):
+        original_targets = health.TARGETS
+        health.TARGETS = {}
+        try:
+            state = {
+                "initialized": True,
+                "incidents": {
+                    "legacy-service": {
+                        "incident_id": "legacy-service", "role": "codex", "code": "service_down",
+                        "status": "open", "first_seen_at": 100, "last_seen_at": 100, "detail": "dead",
+                    },
+                    "legacy-dirty": {
+                        "incident_id": "legacy-dirty", "role": "claude", "code": "main_dirty",
+                        "status": "open", "first_seen_at": 200, "last_seen_at": 200, "detail": "dirty",
+                    },
+                },
+            }
+            alerts = health.poll_once(state, now=1000)
+            self.assertEqual(state["incidents"]["legacy-service"]["escalation_stage"], "awaiting_ack")
+            self.assertEqual(state["incidents"]["legacy-service"]["routed_role"], "codex")
+            self.assertEqual(state["incidents"]["legacy-dirty"]["routed_role"], "codex")
+            self.assertIn(f"@{health.BOT_USERNAMES['codex']}", alerts[0]["message"])
+            self.assertNotIn("kind", alerts[0])
+        finally:
+            health.TARGETS = original_targets
+
+    def test_poll_once_backfill_is_idempotent(self):
+        original_targets = health.TARGETS
+        health.TARGETS = {}
+        try:
+            state = {
+                "initialized": True,
+                "incidents": {
+                    "legacy": {
+                        "incident_id": "legacy", "role": "codex", "code": "service_down",
+                        "status": "open", "first_seen_at": 100, "last_seen_at": 100,
+                    },
+                },
+            }
+            first_alerts = health.poll_once(state, now=1000)
+            second_alerts = health.poll_once(state, now=1001)
+            self.assertEqual(len(first_alerts), 1)
+            self.assertEqual(second_alerts, [])
+        finally:
+            health.TARGETS = original_targets
+
+    def test_poll_once_backfill_ignores_already_routed_incidents(self):
+        original_targets = health.TARGETS
+        health.TARGETS = {}
+        try:
+            state = {
+                "initialized": True,
+                "incidents": {
+                    "awaiting": {
+                        "incident_id": "awaiting", "role": "codex", "code": "service_down",
+                        "status": "open", "first_seen_at": 100, "last_seen_at": 100,
+                        "escalation_stage": "awaiting_ack", "routed_role": "claude", "ack_deadline": 2000,
+                    },
+                    "acked": {
+                        "incident_id": "acked", "role": "codex", "code": "execution_error",
+                        "status": "open", "first_seen_at": 200, "last_seen_at": 200,
+                        "escalation_stage": "acked", "routed_role": "codex", "completion_deadline": 2000,
+                    },
+                },
+            }
+            before = json.loads(json.dumps(state["incidents"]))
+            self.assertEqual(health.poll_once(state, now=1000), [])
+            self.assertEqual(state["incidents"], before)
+        finally:
+            health.TARGETS = original_targets
+
     def test_repeat_failure_within_window_skips_routing_and_notifies_human(self):
         state = {
             "incidents": {},
