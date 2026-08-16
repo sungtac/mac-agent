@@ -129,6 +129,26 @@ if [[ "$FILE_PATH" =~ $CLAUDE_MEMORY_FASTPATH_RE ]]; then
   exit 0
 fi
 
+DOCS_SPECS_FASTPATH_RE='.*/docs/specs/[^/]+\.md$'
+if [[ "$FILE_PATH" =~ $DOCS_SPECS_FASTPATH_RE ]]; then
+  [ -f "$FILE_PATH" ] || exit 0
+
+  ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/docs-specs-fastpath-check.XXXXXX")"
+  trap 'rm -f "$ERR_FILE"' EXIT
+
+  if [ ! -s "$FILE_PATH" ]; then
+    printf '%s\n' "파일이 비어 있습니다." >"$ERR_FILE"
+  elif ! awk 'NF{print; exit}' "$FILE_PATH" | grep -q '^# '; then
+    printf '%s\n' "첫 비어있지 않은 줄이 '# ' 제목으로 시작하지 않습니다." >"$ERR_FILE"
+  fi
+
+  ERR="$(cat "$ERR_FILE" 2>/dev/null)"
+  [ -z "$ERR" ] && exit 0
+
+  report_fastpath_failure "docs/specs 설계문서" "$ERR"
+  exit 0
+fi
+
 BASENAME="$(basename "$FILE_PATH")"
 case "$BASENAME" in
   .zshenv|.zshrc|.zprofile) SHELL_BIN="/bin/zsh"; SHELL_ISOLATE_ARGS=(-f) ;;
