@@ -49,14 +49,11 @@ def detect_scope_violation(diff: dict[str, Any], context: dict[str, Any]) -> lis
     if not isinstance(relevant_files, list) or not relevant_files:
         return []
 
-    def normalize(path: Any) -> str:
-        return str(path).replace("\\", "/").lstrip("./")
-
-    allowed = {normalize(path) for path in relevant_files}
+    allowed = {HARNESS.safe_rel(str(path)) for path in relevant_files}
     files_changed = diff.get("files_changed", [])
     if not isinstance(files_changed, list):
         return []
-    return [path for path in (normalize(item) for item in files_changed) if path not in allowed]
+    return [path for path in (HARNESS.safe_rel(str(item)) for item in files_changed) if path not in allowed]
 
 
 def delta_prompt_context(findings: list[dict[str, Any]]) -> str:
@@ -138,18 +135,26 @@ def _snippet_similarity(previous: dict[str, Any], current: dict[str, Any]) -> fl
     return difflib.SequenceMatcher(None, previous_text, current_text).ratio()
 
 
-def match_open_finding(issue: dict[str, Any], previous_open: list[dict[str, Any]], cwd: Path) -> dict[str, Any] | None:
+_GIT_MAPPING_UNSET = object()
+
+
+def match_open_finding(
+    issue: dict[str, Any],
+    previous_open: list[dict[str, Any]],
+    cwd: Path,
+    git_mapping: dict[str, set[str]] | None | object = _GIT_MAPPING_UNSET,
+) -> dict[str, Any] | None:
     """Return the prior finding matching issue, using host-observed anchors."""
     current_paths = _finding_paths(issue)
     current_symbols = _finding_symbols(issue)
-    mapping = _git_path_mapping(cwd)
+    mapping = _git_path_mapping(cwd) if git_mapping is _GIT_MAPPING_UNSET else git_mapping
     for previous in previous_open:
         previous_paths = _finding_paths(previous)
         paths_match = _paths_correspond(previous_paths, current_paths, mapping or {})
         common_symbols = current_symbols & _finding_symbols(previous)
         if paths_match and common_symbols:
             return previous
-        if mapping is None and common_symbols:
+        if mapping is None and previous_paths & current_paths and common_symbols:
             return previous
         if _snippet_similarity(previous, issue) >= 0.72 and (paths_match or not previous_paths or not current_paths):
             return previous
@@ -848,8 +853,9 @@ class HostOrchestrator:
             if round_number > 1:
                 diff_text = str(verification.get("diff", verification.get("content", "")))
                 allowed = []
+                git_mapping = _git_path_mapping(self.cwd)
                 for issue in issues:
-                    matched = match_open_finding(issue, previous_open, self.cwd)
+                    matched = match_open_finding(issue, previous_open, self.cwd, git_mapping)
                     if matched:
                         allowed.append({**issue, "matched_open_finding_id": matched.get("id")})
                     elif is_critical_delta_issue(issue, diff_text, tests): allowed.append(issue)

@@ -308,6 +308,7 @@ function buildReport(request, target, codex, antigravity, delta = {}) {
 function formatDeltaSummaryComment(report, previous) {
   const statusBadge = report.status === 'AI_APPROVED' ? '✅ AI_APPROVED' : '❌ CHANGES_REQUIRED'
   const titleFor = (finding) => finding.title || finding.description || finding.id || '제목 없는 이슈'
+  const findingKey = (finding) => String(finding.location || finding.title || '').trim()
   const formatList = (title, findings) => {
     const items = findings.map((finding) => `- ${titleFor(finding)}`).join('\n') || '- 없음'
     if (findings.length <= 5) return `### ${title}\n${items}`
@@ -327,11 +328,11 @@ function formatDeltaSummaryComment(report, previous) {
 
   const previousFindings = previous.findings || []
   const currentFindings = report.findings || []
-  const currentIds = new Set(currentFindings.map((finding) => finding.id))
-  const previousIds = new Set(previousFindings.map((finding) => finding.id))
-  const fixed = previousFindings.filter((finding) => !currentIds.has(finding.id))
-  const open = previousFindings.filter((finding) => currentIds.has(finding.id))
-  const added = currentFindings.filter((finding) => !previousIds.has(finding.id))
+  const currentKeys = new Set(currentFindings.map(findingKey))
+  const previousKeys = new Set(previousFindings.map(findingKey))
+  const fixed = previousFindings.filter((finding) => !currentKeys.has(findingKey(finding)))
+  const open = previousFindings.filter((finding) => currentKeys.has(findingKey(finding)))
+  const added = currentFindings.filter((finding) => !previousKeys.has(findingKey(finding)))
 
   lines.push(
     '',
@@ -395,7 +396,7 @@ async function runWorkerOnce(options = {}) {
         commentDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'code-review-comment-'))
         const commentFile = path.join(commentDirectory, 'comment.md')
         fs.writeFileSync(commentFile, formatDeltaSummaryComment(report, previous), { encoding: 'utf8', mode: 0o600 })
-        execFileSync('gh', ['pr', 'comment', String(request.target.pull_request), '--repo', request.target.repository, '--body-file', commentFile, '--edit-last', '--create-if-none'], { stdio: 'ignore' })
+        execFileSync('gh', ['pr', 'comment', String(request.target.pull_request), '--repo', request.target.repository, '--body-file', commentFile, '--edit-last', '--create-if-none'], { stdio: 'ignore', timeout: 15000 })
       } catch (error) {
         console.warn('failed to publish code review summary comment:', error.message)
       } finally {
