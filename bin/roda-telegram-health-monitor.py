@@ -55,6 +55,10 @@ INCIDENT_MERGE_WINDOW_SECONDS = NO_RESPONSE_SECONDS
 REPEAT_FAILURE_WINDOW_SECONDS = ALERT_RETENTION_SECONDS
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
+# Triage is read-only judgment (no repo writes), so — unlike AUTO_REPAIR_ENABLED
+# — it defaults on, matching CODEX_DIAGNOSIS_ENABLED's default.
+AGY_BIN = Path(os.environ.get("AGY_BIN", str(HOME / ".local" / "bin" / "agy")))
+ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
 # authority.  This default is deliberately fail-closed for a long-running
@@ -1652,6 +1656,109 @@ def _parse_triage_verdict(text: str) -> dict:
     return {"verdict": "MISROUTED", "owner": owner}
 
 
+def _run_antigravity_triage_cli(prompt: str) -> str:
+    # Deliberately no --mode plan: that flag hangs headless opinion-only
+    # calls on a permission prompt (see design doc "부수 성과"; the fix
+    # already shipped for telegram-agent-bot.py's conversation-meeting path).
+    try:
+        result = subprocess.run(
+            [str(AGY_BIN), "--print", prompt],
+            capture_output=True,
+            text=True,
+            timeout=180,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Antigravity triage 실행 실패: {type(exc).__name__}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(f"Antigravity triage provider 오류(exit={result.returncode}): {result.stderr[-500:]}")
+    return result.stdout
+
+
+def _record_deliberation_trigger(state: dict, incident: dict, current: float, *, incident_ref: str) -> dict:
+    incident["escalation_stage"] = "deliberation_triggered"
+    incident["triggered_at"] = current
+    state.setdefault("deliberation_history", []).append({
+        "role": incident.get("role", "unknown"),
+        "code": incident.get("code", "unknown"),
+        "triggered_at": current,
+    })
+    return {
+        "kind": "escalation_notice",
+        "role": incident.get("role", "unknown"),
+        "code": "deliberation_triggered",
+        "fingerprint": f"deliberation:{incident_ref}:{int(current)}",
+        "message": (
+            f"[Antigravity 소집] incident={incident_ref} (role={incident.get('role')}, "
+            f"code={incident.get('code')}) 판단이 어려워 다같이 회의해서 결론 내주세요."
+        ),
+        "detail": f"incident={incident_ref}",
+    }
+
+
+def _apply_triage_verdict(state: dict, fingerprint: str, incident: dict, verdict: dict, current: float) -> dict | None:
+    label = verdict.get("verdict")
+    if label == "OWNER_DOWN":
+        incident["escalation_stage"] = "human_notified"
+        incident["escalation_reason"] = "owner_down"
+        incident["escalated_at"] = current
+        return {
+            "kind": "escalation_notice",
+            "role": incident.get("role", "unknown"),
+            "code": "owner_down",
+            "fingerprint": f"owner-down:{fingerprint}:{int(current)}",
+            "message": (
+                f"[Roda 알림] incident={fingerprint}의 담당자({incident.get('routed_role')})가 "
+                "다운/에러 상태로 판정되었습니다. 사람 확인이 필요합니다."
+            ),
+            "detail": incident.get("detail", ""),
+        }
+    if label == "MISROUTED" and incident.get("reroute_count", 0) < 1:
+        owner = verdict.get("owner")
+        incident["escalation_stage"] = "awaiting_ack"
+        incident["routed_role"] = owner
+        incident["routed_at"] = current
+        incident["ack_deadline"] = current + ROUTING_ACK_TIMEOUT_SECONDS
+        incident["reroute_count"] = incident.get("reroute_count", 0) + 1
+        incident.pop("ack_task_id", None)
+        incident.pop("acked_at", None)
+        incident.pop("completion_deadline", None)
+        incident.pop("completed_at", None)
+        return {
+            "kind": "escalation_notice",
+            "role": incident.get("role", "unknown"),
+            "code": "rerouted",
+            "fingerprint": f"reroute:{fingerprint}:{int(current)}",
+            "message": (
+                f"[Roda 재라우팅] incident={fingerprint}의 실제 담당자는 {owner}입니다. "
+                f"@{BOT_USERNAMES.get(owner, owner)} 확인 요망 — 이 인시던트의 담당자입니다."
+            ),
+            "detail": incident.get("detail", ""),
+        }
+    # JUDGMENT_HARD, or a second MISROUTED verdict (reroute cap already spent).
+    return _record_deliberation_trigger(state, incident, current, incident_ref=fingerprint)
+
+
+def _process_antigravity_triage(state: dict, *, current: float | None = None) -> list[dict]:
+    if not ANTIGRAVITY_TRIAGE_ENABLED:
+        return []
+    now = current if current is not None else time.time()
+    events = []
+    for fingerprint, incident in list(state.get("incidents", {}).items()):
+        if incident.get("escalation_stage") != "pending_antigravity_triage":
+            continue
+        prompt = _build_triage_prompt(incident)
+        try:
+            output = _run_antigravity_triage_cli(prompt)
+        except RuntimeError:
+            continue
+        verdict = _parse_triage_verdict(output)
+        event = _apply_triage_verdict(state, fingerprint, incident, verdict, now)
+        if event is not None:
+            events.append(event)
+    return events
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -1826,6 +1933,7 @@ def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
 def _process_cycle(state: dict) -> None:
     _retry_pending_merges(state)
     alerts = poll_once(state)
+    alerts.extend(_process_antigravity_triage(state))
     _save_state(state)
     for event in alerts:
         try:

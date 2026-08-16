@@ -1208,6 +1208,115 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(health._parse_triage_verdict(""), {"verdict": "JUDGMENT_HARD", "owner": None})
         self.assertEqual(health._parse_triage_verdict("정체불명의 응답"), {"verdict": "JUDGMENT_HARD", "owner": None})
 
+    def test_run_antigravity_triage_cli_invokes_agy_print_without_mode_plan(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return mock.Mock(returncode=0, stdout="VERDICT: JUDGMENT_HARD\n", stderr="")
+
+        with mock.patch.object(health.subprocess, "run", side_effect=run):
+            output = health._run_antigravity_triage_cli("prompt text")
+        self.assertEqual(output, "VERDICT: JUDGMENT_HARD\n")
+        command = calls[0]
+        self.assertIn(str(health.AGY_BIN), command)
+        self.assertIn("--print", command)
+        self.assertNotIn("--mode", command)
+
+    def test_run_antigravity_triage_cli_raises_on_nonzero_exit(self):
+        with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
+            with self.assertRaises(RuntimeError):
+                health._run_antigravity_triage_cli("prompt text")
+
+    def test_apply_triage_verdict_owner_down_notifies_human(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {"role": "codex", "code": "execution_error", "reroute_count": 0}
+        event = health._apply_triage_verdict(state, "fp1", incident, {"verdict": "OWNER_DOWN", "owner": None}, current=5000.0)
+        self.assertEqual(incident["escalation_stage"], "human_notified")
+        self.assertEqual(incident["escalation_reason"], "owner_down")
+        self.assertIsNotNone(event)
+        self.assertNotIn("@", event["message"].split("\n")[0])
+
+    def test_apply_triage_verdict_misrouted_reroutes_once(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {"role": "codex", "code": "execution_error", "routed_role": "codex", "reroute_count": 0}
+        event = health._apply_triage_verdict(
+            state, "fp1", incident, {"verdict": "MISROUTED", "owner": "claude"}, current=5000.0,
+        )
+        self.assertEqual(incident["escalation_stage"], "awaiting_ack")
+        self.assertEqual(incident["routed_role"], "claude")
+        self.assertEqual(incident["routed_at"], 5000.0)
+        self.assertEqual(incident["ack_deadline"], 5000.0 + health.ROUTING_ACK_TIMEOUT_SECONDS)
+        self.assertEqual(incident["reroute_count"], 1)
+        self.assertIn(f"@{health.BOT_USERNAMES['claude']}", event["message"])
+
+    def test_apply_triage_verdict_misrouted_second_time_falls_back_to_deliberation(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {"role": "codex", "code": "execution_error", "routed_role": "claude", "reroute_count": 1}
+        event = health._apply_triage_verdict(
+            state, "fp1", incident, {"verdict": "MISROUTED", "owner": "antigravity"}, current=5000.0,
+        )
+        self.assertEqual(incident["escalation_stage"], "deliberation_triggered")
+        self.assertEqual(len(state["deliberation_history"]), 1)
+        self.assertIn("회의해", event["message"])
+        self.assertIn("다같이", event["message"])
+
+    def test_apply_triage_verdict_judgment_hard_triggers_deliberation_and_records_history(self):
+        state = {"incidents": {}, "deliberation_history": []}
+        incident = {"role": "codex", "code": "execution_error", "reroute_count": 0}
+        event = health._apply_triage_verdict(
+            state, "fp1", incident, {"verdict": "JUDGMENT_HARD", "owner": None}, current=5000.0,
+        )
+        self.assertEqual(incident["escalation_stage"], "deliberation_triggered")
+        self.assertEqual(incident["triggered_at"], 5000.0)
+        self.assertEqual(state["deliberation_history"], [{"role": "codex", "code": "execution_error", "triggered_at": 5000.0}])
+        self.assertIn("회의해", event["message"])
+
+    def test_process_antigravity_triage_end_to_end_with_stubbed_cli(self):
+        state = {
+            "incidents": {
+                "fp1": {
+                    "role": "codex", "code": "execution_error", "reroute_count": 0,
+                    "escalation_stage": "pending_antigravity_triage", "detail": "boom",
+                },
+            },
+            "deliberation_history": [],
+        }
+        with mock.patch.object(health, "_run_antigravity_triage_cli", return_value="VERDICT: OWNER_DOWN\n"):
+            events = health._process_antigravity_triage(state, current=5000.0)
+        self.assertEqual(len(events), 1)
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "human_notified")
+
+    def test_process_antigravity_triage_disabled_by_flag(self):
+        state = {
+            "incidents": {
+                "fp1": {"role": "codex", "code": "execution_error", "escalation_stage": "pending_antigravity_triage"},
+            },
+            "deliberation_history": [],
+        }
+        original = health.ANTIGRAVITY_TRIAGE_ENABLED
+        health.ANTIGRAVITY_TRIAGE_ENABLED = False
+        try:
+            with mock.patch.object(health, "_run_antigravity_triage_cli") as cli:
+                events = health._process_antigravity_triage(state, current=5000.0)
+                cli.assert_not_called()
+        finally:
+            health.ANTIGRAVITY_TRIAGE_ENABLED = original
+        self.assertEqual(events, [])
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "pending_antigravity_triage")
+
+    def test_process_antigravity_triage_cli_failure_leaves_incident_pending(self):
+        state = {
+            "incidents": {
+                "fp1": {"role": "codex", "code": "execution_error", "escalation_stage": "pending_antigravity_triage"},
+            },
+            "deliberation_history": [],
+        }
+        with mock.patch.object(health, "_run_antigravity_triage_cli", side_effect=RuntimeError("agy exit=1")):
+            events = health._process_antigravity_triage(state, current=5000.0)
+        self.assertEqual(events, [])
+        self.assertEqual(state["incidents"]["fp1"]["escalation_stage"], "pending_antigravity_triage")
+
 
 if __name__ == "__main__":
     unittest.main()
