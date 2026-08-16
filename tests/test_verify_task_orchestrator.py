@@ -17,6 +17,56 @@ SPEC.loader.exec_module(MODULE)
 
 
 class VerifyTaskOrchestratorTests(unittest.TestCase):
+    def test_detect_scope_violation_ignores_empty_relevant_files(self):
+        self.assertEqual(
+            MODULE.detect_scope_violation(
+                {"files_changed": ["unexpected.py"]}, {"relevant_files": []}
+            ),
+            [],
+        )
+
+    def test_detect_scope_violation_returns_files_outside_relevant_files(self):
+        self.assertEqual(
+            MODULE.detect_scope_violation(
+                {"files_changed": ["allowed.py", "./unexpected.py"]},
+                {"relevant_files": ["allowed.py"]},
+            ),
+            ["unexpected.py"],
+        )
+
+    def test_detect_scope_violation_returns_empty_when_all_files_are_relevant(self):
+        self.assertEqual(
+            MODULE.detect_scope_violation(
+                {"files_changed": ["./allowed.py", "nested\\file.py"]},
+                {"relevant_files": ["allowed.py", "nested/file.py"]},
+            ),
+            [],
+        )
+
+    def test_review_prompt_contains_completion_checklist_and_conditional_scope_notice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runner = MODULE.HostOrchestrator("task", Path(directory), Path(directory) / ".verify", 1, False)
+            prompt = runner.review_prompt(
+                {"relevant_files": ["allowed.py"]},
+                {"files_changed": ["unexpected.py"], "content": "diff"},
+                {"status": "not_run"},
+                "plan",
+                "claude",
+            )
+            self.assertIn("[하네스 사전검사: 범위 위반 감지됨]", prompt)
+            self.assertIn("unexpected.py", prompt)
+            for number in range(1, 6):
+                self.assertIn(f"{number}.", prompt)
+
+            clean_prompt = runner.review_prompt(
+                {"relevant_files": ["allowed.py"]},
+                {"files_changed": ["allowed.py"], "content": "diff"},
+                {"status": "passed"},
+                "plan",
+                "claude",
+            )
+            self.assertNotIn("[하네스 사전검사: 범위 위반 감지됨]", clean_prompt)
+
     def test_match_open_finding_tracks_rename_with_same_symbol(self):
         previous = [{"id": "old-1", "file": "old.py", "location": "old.py:parse_value", "anchor": "def parse_value(value):"}]
         issue = {"file": "new.py", "location": "new.py:parse_value", "anchor": "def parse_value(value):"}

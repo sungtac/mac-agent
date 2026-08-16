@@ -43,6 +43,22 @@ CRITICAL_SECURITY_RE = re.compile(r"security|secret|credential|token|auth|permis
 CRITICAL_MIGRATION_RE = re.compile(r"migration|migrations|schema|database|db/|\.sql$|마이그레이션|스키마", re.I)
 TEST_FAILURE_RE = re.compile(r"test.*fail|failed.*test|regression|회귀|실패 로그|assert", re.I)
 
+
+def detect_scope_violation(diff: dict[str, Any], context: dict[str, Any]) -> list[str]:
+    relevant_files = context.get("relevant_files", [])
+    if not isinstance(relevant_files, list) or not relevant_files:
+        return []
+
+    def normalize(path: Any) -> str:
+        return str(path).replace("\\", "/").lstrip("./")
+
+    allowed = {normalize(path) for path in relevant_files}
+    files_changed = diff.get("files_changed", [])
+    if not isinstance(files_changed, list):
+        return []
+    return [path for path in (normalize(item) for item in files_changed) if path not in allowed]
+
+
 def delta_prompt_context(findings: list[dict[str, Any]]) -> str:
     return "\n".join(json.dumps({"id": item.get("id"), "file": item.get("file"), "anchor": item.get("location") or item.get("anchor"), "symbol": item.get("symbol"), "snippet": item.get("snippet"), "evidence": item.get("evidence"), "title": item.get("title") or item.get("description")}, ensure_ascii=False) for item in findings) or "(이전 라운드 open finding 없음)"
 
@@ -691,10 +707,25 @@ class HostOrchestrator:
     def light_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any]) -> str:
         return f"""[agent profile v1.0.0]\n영구 역할: 독립 조사관이자 레드팀 검증자\n현재 persona: auditor\n\n경량 트랙의 독립 차단 리뷰어다. 점수는 매기지 않는다. 실제 diff, 하네스 트랙 판정, 테스트 요약만 근거로 판단한다.\n\n[원 작업]\n{self.task}\n[허용 파일/정책]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[트랙]\n{json.dumps(diff.get('policy', {}), ensure_ascii=False)}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\nJSON으로만 답해: {{"verdict":"pass|changes_required|full_track_required","blocking_issues":[]}}"""
 
-    def review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
+    def _legacy_review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
         persona = "communicator" if role == "claude" else "auditor"
         identity = "제한된 구현자 또는 독립 리뷰어" if role == "claude" else "독립 조사관이자 레드팀 검증자"
         return f"""[agent profile v1.0.0]\n영구 역할: {identity}\n현재 persona: {persona}\n\n너는 독립 코드 리뷰어다. 점수는 매기지 않는다. 다른 리뷰어의 의견을 전제로 삼지 말고 제공된 패키지만 검토한다. 테스트를 다시 실행하지 마라.\n\n[원 작업]\n{self.task}\n[최종 계획]\n{plan or '(계획 없음)'}\n[허용 파일/적용 규칙]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\n문제가 있으면 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test, blocking을 포함한다.\nJSON으로만 답해: {{"hasBlockingIssue":false,"issues":[],"checks":[{{"name":"test-summary","status":"passed","evidence":"하네스 요약 확인"}}]}}"""
+
+    def review_prompt(self, context: dict[str, Any], diff: dict[str, Any], test_summary: dict[str, Any], plan: str, role: str) -> str:
+        persona = "communicator" if role == "claude" else "auditor"
+        identity = "제한된 구현자 또는 독립 리뷰어" if role == "claude" else "독립 조사관이자 레드팀 검증자"
+        scope_violations = detect_scope_violation(diff, context)
+        scope_notice = ""
+        if scope_violations:
+            scope_notice = "\n[하네스 사전검사: 범위 위반 감지됨]\n" + ", ".join(scope_violations) + "\n"
+        checklist = """[완성도 체크리스트]
+1. 지시서가 허용한 파일 목록과 실제 diff의 파일 목록이 정확히 일치하는가? 벗어난 파일이 있으면 blocking이다.
+2. 지시서가 요구한 신규/수정 결과물이 diff에 실제로 존재하는가? 요구했는데 없으면 blocking이다.
+3. 지시서가 명시한 검증 명령이 실행됐는가? test_summary.status가 not_run인데 검증 명령이 지시서에 명시돼 있었다면 blocking이다. 애초에 검증 명령이 지시되지 않았다면 blocking이 아니다.
+4. finding에서 참조하는 필드/스키마가 실제 코드/데이터 구조와 일치하는가? 존재하지 않는 필드를 참조하는 코드를 놓치지 않았는가.
+5. 지시한 변경 내용과 실제 diff가 대응하는가? 지시서가 말한 파일이 그대로고 엉뚱한 파일만 바뀌어 있으면 blocking이다."""
+        return f"""[agent profile v1.0.0]\n영구 역할: {identity}\n현재 persona: {persona}\n{scope_notice}\n{checklist}\n\n너는 독립 코드 리뷰어다. 점수는 매기지 않는다. 다른 리뷰어의 의견을 전제로 삼지 말고 제공된 패키지만 검토한다. 테스트를 다시 실행하지 마라.\n\n[원 작업]\n{self.task}\n[최종 계획]\n{plan or '(계획 없음)'}\n[허용 파일/적용 규칙]\n{self.context_text(context)}\n[실제 변경사항]\n{diff.get('content', '')}\n[테스트 요약]\n{json.dumps(test_summary, ensure_ascii=False)}\n\n문제가 있으면 file, symbol, line_start, line_end, issue, evidence, required_fix, required_test, blocking을 포함한다.\nJSON으로만 답해: {{\"hasBlockingIssue\":false,\"issues\":[],\"checks\":[{{\"name\":\"test-summary\",\"status\":\"passed\",\"evidence\":\"하네스 요약 확인\"}}]}}"""
 
     def research_prompt(self, context: dict[str, Any], focus: str, instruction: str) -> str:
         persona = "red-team" if focus == "risks-tests" else "researcher"
