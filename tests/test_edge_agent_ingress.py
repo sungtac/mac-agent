@@ -8,6 +8,7 @@ from edge_agent_ingress import (  # noqa: E402
     classify,
     is_conversation_meeting,
     is_deliberation_request,
+    is_execution_directive,
     is_group_address,
     routing_projection,
 )
@@ -107,6 +108,12 @@ class IngressRoutingTests(unittest.TestCase):
         self.assertFalse(is_conversation_meeting("얘들아 이 버그를 논의하고 코드를 수정해줘"))
         self.assertFalse(is_conversation_meeting("모두 로그를 확인해서 원인을 토론해줘"))
         self.assertFalse(is_conversation_meeting("다같이 웹 검색해서 전략을 논의해줘"))
+
+    def test_is_execution_directive_matches_explicit_action_verbs(self):
+        self.assertTrue(is_execution_directive("이 코드를 구현해줘"))
+        self.assertTrue(is_execution_directive("파일을 확인해줘"))
+        self.assertFalse(is_execution_directive("이 부분 어떻게 생각해?"))
+        self.assertFalse(is_execution_directive("장단점을 회의해줘"))
 
     def test_pasted_telegram_history_does_not_wake_quoted_agents(self):
         text = (

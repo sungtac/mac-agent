@@ -65,6 +65,7 @@ from edge_agent_state import write_task_state
 from edge_agent_coordination import wait_for_peer_results
 from edge_agent_control_plane import ControlPlaneError, ControlPlaneStore, is_cancel_request
 from edge_agent_deliberation import (
+    CONVERSATION_COORDINATOR_ROLE,
     DeliberationStore,
     configured_barrier_timeout_seconds,
     configured_conversation_timeout_seconds,
@@ -78,6 +79,7 @@ from edge_agent_ingress import (
     classify as classify_ingress,
     is_conversation_meeting,
     is_deliberation_request,
+    is_execution_directive,
     is_group_address,
 )
 from weather_adapter import fetch_weather, is_weather_request
@@ -2374,6 +2376,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             log(f"웹 검색 capability 부재 안내 전송 실패: {type(exc).__name__}")
         return
 
+    active_meeting_session_id = None
+    if chat is not None and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
+        try:
+            active_meeting_session_id = DeliberationStore().active_session_for_chat(message.chat_id)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            log(f"활성 회의 세션 조회 실패(새 요청으로 계속 진행): {type(exc).__name__}")
+            active_meeting_session_id = None
+    if active_meeting_session_id and not is_execution_directive(text):
+        try:
+            DeliberationStore().append_human_note(
+                active_meeting_session_id,
+                text,
+                telegram_message_id=message.message_id,
+            )
+        except (OSError, ValueError, TypeError) as exc:
+            log(f"회의 발언 반영 실패 session={active_meeting_session_id} error={type(exc).__name__}")
+            if ROLE == CONVERSATION_COORDINATOR_ROLE:
+                try:
+                    await message.reply_text("⚠️ 발언 반영에 실패했습니다, 다시 보내주세요")
+                except TelegramError as send_exc:
+                    log(f"발언 반영 실패 안내 전송도 실패: {send_exc}")
+            _complete_ingress_claim()
+            return
+        if ROLE == CONVERSATION_COORDINATOR_ROLE:
+            try:
+                await message.reply_text("💬 다음 회의 발언에 반영됩니다")
+            except TelegramError as exc:
+                log(f"회의 발언 확인 응답 전송 실패: {exc}")
+        _complete_ingress_claim()
+        return
+
     if _BUSY_LOCK.locked():
         try:
             await message.reply_text(f"⏳ {ROLE_LABELS[ROLE]}가 이미 다른 작업을 처리 중이에요. 끝나면 답할게요.")
@@ -2394,6 +2427,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 roles=roles_for_request(text),
                 mode="conversation" if conversation_meeting_active else "verified",
             )
+            try:
+                DeliberationStore().record_active_chat_session(message.chat_id, deliberation_session_id)
+            except (OSError, ValueError, TypeError, AttributeError) as exc:
+                log(f"채팅 세션 포인터 기록 실패(계속 진행): {type(exc).__name__}")
         if _is_delivery_retry_request(text):
             await _handle_delivery_retry(message, context)
             return

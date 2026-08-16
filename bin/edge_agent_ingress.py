@@ -281,5 +281,14 @@ def is_conversation_meeting(text: str) -> bool:
     return is_deliberation_request(directive) and not bool(_EXECUTION_ACTION.search(directive))
 
 
+def is_execution_directive(text: str) -> bool:
+    """Return whether the current directive is an explicit execution verb.
+
+    Used to keep an in-progress meeting from swallowing a clear "do this
+    now" instruction as a mere discussion note (see design doc 설계 4).
+    """
+    return bool(_EXECUTION_ACTION.search(routing_projection(text)))
+
+
 def should_respond(text: str, role: str, *, default_role: str = DEFAULT_ROLE) -> bool:
     return classify(text, default_role=default_role).accepts(role, default_role=default_role)

@@ -251,6 +251,56 @@ class TelegramExecutionContractTests(unittest.IsolatedAsyncioTestCase):
         provider.assert_awaited_once()
         self.assertIs(provider.await_args.kwargs["conversation_meeting"], True)
 
+    async def test_active_meeting_interjection_appends_note_without_new_session(self):
+        provider = AsyncMock(return_value="이건 절대 호출되면 안 됨")
+        sent = FakeSent(12)
+        update = make_update(sent)
+        session_id = BOT.session_id_for_telegram(update.effective_chat.id, 999)
+        with tempfile.TemporaryDirectory() as directory:
+            store = BOT.DeliberationStore(directory)
+            store.start(session_id, "먼저 시작된 회의")
+            store.record_active_chat_session(update.effective_chat.id, session_id)
+            with patch.object(BOT, "addressed_text", return_value="아 잠깐만 이것도 고려해줘"), \
+                    patch.object(BOT, "DeliberationStore", return_value=store), \
+                    patch.object(BOT, "_ingress_identity", return_value=None), \
+                    patch.object(BOT, "_is_stale", return_value=False), \
+                    patch.object(BOT, "run_provider", new=provider), \
+                    patch.object(BOT, "ROLE", "codex"):
+                await BOT.handle_message(update, SimpleNamespace())
+            provider.assert_not_awaited()
+            notes = store.snapshot(session_id)["human_notes"]
+            self.assertEqual(len(notes), 1)
+            self.assertEqual(notes[0]["text"], "아 잠깐만 이것도 고려해줘")
+
+    async def test_no_active_session_still_opens_new_meeting_classification(self):
+        provider = AsyncMock(return_value="회의 1차 의견")
+        sent = FakeSent(13)
+        update = make_update(sent)
+        with tempfile.TemporaryDirectory() as directory:
+            store = BOT.DeliberationStore(directory)
+            with patch.object(BOT, "addressed_text", return_value="논의하고 의견을 통합해줘"), \
+                    patch.object(BOT, "DeliberationStore", return_value=store), \
+                    patch.object(BOT, "SIMPLE_MEETING_MODE", True), \
+                    patch.object(BOT, "is_conversation_meeting", return_value=True), \
+                    patch.object(BOT, "_prepare_context", return_value=None), \
+                    patch.object(BOT, "_ingress_identity", return_value=None), \
+                    patch.object(BOT, "_is_stale", return_value=False), \
+                    patch.object(BOT, "_needs_task_worktree", return_value=False), \
+                    patch.object(BOT, "wait_for_peer_results", new=AsyncMock(return_value="peer opinions")), \
+                    patch.object(BOT, "run_provider", new=provider), \
+                    patch.object(BOT, "write_task_state", return_value="task-meeting-2"), \
+                    patch.object(BOT, "start_session", return_value="session-meeting-2"), \
+                    patch.object(BOT, "update_session"), \
+                    patch.object(BOT, "write_reflection"), \
+                    patch.object(BOT, "_record_telegram_efficiency"), \
+                    patch.object(BOT, "_update_task_worktree_status"), \
+                    patch.dict(os.environ, {"EDGE_AGENT_TELEGRAM_DELIVERY_ROOT": self.delivery_root.name}), \
+                    patch.object(BOT, "ROLE", "codex"):
+                BOT.ACTIVE_TASK_WORKSPACE = None
+                BOT.ACTIVE_LOGICAL_SESSION_ID = None
+                await BOT.handle_message(update, SimpleNamespace())
+        provider.assert_awaited_once()
+
     def test_delegation_delivery_uses_defined_reply_chunker(self):
         source = (BIN / "telegram-agent-bot.py").read_text(encoding="utf-8")
         self.assertNotIn("for part in _split_message(answer)", source)
