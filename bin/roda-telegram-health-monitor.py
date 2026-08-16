@@ -73,6 +73,7 @@ SELF_HEAL_FINGERPRINT_WINDOW_SECONDS = 86400
 SELF_HEAL_GLOBAL_MERGE_LIMIT = 3
 SELF_HEAL_GLOBAL_MERGE_WINDOW_SECONDS = 86400
 SELF_HEAL_RECURRENCE_WINDOW_SECONDS = 3600
+SELF_HEAL_TOTAL_TIMEOUT_SECONDS = 300
 ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
@@ -2021,6 +2022,161 @@ def _implementer_chain(state: dict, current: float) -> list[str]:
     return [role for role in base_order if role not in busy]
 
 
+def _review_implementer_diff(reviewer_role: str, diff_text: str | None, worktree: Path, *, timeout: int = 180) -> bool:
+    """A reviewer that is NOT the implementer judges the diff. Reuses the
+    same triage-CLI dispatch pattern as _run_antigravity_triage_cli for
+    antigravity, and the equivalent flag set for claude/codex review calls.
+    `timeout` is the caller's remaining self-heal budget (Task 6), so review
+    calls near the end of the 5-minute window get a shrinking timeout instead
+    of an unconditional 180s that could push the whole attempt over budget."""
+    if timeout <= 0:
+        return False
+    prompt = (
+        "다음 diff를 검토하라. 안전하고 요청 범위 내의 최소 변경이면 정확히 "
+        "`REVIEW: APPROVE`로 시작하는 한 줄을, 문제가 있으면 `REVIEW: REJECT`로 "
+        "시작하는 한 줄을 첫 줄에 출력하라.\n\n" + (diff_text or "")
+    )
+    try:
+        if reviewer_role == "codex":
+            result = subprocess.run(
+                [str(CODEX_BIN), "exec", "--json", "-s", "read-only", "--skip-git-repo-check", "-C", str(worktree), "--", prompt],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            output = result.stdout
+        elif reviewer_role == "antigravity":
+            output = _run_antigravity_triage_cli(prompt)
+        elif reviewer_role == "claude":
+            result = subprocess.run(
+                [str(CLAUDE_BIN), "-p", "--model", "sonnet", "--effort", "medium", "--output-format", "json", prompt],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+            payload = json.loads(result.stdout) if result.returncode == 0 else {}
+            output = str(payload.get("result") or "")
+        else:
+            return False
+    except (subprocess.TimeoutExpired, OSError, RuntimeError, json.JSONDecodeError):
+        return False
+    return bool(re.search(r"REVIEW:\s*APPROVE", output, re.I))
+
+
+def _attempt_self_heal(event: dict, state: dict) -> bool:
+    fingerprint = str(event["fingerprint"])
+    incident = state.setdefault("incidents", {}).setdefault(fingerprint, {})
+    incident["escalation_stage"] = "auto_repairing"
+
+    def _fall_back_to_escalation() -> bool:
+        now = time.time()
+        incident["escalation_stage"] = "awaiting_ack"
+        incident["routed_role"] = incident.get("routed_role") or event.get("role")
+        incident["routed_at"] = now
+        incident["ack_deadline"] = now + ROUTING_ACK_TIMEOUT_SECONDS
+        incident.setdefault("reroute_count", 0)
+        incident.setdefault("related_incidents", [])
+        return False
+
+    if _is_blacklisted(state, fingerprint):
+        return _fall_back_to_escalation()
+    if _manual_mode_active(state):
+        return _fall_back_to_escalation()
+    started_at = time.time()
+    if not _check_fingerprint_attempt_budget(state, fingerprint, started_at):
+        return _fall_back_to_escalation()
+    if not _check_global_merge_budget(state, started_at):
+        return _fall_back_to_escalation()
+
+    _record_self_heal_attempt(state, fingerprint, started_at)
+    chain = _implementer_chain(state, started_at)
+    worktree = REPAIR_ROOT / fingerprint
+    prompt = (
+        "장애 원인을 파악하고 최소 범위의 안전한 개선을 구현하라. "
+        "작업 worktree에서만 수정하고, 토큰·인증·.env·삭제·reset·외부 전송은 절대 수행하지 말라.\n\n"
+        f"대상 provider: {event.get('role')}\n감지 코드: {event.get('code')}\n관측 세부: {event.get('detail')}\n"
+    )
+
+    for implementer_role in chain:
+        elapsed = time.time() - started_at
+        remaining_budget = SELF_HEAL_TOTAL_TIMEOUT_SECONDS - elapsed
+        if remaining_budget <= 0:
+            break
+        if not worktree.exists():
+            REPAIR_ROOT.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["/usr/bin/git", "-C", str(SOURCE_REPO), "worktree", "add", "--detach", str(worktree), "HEAD"],
+                capture_output=True, text=True, check=False,
+            )
+        else:
+            # A previous implementer in this same chain may have left partial,
+            # failed changes behind. Reset to a clean HEAD before the next
+            # implementer touches the worktree so their edits never mix.
+            subprocess.run(["/usr/bin/git", "-C", str(worktree), "reset", "--hard", "HEAD"], capture_output=True, text=True, check=False)
+            subprocess.run(["/usr/bin/git", "-C", str(worktree), "clean", "-fd"], capture_output=True, text=True, check=False)
+        per_attempt_timeout = int(min(180, remaining_budget))
+        if per_attempt_timeout <= 0:
+            break
+        cli_result = _run_implementer_cli(implementer_role, prompt, worktree, timeout=per_attempt_timeout)
+        if cli_result["status"] != "success":
+            continue
+
+        post_implement_remaining = SELF_HEAL_TOTAL_TIMEOUT_SECONDS - (time.time() - started_at)
+        if post_implement_remaining <= 0:
+            break
+        low_risk = _is_low_risk_diff(cli_result["changed_files"], cli_result.get("diff"))
+        other_roles = [r for r in ("codex", "claude", "antigravity") if r != implementer_role]
+        review_count = 0
+        for reviewer_role in other_roles:
+            review_timeout = int(min(180, SELF_HEAL_TOTAL_TIMEOUT_SECONDS - (time.time() - started_at)))
+            if review_timeout <= 0:
+                break
+            if _review_implementer_diff(reviewer_role, cli_result.get("diff"), worktree, timeout=review_timeout):
+                review_count += 1
+            if review_count >= 2:
+                break
+            if review_count >= 1 and low_risk:
+                break
+        if SELF_HEAL_TOTAL_TIMEOUT_SECONDS - (time.time() - started_at) <= 0:
+            break
+
+        tests_passed = _run_full_test_suite()
+        if not _merge_allowed(review_count, low_risk, tests_passed):
+            continue
+
+        commit = subprocess.run(["/usr/bin/git", "-C", str(worktree), "add", "-A"], capture_output=True, text=True, check=False)
+        if commit.returncode != 0:
+            continue
+        commit = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "commit", "-m", f"fix: automated self-heal {fingerprint}"],
+            capture_output=True, text=True, check=False,
+        )
+        if commit.returncode != 0:
+            continue
+        repair_commit = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "rev-parse", "HEAD"], capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if not repair_commit:
+            continue
+        merge_result = _merge_repair_commit_and_restart(
+            role=event.get("role", "unknown"), code=event.get("code", "unknown"),
+            repair_commit=repair_commit, fingerprint=fingerprint,
+        )
+        if not _repair_succeeded(merge_result):
+            continue
+
+        now = time.time()
+        _record_self_heal_merge(state, now)
+        _watch_self_heal_merge(state, fingerprint, event.get("role", "unknown"), event.get("code", "unknown"), repair_commit, now)
+        incident["escalation_stage"] = "resolved"
+        incident["resolved_at"] = now
+        incident.setdefault("self_heal_attempts_log", []).append({
+            "role": implementer_role, "status": "success", "changed_files": cli_result["changed_files"],
+            "review_count": review_count, "tests_passed": tests_passed, "merge_commit": repair_commit,
+        })
+        if _check_global_merge_budget(state, now) is False:
+            _enter_manual_mode(state, now)
+        return True
+
+    return _fall_back_to_escalation()
+
+
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:
     current = now if now is not None else time.time()
     alerts: list[dict] = []
@@ -2222,9 +2378,6 @@ def _process_cycle(state: dict) -> None:
                 continue
             fingerprint = str(event["fingerprint"])
             if event.get("code") in NON_REPAIRABLE_CODES or event.get("auto_repair") == "blocked":
-                # A depleted provider cannot be repaired by changing local
-                # code. Alert once and wait for a real subsequent request to
-                # prove recovery; never spend Codex usage on diagnosis.
                 _send_alert(f"{event['message']}\n세부: {event['detail']}")
                 blocked_reason = {
                     "main_dirty": "main 저장소 추적 변경 — 사람 확인 필요",
@@ -2239,30 +2392,15 @@ def _process_cycle(state: dict) -> None:
                 state["repair_results"][fingerprint] = blocked_reason
                 _save_state(state)
                 continue
-            diagnosis = state["repair_results"].get(fingerprint)
-            if diagnosis is None:
-                blocker = _repair_preflight_blocker(event)
-                if blocker is None:
-                    try:
-                        _send_alert(
-                            f"{event['message']}\n세부: {event['detail']}\n\n"
-                            "[Codex 자동복구 시작]\n원인 분석과 안전 검증을 진행합니다."
-                        )
-                    except Exception as exc:
-                        print(f"Roda detection alert delivery failed: {type(exc).__name__}: {exc}")
-            if diagnosis is None:
-                diagnosis = _run_codex_repair(event, state)
-                state["repair_results"][fingerprint] = diagnosis
-                if _repair_succeeded(diagnosis):
-                    state["recovery_watch"][fingerprint] = {
-                        "role": event["role"],
-                        "status": "awaiting_reprocess",
-                        "created_at": time.time(),
-                        "deadline": time.time() + RECOVERY_TIMEOUT_SECONDS,
-                        "notified": False,
-                    }
+            if event.get("kind") == "escalation_notice":
+                _send_alert(event["message"])
+                continue
+            if fingerprint not in state.get("self_heal_watch", {}) and state["incidents"].get(fingerprint, {}).get("escalation_stage") in {None, "awaiting_ack"}:
+                healed = _attempt_self_heal(event, state)
                 _save_state(state)
-            _send_alert(_format_repair_result(event, diagnosis))
+                if not healed:
+                    continue
+            _send_alert(f"{event['message']}\n세부: {event['detail']}")
         except Exception as exc:
             state.setdefault("delivery_retry", []).append(event)
             _save_state(state)
