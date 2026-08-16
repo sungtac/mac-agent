@@ -78,6 +78,18 @@ if [ -n "$FILE_PATH" ] && [[ "$FILE_PATH" =~ $CLAUDE_MEMORY_FASTPATH_RE ]]; then
 fi
 # ---------------------------------------------------------------------------
 
+# --- Fast-path: docs/specs design docs, any repo -------------------------
+DOCS_SPECS_FASTPATH_RE='.*/docs/specs/[^/]+\.md$'
+if [ -n "$FILE_PATH" ] && [[ "$FILE_PATH" =~ $DOCS_SPECS_FASTPATH_RE ]]; then
+  BACKUP_DIR="$HOME/.claude/hooks-state/dotfile-fastpath-backups"
+  mkdir -p "$BACKUP_DIR" 2>/dev/null || true
+  if [ -f "$FILE_PATH" ]; then
+    cp -p "$FILE_PATH" "$BACKUP_DIR/$(basename "$FILE_PATH").$(date +%Y%m%d%H%M%S).bak" 2>/dev/null || true
+  fi
+  exit 0
+fi
+# ---------------------------------------------------------------------------
+
 if [ -z "$SESSION_ID" ] || [ -z "$CWD" ]; then
   jq -n ' {
     hookSpecificOutput: {
