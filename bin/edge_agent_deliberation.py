@@ -458,6 +458,35 @@ class DeliberationStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def unreflected_human_notes(self, session_id: str) -> tuple[dict[str, Any], ...]:
+        payload = self.snapshot(session_id) or {}
+        results = payload.get("results") or {}
+        observed = max(
+            (int((results.get(role) or {}).get("observed_human_seq", 0)) for role in payload.get("expected_roles", EXPECTED_ROLES)),
+            default=0,
+        )
+        notes = payload.get("human_notes") or []
+        return tuple(note for note in notes if int(note.get("seq", 0)) > observed)
+
+    def reintegration_count(self, session_id: str) -> int:
+        payload = self.snapshot(session_id) or {}
+        return int(payload.get("human_note_reintegrations", 0))
+
+    def record_reintegration(self, session_id: str) -> dict[str, Any]:
+        session_id = _safe_session(session_id)
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                return {}
+            payload["human_note_reintegrations"] = int(payload.get("human_note_reintegrations", 0)) + 1
+            self._write(session_id, payload)
+            return payload
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._read(_safe_session(session_id))
 

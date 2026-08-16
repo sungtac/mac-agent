@@ -184,6 +184,25 @@ class DeliberationStoreTests(unittest.TestCase):
                 self.assertEqual(store.snapshot(session_id)["status"], "barrier_ready")
                 self.assertIsNone(store.active_session_for_chat(chat_id))
 
+    def test_unreflected_human_notes_and_reintegration_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 230)
+                store.start(session_id, "회의")
+                store.record(session_id, "roda", status="completed", summary="roda 의견", observed_human_seq=0)
+                self.assertEqual(store.unreflected_human_notes(session_id), ())
+                store.append_human_note(session_id, "뒤늦은 발언", telegram_message_id=1)
+                unreflected = store.unreflected_human_notes(session_id)
+                self.assertEqual(len(unreflected), 1)
+                self.assertEqual(unreflected[0]["text"], "뒤늦은 발언")
+                self.assertEqual(store.reintegration_count(session_id), 0)
+                store.record_reintegration(session_id)
+                self.assertEqual(store.reintegration_count(session_id), 1)
+
     def test_render_includes_unreflected_human_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
