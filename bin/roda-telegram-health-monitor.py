@@ -58,6 +58,7 @@ CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "
 # Triage is read-only judgment (no repo writes), so — unlike AUTO_REPAIR_ENABLED
 # — it defaults on, matching CODEX_DIAGNOSIS_ENABLED's default.
 AGY_BIN = Path(os.environ.get("AGY_BIN", str(HOME / ".local" / "bin" / "agy")))
+CLAUDE_BIN = os.environ.get("CLAUDE_BIN", "claude")
 ANTIGRAVITY_TRIAGE_ENABLED = os.environ.get("RODA_GEMMA_ANTIGRAVITY_TRIAGE_ENABLED", "1") == "1"
 # Automatic provider-authored changes are opt-in.  Diagnosis and alerting can
 # remain enabled without granting the health monitor commit/merge/restart
@@ -1757,6 +1758,118 @@ def _process_antigravity_triage(state: dict, *, current: float | None = None) ->
         if event is not None:
             events.append(event)
     return events
+
+
+_DIFF_FENCE_RE = re.compile(r"```(?:diff|patch)?\n(.*?)```", re.DOTALL)
+
+
+def _strip_diff_fences(text: str) -> str:
+    match = _DIFF_FENCE_RE.search(text or "")
+    if match:
+        return match.group(1).strip()
+    return (text or "").strip()
+
+
+def _changed_files_in_worktree(worktree: Path) -> list[str]:
+    status = subprocess.run(
+        ["/usr/bin/git", "-C", str(worktree), "status", "--porcelain"],
+        capture_output=True, text=True, check=False,
+    )
+    return [line[3:] for line in status.stdout.splitlines() if len(line) >= 4]
+
+
+def _run_implementer_cli(role: str, prompt: str, worktree: Path, *, timeout: int = 180) -> dict:
+    result_template = {
+        "status": "provider_error", "diff": None, "changed_files": [],
+        "exit_code": None, "timed_out": False, "stderr_tail": "",
+    }
+    try:
+        if role == "codex":
+            proc = subprocess.run(
+                [str(CODEX_BIN), "exec", "--json", "-s", "workspace-write", "--skip-git-repo-check", "-C", str(worktree), "--", prompt],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        elif role == "antigravity":
+            proc = subprocess.run(
+                [str(AGY_BIN), "--print", "--mode", "accept-edits", prompt],
+                capture_output=True, text=True, timeout=timeout, check=False, cwd=str(worktree),
+            )
+        elif role == "claude":
+            proc = subprocess.run(
+                [str(CLAUDE_BIN), "-p", "--model", "sonnet", "--effort", "medium", "--output-format", "json", prompt],
+                capture_output=True, text=True, timeout=timeout, check=False,
+            )
+        else:
+            raise ValueError(f"unknown implementer role: {role}")
+    except subprocess.TimeoutExpired:
+        result_template["status"] = "timeout"
+        result_template["timed_out"] = True
+        return result_template
+    except OSError as exc:
+        result_template["stderr_tail"] = f"{type(exc).__name__}: {exc}"[-500:]
+        return result_template
+
+    if proc.returncode != 0:
+        result_template["status"] = "provider_error"
+        result_template["exit_code"] = proc.returncode
+        result_template["stderr_tail"] = (proc.stderr or "")[-500:]
+        return result_template
+
+    if role == "claude":
+        try:
+            payload = json.loads(proc.stdout)
+        except json.JSONDecodeError:
+            result_template["status"] = "provider_error"
+            result_template["stderr_tail"] = "claude output was not valid JSON"[-500:]
+            return result_template
+        diff_text = _strip_diff_fences(str(payload.get("result") or ""))
+        if not diff_text:
+            result_template["status"] = "no_change"
+            result_template["exit_code"] = proc.returncode
+            return result_template
+        patch_file = worktree / ".self-heal-patch.diff"
+        patch_file.write_text(diff_text, encoding="utf-8")
+        check = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "apply", "--check", str(patch_file)],
+            capture_output=True, text=True, check=False,
+        )
+        if check.returncode != 0:
+            patch_file.unlink(missing_ok=True)
+            result_template["status"] = "apply_failed"
+            result_template["stderr_tail"] = (check.stderr or "")[-500:]
+            return result_template
+        apply_result = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "apply", str(patch_file)],
+            capture_output=True, text=True, check=False,
+        )
+        patch_file.unlink(missing_ok=True)
+        if apply_result.returncode != 0:
+            result_template["status"] = "apply_failed"
+            result_template["stderr_tail"] = (apply_result.stderr or "")[-500:]
+            return result_template
+        result_template["diff"] = diff_text
+
+    changed_files = _changed_files_in_worktree(worktree)
+    result_template["changed_files"] = changed_files
+    result_template["exit_code"] = proc.returncode
+    if not changed_files:
+        result_template["status"] = "no_change"
+        return result_template
+    if role != "claude":
+        # codex/antigravity edit the worktree directly rather than emitting a
+        # diff blob — capture one after the fact so _is_low_risk_diff (Task 2)
+        # can measure the change size for these implementers too, not just claude.
+        # `git add -A` first: a plain `git diff HEAD` shows nothing for brand-new
+        # (untracked) files, which would let a new-file change slip through as an
+        # empty diff and wrongly qualify for the low-risk 1-reviewer track.
+        subprocess.run(["/usr/bin/git", "-C", str(worktree), "add", "-A"], capture_output=True, text=True, check=False)
+        diff_result = subprocess.run(
+            ["/usr/bin/git", "-C", str(worktree), "diff", "--cached", "HEAD"],
+            capture_output=True, text=True, check=False,
+        )
+        result_template["diff"] = diff_result.stdout
+    result_template["status"] = "success"
+    return result_template
 
 
 def poll_once(state: dict, *, now: float | None = None) -> list[dict]:

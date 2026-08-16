@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import tempfile
 import unittest
 from unittest import mock
@@ -1227,6 +1228,137 @@ class RodaHealthMonitorTests(unittest.TestCase):
         with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
             with self.assertRaises(RuntimeError):
                 health._run_antigravity_triage_cli("prompt text")
+
+    def test_strip_diff_fences_removes_markdown_wrapper(self):
+        text = "여기 패치입니다:\n```diff\ndiff --git a/x.py b/x.py\n+print(1)\n```\n"
+        self.assertEqual(
+            health._strip_diff_fences(text),
+            "diff --git a/x.py b/x.py\n+print(1)",
+        )
+
+    def test_strip_diff_fences_passes_through_bare_diff(self):
+        text = "diff --git a/x.py b/x.py\n+print(1)"
+        self.assertEqual(health._strip_diff_fences(text), text)
+
+    def test_run_implementer_cli_codex_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            def run(command, **kwargs):
+                if command[0] == str(health.CODEX_BIN):
+                    return mock.Mock(returncode=0, stdout='{"type":"item.completed","item":{"type":"agent_message","text":"fixed it"}}\n', stderr="")
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M x.py\n", stderr="")
+                if command[-1:] == ["HEAD"] and "diff" in command:
+                    return mock.Mock(returncode=0, stdout="diff --git a/x.py b/x.py\n+print(1)\n", stderr="")
+                if command[-2:] == ["add", "-A"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                raise AssertionError(command)
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                result = health._run_implementer_cli("codex", "fix it", worktree)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["changed_files"], ["x.py"])
+        self.assertFalse(result["timed_out"])
+        self.assertIn("diff --git", result["diff"])
+
+    def test_run_implementer_cli_respects_custom_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            calls = []
+            def run(command, **kwargs):
+                calls.append(kwargs.get("timeout"))
+                if command[0] == str(health.CODEX_BIN):
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                return mock.Mock(returncode=0, stdout="", stderr="")
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                health._run_implementer_cli("codex", "fix it", worktree, timeout=45)
+        self.assertEqual(calls[0], 45)
+
+    def test_run_implementer_cli_codex_no_change(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            def run(command, **kwargs):
+                if command[0] == str(health.CODEX_BIN):
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                raise AssertionError(command)
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                result = health._run_implementer_cli("codex", "fix it", worktree)
+        self.assertEqual(result["status"], "no_change")
+        self.assertEqual(result["changed_files"], [])
+
+    def test_run_implementer_cli_codex_timeout(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            with mock.patch.object(health.subprocess, "run", side_effect=health.subprocess.TimeoutExpired(cmd="codex", timeout=180)):
+                result = health._run_implementer_cli("codex", "fix it", worktree)
+        self.assertEqual(result["status"], "timeout")
+        self.assertTrue(result["timed_out"])
+
+    def test_run_implementer_cli_antigravity_success(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            def run(command, **kwargs):
+                if command[0] == str(health.AGY_BIN):
+                    self.assertIn("--mode", command)
+                    self.assertIn("accept-edits", command)
+                    self.assertNotIn("plan", command)
+                    return mock.Mock(returncode=0, stdout="done", stderr="")
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M y.py\n", stderr="")
+                if command[-2:] == ["add", "-A"]:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-1:] == ["HEAD"] and "diff" in command:
+                    return mock.Mock(returncode=0, stdout="diff --git a/y.py b/y.py\n+print(1)\n", stderr="")
+                raise AssertionError(command)
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                result = health._run_implementer_cli("antigravity", "fix it", worktree)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["changed_files"], ["y.py"])
+
+    def test_run_implementer_cli_claude_success_strips_fences_and_applies(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            diff_text = "diff --git a/z.py b/z.py\n--- a/z.py\n+++ b/z.py\n@@ -1 +1 @@\n-old\n+new\n"
+            claude_json = json.dumps({"result": f"```diff\n{diff_text}```"})
+            def run(command, **kwargs):
+                if command[0] == str(health.CLAUDE_BIN):
+                    self.assertIn("--output-format", command)
+                    self.assertIn("json", command)
+                    return mock.Mock(returncode=0, stdout=claude_json, stderr="")
+                if command[-2:] == ["apply", "--check"] or command[-1] == "z.diff":
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if "apply" in command:
+                    return mock.Mock(returncode=0, stdout="", stderr="")
+                if command[-2:] == ["status", "--porcelain"]:
+                    return mock.Mock(returncode=0, stdout=" M z.py\n", stderr="")
+                raise AssertionError(command)
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                result = health._run_implementer_cli("claude", "fix it", worktree)
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["changed_files"], ["z.py"])
+
+    def test_run_implementer_cli_claude_apply_check_failure_is_apply_failed(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            claude_json = json.dumps({"result": "diff --git a/z.py b/z.py\nnot a valid patch"})
+            def run(command, **kwargs):
+                if command[0] == str(health.CLAUDE_BIN):
+                    return mock.Mock(returncode=0, stdout=claude_json, stderr="")
+                if "apply" in command and "--check" in command:
+                    return mock.Mock(returncode=1, stdout="", stderr="corrupt patch")
+                raise AssertionError(command)
+            with mock.patch.object(health.subprocess, "run", side_effect=run):
+                result = health._run_implementer_cli("claude", "fix it", worktree)
+        self.assertEqual(result["status"], "apply_failed")
+
+    def test_run_implementer_cli_provider_error_on_nonzero_exit(self):
+        with tempfile.TemporaryDirectory() as td:
+            worktree = Path(td)
+            with mock.patch.object(health.subprocess, "run", return_value=mock.Mock(returncode=1, stdout="", stderr="boom")):
+                result = health._run_implementer_cli("codex", "fix it", worktree)
+        self.assertEqual(result["status"], "provider_error")
+        self.assertIn("boom", result["stderr_tail"])
 
     def test_apply_triage_verdict_owner_down_notifies_human(self):
         state = {"incidents": {}, "deliberation_history": []}
