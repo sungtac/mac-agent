@@ -222,7 +222,9 @@ def _render_unresolved_incidents(path: Path | None = None) -> str:
         return "⚠️ 장애 원장 형식이 오래되었거나 유효하지 않습니다. health monitor 상태 마이그레이션이 필요합니다."
     open_items = [
         item for item in incidents.values()
-        if isinstance(item, dict) and item.get("status") in {"open", "reopened", "mitigated"}
+        if isinstance(item, dict)
+        and item.get("status") in {"open", "reopened", "mitigated"}
+        and item.get("escalation_stage") is not None
     ]
     open_items.sort(key=lambda item: float(item.get("last_seen_at", 0) or 0), reverse=True)
     if not open_items:
