@@ -44,7 +44,7 @@ USAGE_WATCH_GRACE_SECONDS = int(os.environ.get("RODA_GEMMA_USAGE_WATCH_GRACE_SEC
 # docs/roda-parallel-recovery-improvement-plan.md P2.
 PENDING_MERGE_TTL_SECONDS = int(os.environ.get("RODA_GEMMA_PENDING_MERGE_TTL_SECONDS", str(24 * 60 * 60)))
 MAIN_DIRTY_ALERT_INTERVAL_SECONDS = int(os.environ.get("RODA_GEMMA_MAIN_DIRTY_ALERT_INTERVAL_SECONDS", str(24 * 60 * 60)))
-STATE_SCHEMA_VERSION = 5
+STATE_SCHEMA_VERSION = 6
 ALERT_RETENTION_SECONDS = int(os.environ.get("RODA_GEMMA_ALERT_RETENTION_SECONDS", str(7 * 24 * 60 * 60)))
 DRY_RUN = os.environ.get("RODA_GEMMA_HEALTH_DRY_RUN", "0") == "1"
 CODEX_DIAGNOSIS_ENABLED = os.environ.get("RODA_GEMMA_CODEX_DIAGNOSIS_ENABLED", "1") == "1"
@@ -250,6 +250,7 @@ def _default_state() -> dict:
         "usage_watch": {},
         "pending_merges": {},
         "incidents": {},
+        "deliberation_history": [],
         "main_dirty_alerted_at": 0,
         "metrics": {
             "classified": {},
@@ -279,6 +280,8 @@ def _migrate_state(payload: object) -> dict:
     for key in ("offsets", "pending", "alerted", "repair_results", "recovery_watch", "usage_watch", "pending_merges", "incidents"):
         if not isinstance(state.get(key), dict):
             state[key] = {}
+    if not isinstance(state.get("deliberation_history"), list):
+        state["deliberation_history"] = []
     # v3 stored pending starts as a FIFO list per role.  Keep those entries
     # visible as legacy incidents, but all new observations are keyed by the
     # task ID emitted by the provider bridge so an unrelated DONE cannot pop
@@ -338,6 +341,8 @@ def _migrate_state(payload: object) -> dict:
             state["metrics"][key] = int(state["metrics"][key])
         except (TypeError, ValueError):
             state["metrics"][key] = 0
+    for incident in state.get("incidents", {}).values():
+        incident.setdefault("escalation_stage", None)
     _coalesce_specific_incidents(state)
     return state
 

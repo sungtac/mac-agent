@@ -84,7 +84,7 @@ class RodaHealthMonitorTests(unittest.TestCase):
             },
         })
         canonical = health._fingerprint("claude", "auth_error", "")
-        self.assertEqual(state["schema_version"], 5)
+        self.assertEqual(state["schema_version"], 6)
         self.assertEqual(state["incidents"][canonical]["status"], "open")
         self.assertEqual(state["incidents"][canonical]["detail"], "latest")
         self.assertEqual(state["alerted"][canonical], 121)
@@ -94,6 +94,23 @@ class RodaHealthMonitorTests(unittest.TestCase):
         state["alerted"].pop(canonical)
         remigrated = health._migrate_state(state)
         self.assertEqual(remigrated["alerted"][canonical], 121)
+
+    def test_migration_adds_deliberation_history_and_defaults_escalation_stage(self):
+        state = health._migrate_state({
+            "schema_version": 5,
+            "incidents": {
+                "f1": {
+                    "incident_id": "f1", "role": "codex", "code": "execution_error",
+                    "status": "open", "first_seen_at": 100, "last_seen_at": 100,
+                },
+            },
+        })
+        self.assertEqual(state["schema_version"], 6)
+        self.assertEqual(state["deliberation_history"], [])
+        self.assertIsNone(state["incidents"]["f1"]["escalation_stage"])
+
+    def test_default_state_has_empty_deliberation_history(self):
+        self.assertEqual(health._default_state()["deliberation_history"], [])
 
     def test_classifies_provider_usage_limit_variants_without_prompt_false_positive(self):
         self.assertEqual(health.classify_line("[claude] usage limit reached"), "usage_limited")
