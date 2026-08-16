@@ -370,6 +370,37 @@ class DeliberationStore:
             fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
+    def append_human_note(self, session_id: str, text: str, *, telegram_message_id: object) -> dict[str, Any]:
+        """Record a human interjection as append-only evidence, never mixed
+        into the signed agent `results`/`rounds` stream (see design doc
+        docs/specs/2026-08-16-telegram-meeting-interjection-design.md 설계 1).
+        """
+        session_id = _safe_session(session_id)
+        fd = self._lock()
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            payload = self._read(session_id)
+            if payload is None:
+                raise ValueError("unknown deliberation session")
+            notes = list(payload.get("human_notes") or [])
+            message_id_text = str(telegram_message_id)
+            for note in notes:
+                if str(note.get("telegram_message_id")) == message_id_text:
+                    return payload
+            next_seq = max((int(note.get("seq", 0)) for note in notes), default=0) + 1
+            notes.append({
+                "seq": next_seq,
+                "text": _bounded(text),
+                "telegram_message_id": message_id_text,
+                "recorded_at": time.time(),
+            })
+            payload["human_notes"] = notes
+            self._write(session_id, payload)
+            return payload
+        finally:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
     def snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._read(_safe_session(session_id))
 

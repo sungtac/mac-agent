@@ -110,6 +110,30 @@ class DeliberationStoreTests(unittest.TestCase):
         self.assertEqual(session_id_for_telegram("-1", 7), session_id_for_telegram("-1", 7))
         self.assertNotEqual(session_id_for_telegram("-1", 7), session_id_for_telegram("-1", 8))
 
+    def test_append_human_note_is_ordered_and_idempotent_by_message_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 200)
+                store.start(session_id, "회의 시작")
+                store.append_human_note(session_id, "첫 발언", telegram_message_id=201)
+                store.append_human_note(session_id, "둘째 발언", telegram_message_id=202)
+                notes = store.snapshot(session_id)["human_notes"]
+                self.assertEqual([note["seq"] for note in notes], [1, 2])
+                self.assertEqual(notes[0]["text"], "첫 발언")
+                self.assertEqual(notes[0]["telegram_message_id"], "201")
+                store.append_human_note(session_id, "첫 발언 재전송", telegram_message_id=201)
+                self.assertEqual(len(store.snapshot(session_id)["human_notes"]), 2)
+
+    def test_append_human_note_rejects_unknown_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DeliberationStore(directory)
+            with self.assertRaises(ValueError):
+                store.append_human_note("delib-missing", "발언", telegram_message_id=1)
+
     def test_runtime_result_is_signed_when_key_file_is_configured(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"
