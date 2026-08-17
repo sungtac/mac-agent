@@ -1429,7 +1429,7 @@ def _record_metric(state: dict, code: str, current: float) -> None:
 
 
 def _upsert_incident(state: dict, event: dict, current: float) -> None:
-    if event.get("kind") in {"recovery_result", "usage_recovery"}:
+    if event.get("kind") in {"recovery_result", "usage_recovery", "escalation_notice"}:
         return
     fingerprint = str(event.get("fingerprint") or "")
     if not fingerprint:

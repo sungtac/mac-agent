@@ -173,6 +173,30 @@ class RodaHealthMonitorTests(unittest.TestCase):
         self.assertEqual(incident["reroute_count"], 0)
         self.assertIn(f"@{health.BOT_USERNAMES['codex']}", event["message"])
 
+    def test_escalation_notice_event_does_not_create_phantom_incident(self):
+        state = {"incidents": {}}
+        event = {
+            "kind": "escalation_notice", "role": "codex", "code": "escalation",
+            "fingerprint": "escalation:some-real-fp:no_ack:1000",
+            "message": "에스컬레이션 알림", "detail": "no ack",
+        }
+
+        health._route_incident_event(state, event, current=1000.0)
+
+        self.assertEqual(state["incidents"], {})
+
+    def test_repeated_escalation_notices_never_accumulate_incidents(self):
+        state = {"incidents": {}}
+
+        for index in range(5):
+            event = {
+                "kind": "escalation_notice", "role": "codex", "code": "escalation",
+                "fingerprint": f"escalation:real-fp:no_ack:{1000 + index}",
+                "message": "에스컬레이션 알림", "detail": "no ack",
+            }
+            health._route_incident_event(state, event, current=1000.0 + index)
+            self.assertEqual(state["incidents"], {})
+
     def test_route_incident_event_merges_same_role_incident_within_window(self):
         state = {
             "incidents": {
