@@ -468,6 +468,28 @@ class DeliberationStore:
         notes = payload.get("human_notes") or []
         return tuple(note for note in notes if int(note.get("seq", 0)) > observed)
 
+    def reintegration_probe(self, session_id: str) -> dict[str, Any]:
+        """Single-snapshot read for the reintegration decision path: avoids
+        calling snapshot() separately for unreflected notes / reintegration
+        count / latest human seq when nothing writes between them.
+        """
+        payload = self.snapshot(session_id) or {}
+        results = payload.get("results") or {}
+        observed = max(
+            (
+                int((results.get(role) or {}).get("observed_human_seq", 0))
+                for role in payload.get("expected_roles", EXPECTED_ROLES)
+            ),
+            default=0,
+        )
+        notes = payload.get("human_notes") or []
+        unreflected = tuple(note for note in notes if int(note.get("seq", 0)) > observed)
+        return {
+            "unreflected": unreflected,
+            "reintegration_count": int(payload.get("human_note_reintegrations", 0)),
+            "latest_human_seq": max((int(note.get("seq", 0)) for note in notes), default=0),
+        }
+
     def reintegration_count(self, session_id: str) -> int:
         payload = self.snapshot(session_id) or {}
         return int(payload.get("human_note_reintegrations", 0))

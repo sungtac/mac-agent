@@ -203,6 +203,37 @@ class DeliberationStoreTests(unittest.TestCase):
                 store.record_reintegration(session_id)
                 self.assertEqual(store.reintegration_count(session_id), 1)
 
+    def test_reintegration_probe_returns_only_unreflected_notes_and_latest_seq(self):
+        with tempfile.TemporaryDirectory() as directory:
+            key_path = Path(directory) / "agent-message.key"
+            key_path.write_bytes(b"local-test-key-with-more-than-16-bytes")
+            key_path.chmod(0o600)
+            with patch.dict("os.environ", {"EDGE_AGENT_MESSAGE_KEY_FILE": str(key_path)}):
+                store = DeliberationStore(directory)
+                session_id = session_id_for_telegram("-1", 231)
+                store.start(session_id, "회의")
+                store.append_human_note(session_id, "이미 반영된 발언", telegram_message_id=1)
+                store.append_human_note(session_id, "새 발언", telegram_message_id=2)
+                store.record(session_id, "claude", status="completed", summary="의견", observed_human_seq=1)
+
+                probe = store.reintegration_probe(session_id)
+
+                self.assertEqual([note["text"] for note in probe["unreflected"]], ["새 발언"])
+                self.assertEqual(probe["reintegration_count"], 0)
+                self.assertEqual(probe["latest_human_seq"], 2)
+
+    def test_reintegration_probe_is_empty_for_session_without_human_notes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = DeliberationStore(directory)
+            session_id = session_id_for_telegram("-1", 232)
+            store.start(session_id, "회의")
+
+            probe = store.reintegration_probe(session_id)
+
+            self.assertEqual(probe["unreflected"], ())
+            self.assertEqual(probe["reintegration_count"], 0)
+            self.assertEqual(probe["latest_human_seq"], 0)
+
     def test_render_includes_unreflected_human_notes(self):
         with tempfile.TemporaryDirectory() as directory:
             key_path = Path(directory) / "agent-message.key"

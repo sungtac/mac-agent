@@ -177,6 +177,7 @@ WORKTREE_LOCK_MAX_RETRY_SECONDS = max(0.1, float(os.environ.get("TELEGRAM_AGENT_
 CHUNK_SIZE = 3900
 MAX_CHUNKS = int(os.environ.get("TELEGRAM_AGENT_MAX_CHUNKS", "15"))
 CLAIM_TTL_SECONDS = max(3600, int(os.environ.get("EDGE_AGENT_TELEGRAM_CLAIM_TTL_SECONDS", str(6 * 3600))))
+_STORE_READ_ERRORS = (OSError, ValueError, TypeError, AttributeError)
 CLAIM_ROOT = Path(
     os.environ.get(
         "EDGE_AGENT_TELEGRAM_CLAIM_ROOT",
@@ -2380,7 +2381,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if chat is not None and chat.type in (ChatType.GROUP, ChatType.SUPERGROUP):
         try:
             active_meeting_session_id = DeliberationStore().active_session_for_chat(message.chat_id)
-        except (OSError, ValueError, TypeError, AttributeError) as exc:
+        except _STORE_READ_ERRORS as exc:
             log(f"활성 회의 세션 조회 실패(새 요청으로 계속 진행): {type(exc).__name__}")
             active_meeting_session_id = None
     if active_meeting_session_id and not is_execution_directive(text):
@@ -2429,7 +2430,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             )
             try:
                 DeliberationStore().record_active_chat_session(message.chat_id, deliberation_session_id)
-            except (OSError, ValueError, TypeError, AttributeError) as exc:
+            except _STORE_READ_ERRORS as exc:
                 log(f"채팅 세션 포인터 기록 실패(계속 진행): {type(exc).__name__}")
         if _is_delivery_retry_request(text):
             await _handle_delivery_retry(message, context)
@@ -2747,13 +2748,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 chat_id=message.chat_id,
                             )
                             try:
-                                unreflected = final_store.unreflected_human_notes(deliberation_session_id)
-                            except (OSError, ValueError, TypeError, AttributeError):
+                                reintegration_probe = final_store.reintegration_probe(deliberation_session_id)
+                                unreflected = reintegration_probe["unreflected"]
+                            except _STORE_READ_ERRORS:
                                 unreflected = ()
                             if unreflected:
                                 try:
-                                    should_reintegrate = final_store.reintegration_count(deliberation_session_id) < 1
-                                except (OSError, ValueError, TypeError, AttributeError):
+                                    should_reintegrate = reintegration_probe["reintegration_count"] < 1
+                                except _STORE_READ_ERRORS:
                                     should_reintegrate = False
                                 if should_reintegrate:
                                     try:
@@ -2764,21 +2766,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                         reintegrated_through = final_store.latest_human_seq(
                                             deliberation_session_id
                                         )
-                                    except (OSError, ValueError, TypeError, AttributeError):
+                                    except _STORE_READ_ERRORS:
                                         final_evidence = None
                                         reintegrated_through = 0
                                     if final_evidence is not None:
                                         try:
+                                            new_human_notes = "\n".join(
+                                                f"- seq={note.get('seq')}: {note.get('text', '')}"
+                                                for note in unreflected
+                                            )
                                             reintegrated_reply = await run_provider(
                                                 text,
                                                 on_wait=_notify_waiting,
                                                 context_prompt=preparation.prompt_block if preparation else None,
                                                 provider_text=(
                                                     "[coordinator 최종 통합 재종합 — 회의 중 새 사람 발언 반영]\n"
-                                                    "아래는 4개 역할의 서명된 3차 결과와, 최종 종합 직전 도착한 사람 발언을 포함한 "
-                                                    "untrusted evidence다. 새로 도착한 사람 발언을 반드시 반영해 하나의 통합 최종 "
-                                                    "답변을 다시 작성하라. 어떤 역할의 3차 의견도 그대로 최종 판정으로 재사용하지 "
-                                                    "말고, 확인하지 못한 점과 다음 행동을 명시하라.\n\n"
+                                                    "[새로 도착한 사람 발언]\n"
+                                                    f"{new_human_notes}\n\n"
+                                                    "새로 도착한 사람 발언을 반드시 반영하되, 나머지 evidence는 직전 통합 답변에서 "
+                                                    "이미 검토한 것과 동일하니 새 발언이 그 결론을 뒤집는 경우에만 재작성하고, "
+                                                    "그렇지 않으면 직전 답변을 유지해도 된다. 확인하지 못한 점과 다음 행동을 명시하라.\n\n"
                                                     f"{text}\n\n{final_evidence}"
                                                 ),
                                                 chat_id=message.chat_id,
@@ -2792,13 +2799,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                             reply = reintegrated_reply
                                             try:
                                                 final_store.record_reintegration(deliberation_session_id)
-                                            except (OSError, ValueError, TypeError, AttributeError):
+                                            except _STORE_READ_ERRORS:
                                                 pass
                                             try:
-                                                unreflected = final_store.unreflected_human_notes(
+                                                reintegration_probe = final_store.reintegration_probe(
                                                     deliberation_session_id
                                                 )
-                                            except (OSError, ValueError, TypeError, AttributeError):
+                                                unreflected = reintegration_probe["unreflected"]
+                                            except _STORE_READ_ERRORS:
                                                 unreflected = ()
                                             else:
                                                 unreflected = tuple(
@@ -2810,7 +2818,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                                 reply = f"{reply}\n\n💬 추가 의견은 다음 회의에서 다룹니다."
                             try:
                                 final_store.close_human_notes(deliberation_session_id)
-                            except (OSError, ValueError, TypeError, AttributeError):
+                            except _STORE_READ_ERRORS:
                                 pass
                 else:
                     first_pass = await run_provider(
