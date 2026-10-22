@@ -14,8 +14,20 @@ set -uo pipefail
 INPUT="$(cat)"
 SESSION_ID="$(printf '%s' "$INPUT" | jq -r '.session_id // empty' 2>/dev/null)"
 TRANSCRIPT_PATH="$(printf '%s' "$INPUT" | jq -r '.transcript_path // empty' 2>/dev/null)"
+CWD="$(printf '%s' "$INPUT" | jq -r '.cwd // empty' 2>/dev/null)"
 
 [ -z "$SESSION_ID" ] && exit 0
+
+# 고정 목적 헤드리스 자동화(cron/systemd가 `claude -p`로 호출하는 ~/scripts/* 스크립트)는
+# 제외한다 — 이런 세션은 --allowedTools로 도구가 이미 좁게 제한돼 있어(Workflow 툴 자체가
+# 없음) 이 훅이 요구하는 verify-task를 애초에 실행할 수 없고, "block"이 세션의 마지막 턴을
+# 가로채 스크립트가 파싱해야 할 최종 출력(RESULT:OK 등)을 지워버린다. 이런 자동화는 각자
+# 자체 결정론적 검증(zip 무결성, 텍스트 재조회 등)을 이미 run.sh에 갖추고 있어 이 훅의
+# 대상이 아니다. (2026-09-25, 해수부 주간업무보고 자동화 9/18·9/25 두 회차 모두 실제로는
+# 정상 완료됐는데 이 훅 때문에 실패로 오보된 사고로 발견)
+case "$CWD" in
+  "$HOME"/scripts/*) exit 0 ;;
+esac
 
 STATE_DIR="$HOME/.claude/hooks-state/verify-task-nag"
 mkdir -p "$STATE_DIR"

@@ -19,7 +19,7 @@ const PREFLIGHT_SCHEMA = {
 
 async function preflightCheck() {
   return agent(
-    `Bash 툴로 아래 두 명령을 순서대로 실행해줘:\n1. codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
+    `Bash 툴로 아래 두 명령을 순서대로 실행해줘:\n1. codex login status\n2. env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /home/edge_ai/.local/bin/agy models\n\n두 명령 다 에러 없이 성공(로그인된 상태)이면 ok=true, issues는 빈 문자열로 반환해. 하나라도 로그인 필요/에러가 나면 ok=false로 하고, 어떤 도구가 문제인지와 해결 방법(예: "터미널에서 codex login 실행" 또는 "터미널에서 agy 실행 후 로그인, 저장소의 setup.sh 참고")을 issues에 적어줘.`,
     { phase: 'Preflight', label: 'preflight', schema: PREFLIGHT_SCHEMA }
   )
 }
@@ -116,7 +116,7 @@ async function gatherVerificationContext(cwd) {
 async function scoreWithGemini(task, result, persona, cwd, verificationContent) {
   const prompt = buildScoringPrompt(task, result, persona, cwd, verificationContent)
   return agent(
-    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야). agy는 이미 필요한 검증 자료를 프롬프트 안에 텍스트로 받으므로 셸 명령을 실행할 필요가 없어 — 그래서 이 호출은 작업 디렉토리 이동 없이 진행해.\n\n1. Bash로 \`mktemp /tmp/verify-task-gemini-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /Users/edge_ai/.local/bin/agy -p "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
+    `아래 순서를 정확히 따라줘 (프롬프트 내용을 셸 명령어 문자열에 직접 이어붙이지 마 — 반드시 파일에 저장한 뒤 $(cat ...)로 전달해. 프롬프트 안에 $(...), 백틱, 따옴표가 들어있어도 안전하게 전달하기 위함이야). agy는 이미 필요한 검증 자료를 프롬프트 안에 텍스트로 받으므로 셸 명령을 실행할 필요가 없어 — 그래서 이 호출은 작업 디렉토리 이동 없이 진행해.\n\n1. Bash로 \`mktemp /tmp/verify-task-gemini-XXXXXX.txt\` 실행해서 임시 파일 경로를 얻어.\n2. Write 툴로 그 경로에 아래 [프롬프트 내용]을 정확히 그대로(글자 하나 고치지 말고) 저장해.\n3. Bash로 다음을 실행해 (파일경로는 2번 경로로 치환): env -u SSH_CONNECTION -u SSH_TTY -u SSH_CLIENT /home/edge_ai/.local/bin/agy -p "$(cat <파일경로>)"\n4. 실행이 끝나면 Bash로 그 임시 파일을 삭제해.\n5. 명령 출력 안에서 JSON 객체를 찾아 그 내용 그대로 구조화된 출력으로 반환해. ${FAILURE_SCORE_INSTRUCTION}\n\n[프롬프트 내용]\n${prompt}`,
     { phase: 'Score', label: 'gemini', schema: SCORE_SCHEMA }
   )
 }
@@ -140,7 +140,7 @@ const MAX_ROUNDS = parsedArgs.maxRounds || 3
 const task = parsedArgs.task
 const persona = parsedArgs.persona || '일반 사용자'
 const cwd = parsedArgs.cwd
-const historyFile = parsedArgs.historyFile || '/Users/edge_ai/.claude/verify-task-history.jsonl'
+const historyFile = parsedArgs.historyFile || '/home/edge_ai/.claude/verify-task-history.jsonl'
 
 let result = parsedArgs.result
 const history = []
